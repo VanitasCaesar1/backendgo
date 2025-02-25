@@ -476,18 +476,19 @@ func (h *AuthHandler) Logout(c *fiber.Ctx) error {
 	h.logger.Info("Logout request received")
 	ctx := c.Context()
 
-	// Get current session
-	sessionID := c.Cookies("auth_session")
+	// Get current session using the correct cookie name
+	sessionID := c.Cookies(h.cookieName)
 	var idToken string
 
 	if sessionID != "" {
 		// Get session data to retrieve ID token
-		sessionKey := fmt.Sprintf("session:%s", sessionID)
+		sessionKey := fmt.Sprintf("%s_session:%s", h.clientType, sessionID)
 		var sessionData SessionData
 		sessionBytes, err := h.redisClient.Get(ctx, sessionKey).Bytes()
 		if err == nil {
 			if err := json.Unmarshal(sessionBytes, &sessionData); err == nil {
 				idToken = sessionData.IDToken
+				h.logger.Info("Retrieved ID token for logout", zap.Bool("id_token_present", idToken != ""))
 			}
 		}
 
@@ -509,15 +510,14 @@ func (h *AuthHandler) Logout(c *fiber.Ctx) error {
 	// Add post_logout_redirect_uri if configured
 	if h.config.PostLogoutURI != "" {
 		params.Add("post_logout_redirect_uri", h.config.PostLogoutURI)
+		// Ensure client_id is provided with redirect_uri
+		params.Add("client_id", h.config.KeycloakClientID)
 	}
 
-	// Add id_token_hint if available - this is crucial for ending the SSO session
+	// Add id_token_hint if available - this is CRITICAL for ending the SSO session
 	if idToken != "" {
 		params.Add("id_token_hint", idToken)
 	}
-
-	// Add client_id
-	params.Add("client_id", h.config.KeycloakClientID)
 
 	// Add state parameter for security
 	state := uuid.New().String()
@@ -525,7 +525,7 @@ func (h *AuthHandler) Logout(c *fiber.Ctx) error {
 
 	// Store state temporarily for validation
 	if err := h.redisClient.Set(ctx,
-		fmt.Sprintf("logout_state:%s", state),
+		fmt.Sprintf("%s_logout_state:%s", h.clientType, state),
 		"true",
 		5*time.Minute).Err(); err != nil {
 		h.logger.Error("failed to store logout state", zap.Error(err))
@@ -579,6 +579,7 @@ func (h *AuthHandler) performLocalLogout(c *fiber.Ctx) error {
 		}
 	}
 
+	// Clear the cookie in both root domain and specified domain if any
 	c.Cookie(&fiber.Cookie{
 		Name:     h.cookieName,
 		Value:    "",
@@ -591,6 +592,7 @@ func (h *AuthHandler) performLocalLogout(c *fiber.Ctx) error {
 		SameSite: "Lax",
 	})
 
+	// Also clear without domain to handle cases where cookie was set without domain
 	if h.config.CookieDomain != "" {
 		c.Cookie(&fiber.Cookie{
 			Name:     h.cookieName,

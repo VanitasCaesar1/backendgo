@@ -8,6 +8,7 @@ import (
 	"image"
 	"image/jpeg"
 	_ "image/png" // Register PNG decoder
+	"io"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -57,7 +58,7 @@ func NewUserHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, a
 	// Initialize Minio client
 	minioClient, err := minio.New(cfg.MinioEndpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(cfg.MinioAccessKey, cfg.MinioSecretKey, ""),
-		Secure: !cfg.IsDevelopment(),
+		Secure: true,
 		Region: "india-s-1",
 	})
 	if err != nil {
@@ -550,4 +551,100 @@ func (h *UserHandler) updateProfilePicURL(ctx context.Context, userID string, fi
 		"UPDATE users SET profile_pic = $1 WHERE keycloak_id = $2",
 		filename, keycloakID)
 	return err
+}
+
+// Add this to your user_handler.go file
+// GetProfilePic retrieves a profile picture from MinIO
+func (h *UserHandler) GetProfilePic(c *fiber.Ctx) error {
+	filename := c.Params("filename")
+
+	// Basic validation to prevent path traversal
+	if strings.Contains(filename, "/") || strings.Contains(filename, "\\") {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid filename",
+		})
+	}
+
+	// Increase timeout for image retrieval
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Add retry mechanism for MinIO connection
+	var obj *minio.Object
+	var err error
+
+	// Try up to 3 times with exponential backoff
+	for attempt := 0; attempt < 3; attempt++ {
+		obj, err = h.minioClient.GetObject(ctx, bucketName, filename, minio.GetObjectOptions{})
+		if err == nil {
+			break
+		}
+
+		h.logger.Warn("attempt to get object from minio failed, retrying...",
+			zap.Error(err),
+			zap.String("filename", filename),
+			zap.Int("attempt", attempt+1))
+
+		// Don't sleep on the last attempt
+		if attempt < 2 {
+			time.Sleep(time.Duration(100*(2<<attempt)) * time.Millisecond)
+		}
+	}
+
+	if err != nil {
+		h.logger.Error("all attempts to get object from minio failed",
+			zap.Error(err),
+			zap.String("filename", filename))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to retrieve image",
+		})
+	}
+
+	// Get object info to set content-type with retry
+	var objInfo minio.ObjectInfo
+	for attempt := 0; attempt < 3; attempt++ {
+		objInfo, err = obj.Stat()
+		if err == nil {
+			break
+		}
+
+		h.logger.Warn("attempt to get object stats failed, retrying...",
+			zap.Error(err),
+			zap.String("filename", filename),
+			zap.Int("attempt", attempt+1))
+
+		// Don't sleep on the last attempt
+		if attempt < 2 {
+			time.Sleep(time.Duration(100*(2<<attempt)) * time.Millisecond)
+		}
+	}
+
+	if err != nil {
+		h.logger.Error("all attempts to get object stats failed",
+			zap.Error(err),
+			zap.String("filename", filename))
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Image not found",
+		})
+	}
+
+	// Set appropriate headers
+	c.Set("Content-Type", objInfo.ContentType)
+	c.Set("Content-Length", fmt.Sprintf("%d", objInfo.Size))
+	c.Set("Cache-Control", "public, max-age=86400") // Cache for 24 hours
+	c.Set("ETag", objInfo.ETag)
+
+	// Stream the file to the client with a more robust approach
+	buffer := make([]byte, 32*1024) // 32KB buffer
+	_, err = io.CopyBuffer(c, obj, buffer)
+	if err != nil {
+		h.logger.Error("failed to stream file to client",
+			zap.Error(err),
+			zap.String("filename", filename))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to stream image data",
+		})
+	}
+
+	return nil
 }

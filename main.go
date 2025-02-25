@@ -277,6 +277,8 @@ func (a *App) setupRoutes() error {
 	userGroup.Put("/profile", userHandler.UpdateUserProfile)
 	userGroup.Post("/profile/picture", userHandler.UploadProfilePic)
 
+	a.Fiber.Get("/api/media/profile-pics/:filename", userHandler.GetProfilePic)
+
 	// Doctor auth routes - no middleware for auth endpoints
 	doctorAuth := a.Fiber.Group("/auth/doctor")
 	doctorAuth.Post("/register", doctorAuthHandler.Register)
