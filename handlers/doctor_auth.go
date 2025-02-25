@@ -143,7 +143,7 @@ func (h *DoctorAuthHandler) Register(c *fiber.Ctx) error {
 	// Insert into users table
 	_, err = tx.Exec(c.Context(),
 		`INSERT INTO users (keycloak_id, email, name) 
-         VALUES ($1, $2, $3)`,
+     VALUES ($1, $2, $3)`,
 		parsedID,
 		req.Email,
 		fmt.Sprintf("%s %s", req.FirstName, req.LastName),
@@ -155,16 +155,32 @@ func (h *DoctorAuthHandler) Register(c *fiber.Ctx) error {
 		})
 	}
 
-	// Insert into roles table
+	// Insert into roles table - updated to match new schema with main_role (singular)
 	_, err = tx.Exec(c.Context(),
-		`INSERT INTO roles (keycloak_id, main_roles, sub_roles, scopes) 
-         VALUES ($1, 'practitioner', 'doctor', '{}'::jsonb)`,
+		`INSERT INTO roles (keycloak_id, main_role, scopes) 
+     VALUES ($1, $2, $3)`,
 		parsedID,
+		"practitioner",
+		nil, // Pass nil to represent NULL in the database
 	)
 	if err != nil {
 		h.logger.Error("failed to insert role", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to create role record",
+		})
+	}
+
+	// Insert into user_sub_roles table for the doctor sub-role
+	_, err = tx.Exec(c.Context(),
+		`INSERT INTO user_sub_roles (keycloak_id, sub_role, assigned_by) 
+     VALUES ($1, $2, $1)`, // The user is assigned their own role initially
+		parsedID,
+		"doctor",
+	)
+	if err != nil {
+		h.logger.Error("failed to insert sub role", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to create sub role record",
 		})
 	}
 
