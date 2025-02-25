@@ -553,7 +553,6 @@ func (h *UserHandler) updateProfilePicURL(ctx context.Context, userID string, fi
 	return err
 }
 
-// Add this to your user_handler.go file
 // GetProfilePic retrieves a profile picture from MinIO
 func (h *UserHandler) GetProfilePic(c *fiber.Ctx) error {
 	filename := c.Params("filename")
