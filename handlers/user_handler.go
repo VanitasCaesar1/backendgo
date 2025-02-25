@@ -265,12 +265,35 @@ func (h *UserHandler) UpdateUserProfile(c *fiber.Ctx) error {
 		})
 	}
 
+	// Check if username is unique if it was provided
+	if updateData.Username != "" {
+		var usernameExists bool
+		err = tx.QueryRow(c.Context(),
+			"SELECT EXISTS(SELECT 1 FROM users WHERE username = $1 AND keycloak_id != $2)",
+			updateData.Username, keycloakID).Scan(&usernameExists)
+		if err != nil {
+			h.logger.Error("failed to check username uniqueness",
+				zap.Error(err),
+				zap.String("username", updateData.Username))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Database error",
+			})
+		}
+
+		if usernameExists {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error": "Username already taken",
+			})
+		}
+	}
+
 	// Perform update within transaction
 	commandTag, err := tx.Exec(c.Context(),
 		`UPDATE users 
-		 SET name = $1, mobile = $2, blood_group = $3, 
-		     location = $4, address = $5
-		 WHERE keycloak_id = $6`,
+		 SET username = $1, name = $2, mobile = $3, blood_group = $4, 
+		     location = $5, address = $6
+		 WHERE keycloak_id = $7`,
+		updateData.Username,
 		updateData.Name,
 		updateData.Mobile,
 		updateData.BloodGroup,
@@ -310,6 +333,24 @@ func (h *UserHandler) UpdateUserProfile(c *fiber.Ctx) error {
 }
 
 func (h *UserHandler) validateProfileUpdate(profile *UserProfile) error {
+	// Username validation
+	if profile.Username != "" {
+		if len(profile.Username) < 3 || len(profile.Username) > 30 {
+			h.logger.Error("invalid username length",
+				zap.String("username", profile.Username),
+				zap.Int("length", len(profile.Username)))
+			return errors.New("username must be between 3 and 30 characters")
+		}
+
+		// Only allow alphanumeric characters, underscores, and periods
+		usernamePattern := regexp.MustCompile(`^[a-zA-Z0-9_.]+$`)
+		if !usernamePattern.MatchString(profile.Username) {
+			h.logger.Error("invalid username format",
+				zap.String("username", profile.Username))
+			return errors.New("username can only contain letters, numbers, underscores, and periods")
+		}
+	}
+
 	// Name validation
 	if len(profile.Name) > 100 {
 		h.logger.Error("name too long",
@@ -411,6 +452,26 @@ func (h *UserHandler) UploadProfilePic(c *fiber.Ctx) error {
 	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Only JPG and PNG files are allowed",
+		})
+	}
+
+	// Fetch current profile pic filename
+	keycloakID, err := uuid.Parse(userID)
+	if err != nil {
+		h.logger.Error("invalid keycloak ID format", zap.Error(err))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid user ID format",
+		})
+	}
+
+	var oldFilename string
+	err = h.pgPool.QueryRow(c.Context(),
+		"SELECT COALESCE(profile_pic, '') FROM users WHERE keycloak_id = $1",
+		keycloakID).Scan(&oldFilename)
+	if err != nil && err != pgx.ErrNoRows {
+		h.logger.Error("failed to fetch current profile pic", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Database error",
 		})
 	}
 
@@ -533,6 +594,25 @@ func (h *UserHandler) UploadProfilePic(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to update profile picture",
 		})
+	}
+
+	// Delete old profile picture if it exists
+	if oldFilename != "" {
+		// Don't block the response on deletion, just log errors
+		go func(oldFile string) {
+			delCtx, delCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer delCancel()
+
+			err := h.minioClient.RemoveObject(delCtx, bucketName, oldFile, minio.RemoveObjectOptions{})
+			if err != nil {
+				h.logger.Error("failed to delete old profile picture",
+					zap.Error(err),
+					zap.String("oldFilename", oldFile))
+			} else {
+				h.logger.Info("successfully deleted old profile picture",
+					zap.String("oldFilename", oldFile))
+			}
+		}(oldFilename)
 	}
 
 	return c.JSON(fiber.Map{
