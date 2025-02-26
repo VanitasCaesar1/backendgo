@@ -399,25 +399,59 @@ func (h *AuthHandler) validateIDTokenWithNonce(token *oauth2.Token, expectedNonc
 // AuthMiddleware authenticates requests
 func (h *AuthHandler) AuthMiddleware(c *fiber.Ctx) error {
 	ctx := c.Context()
-	sessionID := c.Cookies("auth_session")
+
+	// First try to get session from cookie
+	sessionID := c.Cookies(h.cookieName)
+
+	// Then try from Authorization header (Bearer token)
 	if sessionID == "" {
+		auth := c.Get("Authorization")
+		if strings.HasPrefix(auth, "Bearer ") {
+			sessionID = strings.TrimPrefix(auth, "Bearer ")
+		}
+	}
+
+	if sessionID == "" {
+		h.logger.Debug("no session found",
+			zap.String("path", c.Path()),
+			zap.String("ip", c.IP()))
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 			"error": "No session found",
+			"code":  "NO_SESSION",
 		})
 	}
 
-	sessionKey := fmt.Sprintf("session:%s", sessionID)
+	sessionKey := fmt.Sprintf("%s_session:%s", h.clientType, sessionID)
 	exists, err := h.redisClient.Exists(ctx, sessionKey).Result()
 	if err != nil {
 		h.logger.Error("session check failed", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Server error",
+			"code":  "SERVER_ERROR",
 		})
 	}
 
 	if exists == 0 {
+		h.logger.Debug("invalid session",
+			zap.String("session_id", sessionID),
+			zap.String("path", c.Path()))
+
+		// Clear the invalid cookie
+		c.Cookie(&fiber.Cookie{
+			Name:     h.cookieName,
+			Value:    "",
+			Path:     "/",
+			Domain:   h.config.CookieDomain,
+			MaxAge:   -1,
+			Expires:  time.Now().Add(-24 * time.Hour),
+			Secure:   !h.config.IsDevelopment(),
+			HTTPOnly: true,
+			SameSite: "Lax",
+		})
+
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 			"error": "Invalid session",
+			"code":  "INVALID_SESSION",
 		})
 	}
 
@@ -427,6 +461,7 @@ func (h *AuthHandler) AuthMiddleware(c *fiber.Ctx) error {
 		h.logger.Error("failed to get session data", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Server error",
+			"code":  "SERVER_ERROR",
 		})
 	}
 
@@ -435,16 +470,36 @@ func (h *AuthHandler) AuthMiddleware(c *fiber.Ctx) error {
 		h.logger.Error("failed to unmarshal session data", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Server error",
+			"code":  "SERVER_ERROR",
 		})
 	}
 
 	// Check token expiration
 	if time.Now().After(sessionData.ExpiresAt) {
 		// Token is expired, try to refresh
-		if err := h.refreshSession(ctx, sessionID); err != nil {
-			h.logger.Error("session refresh failed", zap.Error(err))
+		refreshErr := h.refreshSession(ctx, sessionID)
+
+		if refreshErr != nil {
+			h.logger.Info("session expired and refresh failed",
+				zap.String("session_id", sessionID),
+				zap.Error(refreshErr))
+
+			// Clear the expired cookie
+			c.Cookie(&fiber.Cookie{
+				Name:     h.cookieName,
+				Value:    "",
+				Path:     "/",
+				Domain:   h.config.CookieDomain,
+				MaxAge:   -1,
+				Expires:  time.Now().Add(-24 * time.Hour),
+				Secure:   !h.config.IsDevelopment(),
+				HTTPOnly: true,
+				SameSite: "Lax",
+			})
+
 			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 				"error": "Session expired",
+				"code":  "SESSION_EXPIRED",
 			})
 		}
 
@@ -454,6 +509,7 @@ func (h *AuthHandler) AuthMiddleware(c *fiber.Ctx) error {
 			h.logger.Error("failed to get refreshed session data", zap.Error(err))
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": "Server error",
+				"code":  "SERVER_ERROR",
 			})
 		}
 
@@ -461,13 +517,18 @@ func (h *AuthHandler) AuthMiddleware(c *fiber.Ctx) error {
 			h.logger.Error("failed to unmarshal refreshed session data", zap.Error(err))
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 				"error": "Server error",
+				"code":  "SERVER_ERROR",
 			})
 		}
+
+		// Update the session cookie with new expiration
+		h.setSessionCookie(c, sessionID)
 	}
 
 	// Set user info in context
 	c.Locals("userID", sessionData.UserID)
 	c.Locals("email", sessionData.Email)
+	c.Locals("sessionID", sessionID)
 
 	return c.Next()
 }
@@ -476,7 +537,7 @@ func (h *AuthHandler) Logout(c *fiber.Ctx) error {
 	h.logger.Info("Logout request received")
 	ctx := c.Context()
 
-	// Get current session using the correct cookie name
+	// Get current session
 	sessionID := c.Cookies(h.cookieName)
 	var idToken string
 
@@ -499,7 +560,7 @@ func (h *AuthHandler) Logout(c *fiber.Ctx) error {
 		}
 	}
 
-	// Build Keycloak end-session URL
+	// Build Keycloak end-session URL with OIDC RP-initiated logout
 	logoutURL := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/logout",
 		h.config.KeycloakURL,
 		h.config.RealmName)
@@ -808,13 +869,29 @@ func (h *AuthHandler) createSession(ctx context.Context, token *oauth2.Token, cl
 	sessionID := uuid.New().String()
 	sessionKey := fmt.Sprintf("%s_session:%s", h.clientType, sessionID)
 
+	// Calculate session expiry time
+	// Ensure session expiry is slightly before token expiry for proper refresh
+	sessionExpiry := token.Expiry.Add(-5 * time.Minute)
+
+	// If session expiry is too short, set a reasonable minimum
+	minExpiry := time.Now().Add(30 * time.Minute)
+	if sessionExpiry.Before(minExpiry) {
+		sessionExpiry = minExpiry
+	}
+
+	// Set max session duration (24 hours) regardless of token lifetime
+	maxExpiry := time.Now().Add(24 * time.Hour)
+	if sessionExpiry.After(maxExpiry) {
+		sessionExpiry = maxExpiry
+	}
+
 	sessionData := SessionData{
 		AccessToken:  token.AccessToken,
 		RefreshToken: token.RefreshToken,
 		IDToken:      token.Extra("id_token").(string),
 		UserID:       claims["sub"].(string),
 		Email:        claims["email"].(string),
-		ExpiresAt:    token.Expiry,
+		ExpiresAt:    sessionExpiry,
 		CreatedAt:    time.Now(),
 	}
 
@@ -823,19 +900,28 @@ func (h *AuthHandler) createSession(ctx context.Context, token *oauth2.Token, cl
 		return "", fmt.Errorf("failed to marshal session data: %w", err)
 	}
 
+	// Calculate TTL for Redis
+	ttl := time.Until(sessionExpiry) + 5*time.Minute // Add buffer for refresh operations
+
 	pipe := h.redisClient.Pipeline()
-	pipe.Set(ctx, sessionKey, sessionJSON, time.Hour*24)
-	pipe.Set(ctx, fmt.Sprintf("%s_user_session:%s", h.clientType, sessionData.UserID), sessionID, time.Hour*24)
+	pipe.Set(ctx, sessionKey, sessionJSON, ttl)
+	pipe.Set(ctx, fmt.Sprintf("%s_user_session:%s", h.clientType, sessionData.UserID), sessionID, ttl)
 
 	if _, err := pipe.Exec(ctx); err != nil {
 		return "", fmt.Errorf("failed to store session: %w", err)
 	}
 
+	h.logger.Info("Created new session",
+		zap.String("user_id", sessionData.UserID),
+		zap.String("session_id", sessionID),
+		zap.Time("expires_at", sessionExpiry),
+		zap.Duration("ttl", ttl))
+
 	return sessionID, nil
 }
 
 func (h *AuthHandler) refreshSession(ctx context.Context, sessionID string) error {
-	sessionKey := fmt.Sprintf("session:%s", sessionID)
+	sessionKey := fmt.Sprintf("%s_session:%s", h.clientType, sessionID)
 
 	// Get existing session data
 	var sessionData SessionData
@@ -846,6 +932,11 @@ func (h *AuthHandler) refreshSession(ctx context.Context, sessionID string) erro
 
 	if err := json.Unmarshal(sessionJSON, &sessionData); err != nil {
 		return fmt.Errorf("failed to unmarshal session data: %w", err)
+	}
+
+	// Don't try to refresh if refresh token is missing
+	if sessionData.RefreshToken == "" {
+		return fmt.Errorf("no refresh token available")
 	}
 
 	// Create token source with refresh token
@@ -865,13 +956,28 @@ func (h *AuthHandler) refreshSession(ctx context.Context, sessionID string) erro
 		return fmt.Errorf("invalid refreshed token: %w", err)
 	}
 
+	// Calculate session expiry time
+	sessionExpiry := newToken.Expiry.Add(-5 * time.Minute)
+
+	// If session expiry is too short, set a reasonable minimum
+	minExpiry := time.Now().Add(30 * time.Minute)
+	if sessionExpiry.Before(minExpiry) {
+		sessionExpiry = minExpiry
+	}
+
+	// Set max session duration (24 hours) regardless of token lifetime
+	maxExpiry := time.Now().Add(24 * time.Hour)
+	if sessionExpiry.After(maxExpiry) {
+		sessionExpiry = maxExpiry
+	}
+
 	// Update session data
 	sessionData.AccessToken = newToken.AccessToken
 	if newToken.RefreshToken != "" { // Some providers don't always return a new refresh token
 		sessionData.RefreshToken = newToken.RefreshToken
 	}
 	sessionData.IDToken = newToken.Extra("id_token").(string)
-	sessionData.ExpiresAt = newToken.Expiry
+	sessionData.ExpiresAt = sessionExpiry
 
 	// Store updated session
 	updatedSessionJSON, err := json.Marshal(sessionData)
@@ -879,28 +985,84 @@ func (h *AuthHandler) refreshSession(ctx context.Context, sessionID string) erro
 		return fmt.Errorf("failed to marshal updated session: %w", err)
 	}
 
+	// Calculate TTL for Redis
+	ttl := time.Until(sessionExpiry) + 5*time.Minute // Add buffer for refresh operations
+
 	pipe := h.redisClient.Pipeline()
-	pipe.Set(ctx, sessionKey, updatedSessionJSON, time.Hour*24)
-	pipe.Set(ctx, fmt.Sprintf("user_session:%s", claims["sub"].(string)), sessionID, time.Hour*24)
+	pipe.Set(ctx, sessionKey, updatedSessionJSON, ttl)
+	pipe.Set(ctx, fmt.Sprintf("%s_user_session:%s", h.clientType, claims["sub"].(string)), sessionID, ttl)
 
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("failed to store updated session: %w", err)
 	}
 
+	h.logger.Info("Session refreshed successfully",
+		zap.String("session_id", sessionID),
+		zap.String("user_id", claims["sub"].(string)),
+		zap.Time("new_expiry", sessionExpiry))
+
 	return nil
 }
 
 func (h *AuthHandler) setSessionCookie(c *fiber.Ctx, sessionID string) {
+	// Get session data to determine proper cookie expiration
+	sessionKey := fmt.Sprintf("%s_session:%s", h.clientType, sessionID)
+	var sessionData SessionData
+
+	sessionJSON, err := h.redisClient.Get(c.Context(), sessionKey).Bytes()
+	if err != nil {
+		h.logger.Error("failed to get session data for cookie", zap.Error(err))
+		// Use default expiration if session data can't be retrieved
+		cookie := fiber.Cookie{
+			Name:     h.cookieName,
+			Value:    sessionID,
+			Path:     "/",
+			Domain:   h.config.CookieDomain,
+			MaxAge:   int(time.Hour * 24 / time.Second),
+			Secure:   !h.config.IsDevelopment(),
+			HTTPOnly: true,
+			SameSite: "Lax",
+		}
+		c.Cookie(&cookie)
+		return
+	}
+
+	if err := json.Unmarshal(sessionJSON, &sessionData); err != nil {
+		h.logger.Error("failed to unmarshal session data for cookie", zap.Error(err))
+		// Use default expiration if session data can't be unmarshaled
+		cookie := fiber.Cookie{
+			Name:     h.cookieName,
+			Value:    sessionID,
+			Path:     "/",
+			Domain:   h.config.CookieDomain,
+			MaxAge:   int(time.Hour * 24 / time.Second),
+			Secure:   !h.config.IsDevelopment(),
+			HTTPOnly: true,
+			SameSite: "Lax",
+		}
+		c.Cookie(&cookie)
+		return
+	}
+
+	// Calculate cookie expiration time - align with session expiration
+	cookieExpiration := sessionData.ExpiresAt
+
+	// Set cookie with calculated expiration
 	cookie := fiber.Cookie{
 		Name:     h.cookieName,
 		Value:    sessionID,
 		Path:     "/",
 		Domain:   h.config.CookieDomain,
-		MaxAge:   int(time.Hour * 24 / time.Second),
+		Expires:  cookieExpiration,
 		Secure:   !h.config.IsDevelopment(),
 		HTTPOnly: true,
 		SameSite: "Lax",
 	}
+
+	h.logger.Debug("setting session cookie",
+		zap.String("cookie_name", h.cookieName),
+		zap.Time("expires", cookieExpiration))
+
 	c.Cookie(&cookie)
 }
 
@@ -947,5 +1109,104 @@ func (h *AuthHandler) RevokeAllSessions(c *fiber.Ctx) error {
 
 	return c.JSON(fiber.Map{
 		"message": "All sessions revoked successfully",
+	})
+}
+
+func (h *AuthHandler) ValidateSession(c *fiber.Ctx) error {
+	ctx := c.Context()
+
+	// Try to get session ID first from Authorization header
+	sessionID := ""
+	auth := c.Get("Authorization")
+	if auth != "" && strings.HasPrefix(auth, "Bearer ") {
+		sessionID = strings.TrimPrefix(auth, "Bearer ")
+	}
+
+	// Fall back to cookie if necessary
+	if sessionID == "" {
+		sessionID = c.Cookies(h.cookieName)
+	}
+
+	if sessionID == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "No session found",
+			"valid": false,
+		})
+	}
+
+	// Check if session exists in Redis
+	sessionKey := fmt.Sprintf("%s_session:%s", h.clientType, sessionID)
+	exists, err := h.redisClient.Exists(ctx, sessionKey).Result()
+	if err != nil {
+		h.logger.Error("session validation check failed", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Server error",
+			"valid": false,
+		})
+	}
+
+	if exists == 0 {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "Invalid session",
+			"valid": false,
+		})
+	}
+
+	// Get session data
+	sessionBytes, err := h.redisClient.Get(ctx, sessionKey).Bytes()
+	if err != nil {
+		h.logger.Error("failed to get session data", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Server error",
+			"valid": false,
+		})
+	}
+
+	var sessionData SessionData
+	if err := json.Unmarshal(sessionBytes, &sessionData); err != nil {
+		h.logger.Error("failed to unmarshal session data", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Server error",
+			"valid": false,
+		})
+	}
+
+	// Check session expiration
+	if time.Now().After(sessionData.ExpiresAt) {
+		// Try to refresh the session
+		if err := h.refreshSession(ctx, sessionID); err != nil {
+			h.logger.Debug("session expired and refresh failed",
+				zap.String("session_id", sessionID),
+				zap.Error(err))
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "Session expired",
+				"valid": false,
+			})
+		}
+
+		// Get updated session data after refresh
+		sessionBytes, err = h.redisClient.Get(ctx, sessionKey).Bytes()
+		if err != nil {
+			h.logger.Error("failed to get refreshed session data", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Server error",
+				"valid": false,
+			})
+		}
+
+		if err := json.Unmarshal(sessionBytes, &sessionData); err != nil {
+			h.logger.Error("failed to unmarshal refreshed session data", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Server error",
+				"valid": false,
+			})
+		}
+	}
+
+	// Return basic session info
+	return c.JSON(fiber.Map{
+		"valid":      true,
+		"user_id":    sessionData.UserID,
+		"expires_in": int(time.Until(sessionData.ExpiresAt).Seconds()),
 	})
 }

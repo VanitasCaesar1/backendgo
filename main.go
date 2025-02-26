@@ -269,6 +269,7 @@ func (a *App) setupRoutes() error {
 	auth.Post("/callback", authHandler.Callback)
 	auth.Post("/logout", authHandler.Logout)
 	auth.Get("/user", authHandler.AuthMiddleware, authHandler.GetUserInfo)
+	auth.Get("/auth/validate", authHandler.ValidateSession)
 
 	// Regular API routes
 	api := a.Fiber.Group("/api", authMiddleware.Handler())
