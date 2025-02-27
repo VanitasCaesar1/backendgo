@@ -20,17 +20,19 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/redis/go-redis/v9"
+	"github.com/workos/workos-go/v4/pkg/sso"
 	"go.uber.org/zap"
 )
 
 type App struct {
-	Fiber       *fiber.App
-	Postgres    *pgxpool.Pool // Changed from pgx.Conn to pgxpool.Pool
-	Redis       *redis.Client
-	MinioClient *minio.Client
-	Ctx         context.Context
-	Config      *config.Config
-	Logger      *zap.Logger
+	Fiber        *fiber.App
+	Postgres     *pgxpool.Pool
+	Redis        *redis.Client
+	MinioClient  *minio.Client
+	Ctx          context.Context
+	Config       *config.Config
+	Logger       *zap.Logger
+	WorkosClient *sso.Client
 }
 
 func NewApp() (*App, error) {
@@ -39,6 +41,13 @@ func NewApp() (*App, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to load config: %v", err)
 	}
+
+	// Initialize WorkOS AuthKit - assuming this returns *sso.Client
+	// Call AuthkitInit without capturing the return value
+	AuthkitInit(*cfg)
+
+	// Use the DefaultClient variable directly - it's not a function in v4
+	workosClient := sso.DefaultClient
 
 	// Setup context with cancellation
 	ctx := context.Background()
@@ -128,17 +137,6 @@ func NewApp() (*App, error) {
 		return nil, fmt.Errorf("minio connection failed after %d attempts: %v", maxMinioRetries, err)
 	}
 
-	exists, err := minioClient.BucketExists(ctx, "profile-pics")
-	if err != nil && err.Error() != "Found" {
-		return nil, fmt.Errorf("failed to check bucket existence: %w", err)
-	}
-
-	if !exists {
-		err = minioClient.MakeBucket(ctx, "profile-pics", minio.MakeBucketOptions{})
-		if err != nil && !strings.Contains(err.Error(), "already exists") {
-			return nil, fmt.Errorf("failed to create bucket: %w", err)
-		}
-	}
 	// Create required buckets
 	requiredBuckets := []string{"profile-pics", "hospital-pics"}
 	for _, bucket := range requiredBuckets {
@@ -162,6 +160,16 @@ func NewApp() (*App, error) {
 			continue
 		}
 
+		// Create bucket if it doesn't exist
+		err = minioClient.MakeBucket(ctx, bucket, minio.MakeBucketOptions{})
+		if err != nil && !strings.Contains(err.Error(), "already exists") {
+			logger.Error("failed to create bucket",
+				zap.String("bucket", bucket),
+				zap.Error(err))
+		} else {
+			logger.Info("bucket created",
+				zap.String("bucket", bucket))
+		}
 	}
 
 	// Fiber setup with improved error handling
@@ -223,18 +231,47 @@ func NewApp() (*App, error) {
 	})
 
 	return &App{
-		Fiber:       fiberApp,
-		Postgres:    pgPool,
-		Redis:       redisClient,
-		MinioClient: minioClient,
-		Ctx:         ctx,
-		Config:      cfg,
-		Logger:      logger,
+		Fiber:        fiberApp,
+		Postgres:     pgPool,
+		Redis:        redisClient,
+		MinioClient:  minioClient,
+		Ctx:          ctx,
+		Config:       cfg,
+		Logger:       logger,
+		WorkosClient: workosClient,
 	}, nil
 }
 
 func (a *App) setupRoutes() error {
-	// Regular auth handler
+	// Configure client types
+	clientTypes := map[string]string{
+		"web-client-123":    string(middleware.WebApp),
+		"mobile-client-123": string(middleware.MobileApp),
+		"user-client-123":   string(middleware.UserClient),
+		"doctor-client-123": string(middleware.DoctorClient),
+		"admin-client-123":  string(middleware.AdminPanel),
+	}
+
+	// Configure cookie names
+	cookieNames := map[middleware.ClientType]string{
+		middleware.WebApp:       "hospital_web_session",
+		middleware.MobileApp:    "doctor_web_session",
+		middleware.UserClient:   "user_mobile_session",
+		middleware.DoctorClient: "doctor_mobile_session",
+		middleware.AdminPanel:   "admin_session",
+	}
+
+	// Setup the new auth middleware
+	authMiddleware := middleware.NewAuthMiddleware(middleware.AuthMiddlewareConfig{
+		Logger:      a.Logger,
+		Redis:       a.Redis,
+		Config:      a.Config,
+		ClientTypes: clientTypes,
+		CookieNames: cookieNames,
+		// WorkOS client is now handled internally in the middleware
+	})
+
+	// Regular auth handler with WorkOS integration
 	authHandler, err := handlers.NewAuthHandler(a.Config, a.Redis, a.Logger, "user", "auth_session")
 	if err != nil {
 		return fmt.Errorf("failed to initialize auth handler: %v", err)
@@ -252,16 +289,6 @@ func (a *App) setupRoutes() error {
 		return fmt.Errorf("failed to initialize user handler: %v", err)
 	}
 
-	// Regular auth middleware
-	authMiddleware := middleware.NewAuthMiddleware(a.Logger, a.Redis, "user", "auth_session")
-	//	doctorAuthMiddleware := middleware.NewAuthMiddleware(
-	//       a.Logger,
-	//       a.Redis,
-	//      "doctor",
-	//      "doctor_session",
-	//  )
-	// Doctor auth middleware with different cookie name
-
 	// Regular auth routes
 	auth := a.Fiber.Group("/auth")
 	auth.Get("/login", authHandler.Login)
@@ -269,9 +296,9 @@ func (a *App) setupRoutes() error {
 	auth.Post("/callback", authHandler.Callback)
 	auth.Post("/logout", authHandler.Logout)
 	auth.Get("/user", authHandler.AuthMiddleware, authHandler.GetUserInfo)
-	auth.Get("/auth/validate", authHandler.ValidateSession)
+	auth.Get("/validate", authHandler.ValidateSession) // Fixed path to match usage
 
-	// Regular API routes
+	// Regular API routes - use new auth middleware
 	api := a.Fiber.Group("/api", authMiddleware.Handler())
 	userGroup := api.Group("/user")
 	userGroup.Get("/profile", userHandler.GetUserProfile)
@@ -285,11 +312,12 @@ func (a *App) setupRoutes() error {
 	doctorAuth.Post("/register", doctorAuthHandler.Register)
 	doctorAuth.Post("/login", doctorAuthHandler.Login)
 	doctorAuth.Get("/callback", doctorAuthHandler.Callback)
-	doctorAuth.Post("/callback", doctorAuthHandler.Callback) // If you also need POST
+	doctorAuth.Post("/callback", doctorAuthHandler.Callback)
 	doctorAuth.Post("/logout", doctorAuthHandler.Logout)
-	// Protected doctor routes - with middleware
 
-	// Add other protected doctor routes here...
+	// Doctor API routes - use the new auth middleware with doctor client type
+	//doctorApi := a.Fiber.Group("/api/doctor", authMiddleware.Handler())
+	// Add doctor-specific routes here
 
 	return nil
 }
@@ -325,11 +353,7 @@ func (a *App) Start() error {
 		a.Logger.Error("error during server shutdown",
 			zap.Error(err))
 	}
-	a.Postgres.Close() // Updated cleanup for pool
-	if err := a.Redis.Close(); err != nil {
-		a.Logger.Error("error closing redis connection",
-			zap.Error(err))
-	}
+	a.Postgres.Close()
 	if err := a.Redis.Close(); err != nil {
 		a.Logger.Error("error closing redis connection",
 			zap.Error(err))
