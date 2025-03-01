@@ -17,12 +17,12 @@ import (
 	"github.com/VanitasCaesar1/backend/config"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/nfnt/resize"
 	"github.com/redis/go-redis/v9"
+	"github.com/workos/workos-go/v4/pkg/usermanagement"
 	"go.uber.org/zap"
 )
 
@@ -37,24 +37,31 @@ type UserHandler struct {
 	config      *config.Config
 	redisClient *redis.Client
 	logger      *zap.Logger
-	authHandler *AuthHandler
 	pgPool      *pgxpool.Pool
 	minioClient *minio.Client
 }
 
 type UserProfile struct {
-	KeycloakID uuid.UUID `json:"keycloak_id"`
-	Username   string    `json:"username,omitempty"`
-	ProfilePic string    `json:"profile_pic,omitempty"`
-	Name       string    `json:"name"`
-	Mobile     string    `json:"mobile"`
-	Email      string    `json:"email"`
-	BloodGroup string    `json:"blood_group,omitempty"`
-	Location   string    `json:"location,omitempty"`
-	Address    string    `json:"address,omitempty"`
+	UserID            uuid.UUID `json:"user_id"`
+	AuthID            string    `json:"auth_id,omitempty"` // WorkOS user ID
+	Username          string    `json:"username,omitempty"`
+	ProfilePic        string    `json:"profile_pic,omitempty"`
+	FirstName         string    `json:"first_name,omitempty"`
+	LastName          string    `json:"last_name,omitempty"`
+	Name              string    `json:"name,omitempty"`
+	Mobile            string    `json:"mobile,omitempty"`
+	Email             string    `json:"email"`
+	EmailVerified     bool      `json:"email_verified,omitempty"`
+	BloodGroup        string    `json:"blood_group,omitempty"`
+	Location          string    `json:"location,omitempty"`
+	Address           string    `json:"address,omitempty"`
+	ProfilePictureURL string    `json:"profile_picture_url,omitempty"`
+	LastSignInAt      string    `json:"last_sign_in_at,omitempty"`
+	CreatedAt         string    `json:"created_at,omitempty"`
+	UpdatedAt         string    `json:"updated_at,omitempty"`
 }
 
-func NewUserHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, auth *AuthHandler, pgPool *pgxpool.Pool) (*UserHandler, error) {
+func NewUserHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, pgPool *pgxpool.Pool) (*UserHandler, error) {
 	// Initialize Minio client
 	minioClient, err := minio.New(cfg.MinioEndpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(cfg.MinioAccessKey, cfg.MinioSecretKey, ""),
@@ -65,62 +72,178 @@ func NewUserHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, a
 		return nil, fmt.Errorf("failed to initialize minio client: %w", err)
 	}
 
+	// Initialize WorkOS SDK
+	usermanagement.SetAPIKey(cfg.WorkOSApiKey)
+
 	return &UserHandler{
 		config:      cfg,
 		redisClient: rds,
 		logger:      logger,
-		authHandler: auth,
 		pgPool:      pgPool,
 		minioClient: minioClient,
 	}, nil
 }
 
 // GetUserProfile retrieves the user's profile
+// GetUserProfile retrieves the user's profile
 func (h *UserHandler) GetUserProfile(c *fiber.Ctx) error {
-	userID, ok := c.Locals("userID").(string)
+	// Get WorkOS user ID from context
+	authID, ok := c.Locals("authID").(string)
 	if !ok {
-		h.logger.Error("userID not found in context")
+		h.logger.Error("authID not found in context")
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 			"error": "User ID not found",
 		})
 	}
 
-	email, ok := c.Locals("email").(string)
-	if !ok {
-		h.logger.Error("email not found in context")
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-			"error": "Email not found",
-		})
-	}
-
 	h.logger.Info("processing user profile request",
-		zap.String("userID", userID),
-		zap.String("email", email),
+		zap.String("authID", authID),
 		zap.Any("all_claims", c.Locals("claims")),
 	)
 
-	keycloakID, err := uuid.Parse(userID)
+	// Get user from WorkOS
+	workosUser, err := usermanagement.GetUser(
+		c.Context(),
+		usermanagement.GetUserOpts{
+			User: authID,
+		},
+	)
 	if err != nil {
-		h.logger.Error("invalid keycloak ID format", zap.Error(err))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid user ID format",
+		h.logger.Error("failed to fetch user from WorkOS", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to fetch user profile from authentication provider",
 		})
 	}
 
-	// Start transaction
+	// Check if user exists in our database
+	var exists bool
+	err = h.pgPool.QueryRow(c.Context(),
+		"SELECT EXISTS(SELECT 1 FROM users WHERE auth_id = $1)",
+		authID).Scan(&exists)
+	if err != nil {
+		h.logger.Error("failed to check user existence", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Database error",
+		})
+	}
+
+	var userID uuid.UUID
+
+	// Use a separate transaction for creating user if needed
+	if !exists {
+		// Create a transaction specifically for user creation
+		tx, err := h.pgPool.Begin(c.Context())
+		if err != nil {
+			h.logger.Error("failed to begin transaction for user creation", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Database error",
+			})
+		}
+		defer tx.Rollback(c.Context()) // Rollback if not committed
+
+		// Create new user in our database
+		userID = uuid.New()
+		_, err = tx.Exec(c.Context(),
+			`INSERT INTO users (user_id, auth_id, email, name, profile_pic) 
+			 VALUES ($1, $2, $3, $4, $5)`,
+			userID, authID, workosUser.Email,
+			strings.TrimSpace(workosUser.FirstName+" "+workosUser.LastName),
+			workosUser.ProfilePictureURL,
+		)
+		if err != nil {
+			h.logger.Error("failed to create user",
+				zap.Error(err),
+				zap.String("userID", userID.String()),
+				zap.String("authID", authID),
+				zap.String("email", workosUser.Email))
+
+			// Check for unique constraint violations
+			if strings.Contains(err.Error(), "unique constraint") {
+				if strings.Contains(err.Error(), "users_email_key") {
+					return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+						"error": "Email already registered",
+					})
+				} else if strings.Contains(err.Error(), "users_username_key") {
+					return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+						"error": "Username already taken",
+					})
+				} else if strings.Contains(err.Error(), "users_mobile_key") {
+					return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+						"error": "Mobile number already registered",
+					})
+				}
+			}
+
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to create user profile",
+			})
+		}
+
+		// Commit the transaction for user creation
+		if err := tx.Commit(c.Context()); err != nil {
+			h.logger.Error("failed to commit transaction for user creation", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Database error during user creation",
+			})
+		}
+
+		h.logger.Info("new user created",
+			zap.String("userID", userID.String()),
+			zap.String("authID", authID))
+	} else {
+		// Get existing user ID
+		err = h.pgPool.QueryRow(c.Context(),
+			"SELECT user_id FROM users WHERE auth_id = $1",
+			authID).Scan(&userID)
+		if err != nil {
+			h.logger.Error("failed to get user ID", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Database error",
+			})
+		}
+	}
+
+	// Use a separate transaction for updating WorkOS data
 	tx, err := h.pgPool.Begin(c.Context())
 	if err != nil {
-		h.logger.Error("failed to begin transaction", zap.Error(err))
+		h.logger.Error("failed to begin transaction for updating WorkOS data", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Database error",
 		})
 	}
 	defer tx.Rollback(c.Context()) // Rollback if not committed
 
+	// Update user profile with latest WorkOS data
+	fullName := strings.TrimSpace(workosUser.FirstName + " " + workosUser.LastName)
+
+	_, err = tx.Exec(c.Context(),
+		`UPDATE users 
+		 SET email = $1, 
+		     name = $2, 
+		     profile_pic = $3,
+		     updated_at = CURRENT_TIMESTAMP
+		 WHERE auth_id = $4`,
+		workosUser.Email, fullName,
+		workosUser.ProfilePictureURL, authID)
+	if err != nil {
+		h.logger.Error("failed to update user with WorkOS data",
+			zap.Error(err),
+			zap.String("authID", authID))
+		// Continue anyway - we can still try to fetch the profile
+	} else {
+		// Only commit if update was successful
+		if err := tx.Commit(c.Context()); err != nil {
+			h.logger.Error("failed to commit transaction for updating WorkOS data", zap.Error(err))
+			// Continue anyway - we can still try to fetch the profile
+		}
+	}
+
+	// Get additional profile data from our database using a direct query, not a transaction
 	var profile UserProfile
-	err = tx.QueryRow(c.Context(),
+	err = h.pgPool.QueryRow(c.Context(),
 		`SELECT 
-			keycloak_id,
+			user_id,
+			auth_id,
 			COALESCE(username, '') as username,
 			COALESCE(profile_pic, '') as profile_pic,
 			COALESCE(name, '') as name,
@@ -130,11 +253,12 @@ func (h *UserHandler) GetUserProfile(c *fiber.Ctx) error {
 			COALESCE(location, '') as location,
 			COALESCE(address, '') as address
 		FROM users 
-		WHERE keycloak_id = $1`,
-		keycloakID, email).Scan(
-		&profile.KeycloakID,
+		WHERE auth_id = $1`,
+		authID, workosUser.Email).Scan(
+		&profile.UserID,
+		&profile.AuthID,
 		&profile.Username,
-		&profile.ProfilePic,
+		&profile.ProfilePictureURL,
 		&profile.Name,
 		&profile.Mobile,
 		&profile.Email,
@@ -144,70 +268,32 @@ func (h *UserHandler) GetUserProfile(c *fiber.Ctx) error {
 	)
 
 	if err != nil {
-		if err == pgx.ErrNoRows {
-			profile = UserProfile{
-				KeycloakID: keycloakID,
-				Email:      email,
-			}
-
-			commandTag, err := tx.Exec(c.Context(),
-				`INSERT INTO users (keycloak_id, email) VALUES ($1, $2)`,
-				keycloakID, email)
-			if err != nil {
-				h.logger.Error("failed to create user profile",
-					zap.Error(err),
-					zap.String("keycloakID", keycloakID.String()))
-				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-					"error": "Failed to create user profile",
-				})
-			}
-
-			if commandTag.RowsAffected() != 1 {
-				h.logger.Error("failed to insert user profile - no rows affected",
-					zap.String("keycloakID", keycloakID.String()))
-				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-					"error": "Failed to create user profile",
-				})
-			}
-
-			h.logger.Info("new user profile created successfully",
-				zap.String("keycloakID", keycloakID.String()))
-		} else {
-			h.logger.Error("failed to fetch user profile",
-				zap.Error(err),
-				zap.String("keycloakID", keycloakID.String()))
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"error": "Failed to fetch user profile",
-			})
-		}
-	}
-
-	// Commit transaction
-	if err := tx.Commit(c.Context()); err != nil {
-		h.logger.Error("failed to commit transaction", zap.Error(err))
+		h.logger.Error("failed to fetch user profile", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Database error",
+			"error": "Failed to fetch user profile",
 		})
 	}
+
+	// Merge WorkOS data with our database data
+	profile.LastSignInAt = workosUser.LastSignInAt
+	profile.CreatedAt = workosUser.CreatedAt
+	profile.UpdatedAt = workosUser.UpdatedAt
+
+	// Set FirstName and LastName from WorkOS for the response
+	profile.FirstName = workosUser.FirstName
+	profile.LastName = workosUser.LastName
+	profile.EmailVerified = workosUser.EmailVerified
 
 	return c.JSON(profile)
 }
 
 // UpdateUserProfile updates the user's profile information
 func (h *UserHandler) UpdateUserProfile(c *fiber.Ctx) error {
-	userID, ok := c.Locals("userID").(string)
+	authID, ok := c.Locals("authID").(string)
 	if !ok {
-		h.logger.Error("userID not found in context")
+		h.logger.Error("authID not found in context")
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 			"error": "User ID not found",
-		})
-	}
-
-	keycloakID, err := uuid.Parse(userID)
-	if err != nil {
-		h.logger.Error("invalid keycloak ID format", zap.Error(err))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid user ID format",
 		})
 	}
 
@@ -218,16 +304,6 @@ func (h *UserHandler) UpdateUserProfile(c *fiber.Ctx) error {
 			"error": "Invalid request data",
 		})
 	}
-
-	contextEmail, ok := c.Locals("email").(string)
-	if !ok {
-		h.logger.Error("email not found in context")
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-			"error": "Email not found",
-		})
-	}
-
-	updateData.Email = contextEmail
 
 	if err := h.validateProfileUpdate(&updateData); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -248,12 +324,12 @@ func (h *UserHandler) UpdateUserProfile(c *fiber.Ctx) error {
 	// First check if user exists
 	var exists bool
 	err = tx.QueryRow(c.Context(),
-		"SELECT EXISTS(SELECT 1 FROM users WHERE keycloak_id = $1)",
-		keycloakID).Scan(&exists)
+		"SELECT EXISTS(SELECT 1 FROM users WHERE auth_id = $1)",
+		authID).Scan(&exists)
 	if err != nil {
 		h.logger.Error("failed to check user existence",
 			zap.Error(err),
-			zap.String("keycloak_id", keycloakID.String()))
+			zap.String("auth_id", authID))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Database error",
 		})
@@ -269,8 +345,8 @@ func (h *UserHandler) UpdateUserProfile(c *fiber.Ctx) error {
 	if updateData.Username != "" {
 		var usernameExists bool
 		err = tx.QueryRow(c.Context(),
-			"SELECT EXISTS(SELECT 1 FROM users WHERE username = $1 AND keycloak_id != $2)",
-			updateData.Username, keycloakID).Scan(&usernameExists)
+			"SELECT EXISTS(SELECT 1 FROM users WHERE username = $1 AND auth_id != $2)",
+			updateData.Username, authID).Scan(&usernameExists)
 		if err != nil {
 			h.logger.Error("failed to check username uniqueness",
 				zap.Error(err),
@@ -287,25 +363,30 @@ func (h *UserHandler) UpdateUserProfile(c *fiber.Ctx) error {
 		}
 	}
 
-	// Perform update within transaction
+	// Update in our database
 	commandTag, err := tx.Exec(c.Context(),
 		`UPDATE users 
-		 SET username = $1, name = $2, mobile = $3, blood_group = $4, 
-		     location = $5, address = $6
-		 WHERE keycloak_id = $7`,
+		 SET username = $1, 
+		     name = $2, 
+		     mobile = $3, 
+		     blood_group = $4, 
+		     location = $5, 
+		     address = $6,
+		     updated_at = CURRENT_TIMESTAMP
+		 WHERE auth_id = $7`,
 		updateData.Username,
 		updateData.Name,
 		updateData.Mobile,
 		updateData.BloodGroup,
 		updateData.Location,
 		updateData.Address,
-		keycloakID,
+		authID,
 	)
 
 	if err != nil {
 		h.logger.Error("failed to update user profile",
 			zap.Error(err),
-			zap.String("keycloak_id", keycloakID.String()))
+			zap.String("auth_id", authID))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to update profile",
 		})
@@ -313,10 +394,34 @@ func (h *UserHandler) UpdateUserProfile(c *fiber.Ctx) error {
 
 	if commandTag.RowsAffected() != 1 {
 		h.logger.Error("no rows affected during update",
-			zap.String("keycloak_id", keycloakID.String()))
+			zap.String("auth_id", authID))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to update profile",
 		})
+	}
+
+	// Update first/last name in WorkOS if provided
+	if updateData.FirstName != "" || updateData.LastName != "" {
+		updateOpts := usermanagement.UpdateUserOpts{
+			User: authID,
+		}
+		if updateData.FirstName != "" {
+			updateOpts.FirstName = updateData.FirstName
+		}
+		if updateData.LastName != "" {
+			updateOpts.LastName = updateData.LastName
+		}
+
+		_, err = usermanagement.UpdateUser(
+			c.Context(),
+			updateOpts,
+		)
+		if err != nil {
+			h.logger.Error("failed to update user in WorkOS",
+				zap.Error(err),
+				zap.String("auth_id", authID))
+			// Continue anyway - the local update was successful
+		}
 	}
 
 	// Commit transaction
@@ -356,6 +461,20 @@ func (h *UserHandler) validateProfileUpdate(profile *UserProfile) error {
 		h.logger.Error("name too long",
 			zap.String("name", profile.Name))
 		return errors.New("name must not exceed 100 characters")
+	}
+
+	// First name validation
+	if len(profile.FirstName) > 50 {
+		h.logger.Error("first name too long",
+			zap.String("first_name", profile.FirstName))
+		return errors.New("first name must not exceed 50 characters")
+	}
+
+	// Last name validation
+	if len(profile.LastName) > 50 {
+		h.logger.Error("last name too long",
+			zap.String("last_name", profile.LastName))
+		return errors.New("last name must not exceed 50 characters")
 	}
 
 	// Mobile number validation
@@ -416,11 +535,12 @@ func (h *UserHandler) testMinioConnection(ctx context.Context) error {
 	return nil
 }
 
+// UploadProfilePic has been modified to update the profile picture in WorkOS
 func (h *UserHandler) UploadProfilePic(c *fiber.Ctx) error {
 	// Get user ID from context
-	userID, ok := c.Locals("userID").(string)
+	authID, ok := c.Locals("authID").(string)
 	if !ok {
-		h.logger.Error("userID not found in context")
+		h.logger.Error("authID not found in context")
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 			"error": "User ID not found",
 		})
@@ -452,26 +572,6 @@ func (h *UserHandler) UploadProfilePic(c *fiber.Ctx) error {
 	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Only JPG and PNG files are allowed",
-		})
-	}
-
-	// Fetch current profile pic filename
-	keycloakID, err := uuid.Parse(userID)
-	if err != nil {
-		h.logger.Error("invalid keycloak ID format", zap.Error(err))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid user ID format",
-		})
-	}
-
-	var oldFilename string
-	err = h.pgPool.QueryRow(c.Context(),
-		"SELECT COALESCE(profile_pic, '') FROM users WHERE keycloak_id = $1",
-		keycloakID).Scan(&oldFilename)
-	if err != nil && err != pgx.ErrNoRows {
-		h.logger.Error("failed to fetch current profile pic", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Database error",
 		})
 	}
 
@@ -588,48 +688,43 @@ func (h *UserHandler) UploadProfilePic(c *fiber.Ctx) error {
 		zap.Any("info", info),
 	)
 
+	// Generate full URL for the image
+	imageURL := fmt.Sprintf("%s/%s/%s", h.config.MinioEndpoint, bucketName, filename)
+
+	// Update profile picture URL in WorkOS
+	//	_, err = usermanagement.UpdateUser(
+	//		c.Context(),
+	//		usermanagement.UpdateUserOpts{
+	//			User:              authID,
+	//			ProfilePictureURL: imageURL,
+
+	//		},
+	//	)
+	//	if err != nil {
+	//		h.logger.Error("failed to update profile picture in WorkOS",
+	//			zap.Error(err),
+	//		zap.String("auth_id", authID))
+	// Continue anyway - we'll still update our database
+	//	}
+
 	// Update user profile in database
-	if err := h.updateProfilePicURL(c.Context(), userID, filename); err != nil {
+	if err := h.updateProfilePicURL(c.Context(), authID, imageURL); err != nil {
 		h.logger.Error("failed to update profile pic URL", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to update profile picture",
 		})
 	}
 
-	// Delete old profile picture if it exists
-	if oldFilename != "" {
-		// Don't block the response on deletion, just log errors
-		go func(oldFile string) {
-			delCtx, delCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer delCancel()
-
-			err := h.minioClient.RemoveObject(delCtx, bucketName, oldFile, minio.RemoveObjectOptions{})
-			if err != nil {
-				h.logger.Error("failed to delete old profile picture",
-					zap.Error(err),
-					zap.String("oldFilename", oldFile))
-			} else {
-				h.logger.Info("successfully deleted old profile picture",
-					zap.String("oldFilename", oldFile))
-			}
-		}(oldFilename)
-	}
-
 	return c.JSON(fiber.Map{
 		"message": "Profile picture updated successfully",
-		"url":     filename,
+		"url":     imageURL,
 	})
 }
 
-func (h *UserHandler) updateProfilePicURL(ctx context.Context, userID string, filename string) error {
-	keycloakID, err := uuid.Parse(userID)
-	if err != nil {
-		return fmt.Errorf("invalid user ID format: %w", err)
-	}
-
-	_, err = h.pgPool.Exec(ctx,
-		"UPDATE users SET profile_pic = $1 WHERE keycloak_id = $2",
-		filename, keycloakID)
+func (h *UserHandler) updateProfilePicURL(ctx context.Context, authID string, imageURL string) error {
+	_, err := h.pgPool.Exec(ctx,
+		"UPDATE users SET profile_picture_url = $1 WHERE auth_id = $2",
+		imageURL, authID)
 	return err
 }
 
@@ -647,7 +742,7 @@ func (h *UserHandler) GetProfilePic(c *fiber.Ctx) error {
 	// Increase timeout for image retrieval
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	// test 32
+
 	// Add retry mechanism for MinIO connection
 	var obj *minio.Object
 	var err error

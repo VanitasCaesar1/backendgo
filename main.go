@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gofiber/fiber/v2/middleware/limiter"
+
 	"github.com/VanitasCaesar1/backend/config"
 	"github.com/VanitasCaesar1/backend/handlers"
 	"github.com/VanitasCaesar1/backend/middleware"
@@ -20,7 +22,13 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/redis/go-redis/v9"
+	"github.com/workos/workos-go/v4/pkg/auditlogs"
+	"github.com/workos/workos-go/v4/pkg/directorysync"
+	"github.com/workos/workos-go/v4/pkg/organizations"
+	"github.com/workos/workos-go/v4/pkg/passwordless"
+	"github.com/workos/workos-go/v4/pkg/portal"
 	"github.com/workos/workos-go/v4/pkg/sso"
+	"github.com/workos/workos-go/v4/pkg/usermanagement"
 	"go.uber.org/zap"
 )
 
@@ -214,6 +222,21 @@ func NewApp() (*App, error) {
 		return c.Next()
 	})
 
+	// In your Fiber app setup
+	fiberApp.Use(limiter.New(limiter.Config{
+		Max:        100,
+		Expiration: 1 * time.Minute,
+		KeyGenerator: func(c *fiber.Ctx) string {
+			return c.IP() // Rate limit by IP
+		},
+		LimitReached: func(c *fiber.Ctx) error {
+			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+				"error": "Rate limit exceeded",
+				"code":  "RATE_LIMIT_EXCEEDED",
+			})
+		},
+	}))
+
 	// Request logging middleware
 	fiberApp.Use(func(c *fiber.Ctx) error {
 		start := time.Now()
@@ -243,81 +266,34 @@ func NewApp() (*App, error) {
 }
 
 func (a *App) setupRoutes() error {
-	// Configure client types
-	clientTypes := map[string]string{
-		"web-client-123":    string(middleware.WebApp),
-		"mobile-client-123": string(middleware.MobileApp),
-		"user-client-123":   string(middleware.UserClient),
-		"doctor-client-123": string(middleware.DoctorClient),
-		"admin-client-123":  string(middleware.AdminPanel),
-	}
-
-	// Configure cookie names
-	cookieNames := map[middleware.ClientType]string{
-		middleware.WebApp:       "hospital_web_session",
-		middleware.MobileApp:    "doctor_web_session",
-		middleware.UserClient:   "user_mobile_session",
-		middleware.DoctorClient: "doctor_mobile_session",
-		middleware.AdminPanel:   "admin_session",
-	}
-
-	// Setup the new auth middleware
-	authMiddleware := middleware.NewAuthMiddleware(middleware.AuthMiddlewareConfig{
-		Logger:      a.Logger,
-		Redis:       a.Redis,
-		Config:      a.Config,
-		ClientTypes: clientTypes,
-		CookieNames: cookieNames,
-		// WorkOS client is now handled internally in the middleware
+	// Setup the auth middleware with WorkOS client
+	// Update: Handle both the middleware and error return values
+	authMiddleware, err := middleware.NewAuthMiddleware(middleware.AuthMiddlewareConfig{
+		Logger:       a.Logger,
+		Redis:        a.Redis,
+		Config:       a.Config,
+		CookieName:   "wos-session", // Changed from "session" to "wos-session"
+		WorkosClient: a.WorkosClient,
+		ClientID:     a.Config.WorkOSClientId, // Added ClientID from config
 	})
 
-	// Regular auth handler with WorkOS integration
-	authHandler, err := handlers.NewAuthHandler(a.Config, a.Redis, a.Logger, "user", "auth_session")
 	if err != nil {
-		return fmt.Errorf("failed to initialize auth handler: %v", err)
-	}
-
-	// Doctor auth handler
-	doctorAuthHandler, err := handlers.NewDoctorAuthHandler(a.Config, a.Redis, a.Postgres, a.Logger)
-	if err != nil {
-		return fmt.Errorf("failed to initialize doctor auth handler: %v", err)
+		return fmt.Errorf("failed to initialize auth middleware: %v", err)
 	}
 
 	// User handler
-	userHandler, err := handlers.NewUserHandler(a.Config, a.Redis, a.Logger, authHandler, a.Postgres)
+	userHandler, err := handlers.NewUserHandler(a.Config, a.Redis, a.Logger, a.Postgres)
 	if err != nil {
 		return fmt.Errorf("failed to initialize user handler: %v", err)
 	}
 
-	// Regular auth routes
-	auth := a.Fiber.Group("/auth")
-	auth.Get("/login", authHandler.Login)
-	auth.Get("/callback", authHandler.Callback)
-	auth.Post("/callback", authHandler.Callback)
-	auth.Post("/logout", authHandler.Logout)
-	auth.Get("/user", authHandler.AuthMiddleware, authHandler.GetUserInfo)
-	auth.Get("/validate", authHandler.ValidateSession) // Fixed path to match usage
-
-	// Regular API routes - use new auth middleware
+	// Regular API routes - use auth middleware
 	api := a.Fiber.Group("/api", authMiddleware.Handler())
 	userGroup := api.Group("/user")
 	userGroup.Get("/profile", userHandler.GetUserProfile)
 	userGroup.Put("/profile", userHandler.UpdateUserProfile)
 	userGroup.Post("/profile/picture", userHandler.UploadProfilePic)
-
-	a.Fiber.Get("/api/media/profile-pics/:filename", userHandler.GetProfilePic)
-
-	// Doctor auth routes - no middleware for auth endpoints
-	doctorAuth := a.Fiber.Group("/auth/doctor")
-	doctorAuth.Post("/register", doctorAuthHandler.Register)
-	doctorAuth.Post("/login", doctorAuthHandler.Login)
-	doctorAuth.Get("/callback", doctorAuthHandler.Callback)
-	doctorAuth.Post("/callback", doctorAuthHandler.Callback)
-	doctorAuth.Post("/logout", doctorAuthHandler.Logout)
-
-	// Doctor API routes - use the new auth middleware with doctor client type
-	//doctorApi := a.Fiber.Group("/api/doctor", authMiddleware.Handler())
-	// Add doctor-specific routes here
+	userGroup.Get("/profile/picture/:filename", userHandler.GetProfilePic)
 
 	return nil
 }
@@ -374,4 +350,20 @@ func main() {
 	if err := app.Start(); err != nil {
 		log.Fatalf("Application error: %v", err)
 	}
+}
+
+func AuthkitInit(cfg config.Config) {
+	// Initialize SSO with client ID and API key
+	sso.Configure(
+		cfg.WorkOSClientId,
+		cfg.WorkOSApiKey,
+	)
+
+	// Set API keys for other WorkOS services
+	organizations.SetAPIKey(cfg.WorkOSOrganizationsKey)
+	passwordless.SetAPIKey(cfg.WorkOSPasswordlessKey)
+	directorysync.SetAPIKey(cfg.WorkOSDirectorySyncKey)
+	usermanagement.SetAPIKey(cfg.WorkOSUserManagement)
+	auditlogs.SetAPIKey(cfg.WorkOSAuditLogsKey)
+	portal.SetAPIKey(cfg.WorkOSPortal)
 }
