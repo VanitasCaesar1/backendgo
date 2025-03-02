@@ -275,7 +275,6 @@ func (a *App) setupRoutes() error {
 		WorkosClient: a.WorkosClient,
 		ClientID:     a.Config.WorkOSClientId,
 	})
-
 	if err != nil {
 		return fmt.Errorf("failed to initialize auth middleware: %v", err)
 	}
@@ -284,6 +283,12 @@ func (a *App) setupRoutes() error {
 	userHandler, err := handlers.NewUserHandler(a.Config, a.Redis, a.Logger, a.Postgres)
 	if err != nil {
 		return fmt.Errorf("failed to initialize user handler: %v", err)
+	}
+
+	// Doctor handler
+	doctorHandler, err := handlers.NewDoctorHandler(a.Config, a.Redis, a.Logger, a.Postgres)
+	if err != nil {
+		return fmt.Errorf("failed to initialize doctor handler: %v", err)
 	}
 
 	// Initialize Doctor Auth Handler
@@ -300,9 +305,19 @@ func (a *App) setupRoutes() error {
 	userGroup.Get("/profile/picture/:filename", userHandler.GetProfilePic)
 
 	// Doctor routes that require authentication
-	doctorGroup := api.Group("/doctor")
+	doctorGroup := api.Group("/doctors")
 	doctorGroup.Get("/profile", doctorAuthHandler.GetDoctorProfile)
 	doctorGroup.Delete("/profile", doctorAuthHandler.DeleteDoctor)
+
+	// Adding new doctor routes for profile, schedule and fees
+	doctorGroup.Get("/profile", doctorHandler.GetDoctorProfile)
+	doctorGroup.Put("/profile", doctorHandler.UpdateDoctorProfile)
+	doctorGroup.Get("/schedule", doctorHandler.GetDoctorSchedule)
+	doctorGroup.Put("/schedule", doctorHandler.UpdateDoctorSchedule)
+	doctorGroup.Get("/fees", doctorHandler.GetDoctorFees)
+	doctorGroup.Put("/fees", doctorHandler.UpdateDoctorFees)
+	doctorGroup.Delete("/api/doctors/schedule/:id", doctorHandler.DeleteDoctorSchedule)
+	doctorGroup.Delete("/api/doctors/fees/:id", doctorHandler.DeleteDoctorFees)
 
 	// Auth routes (no authentication required)
 	authGroup := a.Fiber.Group("/auth")

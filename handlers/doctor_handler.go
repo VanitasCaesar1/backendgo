@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"regexp"
 	"time"
@@ -22,6 +23,12 @@ type DoctorHandler struct {
 	pgPool      *pgxpool.Pool
 }
 
+type Specialization struct {
+	Primary   string   `json:"primary"`
+	Secondary []string `json:"secondary,omitempty"`
+	Tags      []string `json:"tags,omitempty"`
+}
+
 type DoctorProfile struct {
 	UserID            uuid.UUID `json:"user_id"`
 	AuthID            string    `json:"auth_id,omitempty"`
@@ -34,12 +41,12 @@ type DoctorProfile struct {
 	Location          string    `json:"location"`
 	Address           string    `json:"address,omitempty"`
 
-	IMRNumber      string `json:"imr_number,omitempty"`
-	Age            int    `json:"age,omitempty"`
-	Specialization string `json:"specialization,omitempty"`
-	IsActive       bool   `json:"is_active,omitempty"`
-	Qualification  string `json:"qualification,omitempty"`
-	SlotDuration   int    `json:"slot_duration,omitempty"`
+	IMRNumber      string         `json:"imr_number,omitempty"`
+	Age            int            `json:"age,omitempty"`
+	Specialization Specialization `json:"specialization,omitempty"`
+	IsActive       bool           `json:"is_active,omitempty"`
+	Qualification  string         `json:"qualification,omitempty"`
+	SlotDuration   int            `json:"slot_duration,omitempty"`
 
 	HospitalID uuid.UUID `json:"hospital_id,omitempty"`
 
@@ -105,6 +112,7 @@ func (h *DoctorHandler) getAuthID(c *fiber.Ctx) (string, error) {
 
 // GetDoctorProfile retrieves the doctor's complete profile
 func (h *DoctorHandler) GetDoctorProfile(c *fiber.Ctx) error {
+
 	authID, err := h.getAuthID(c)
 	if err != nil {
 		h.logger.Error("authID not found in context")
@@ -122,13 +130,14 @@ func (h *DoctorHandler) GetDoctorProfile(c *fiber.Ctx) error {
 		})
 	}
 
-	// Get user ID and check if doctor
+	// Get user ID directly from database
 	userID, err := h.getUserID(c.Context(), authID)
 	if err != nil {
 		h.logger.Error("failed to get user ID", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
+	// Now proceed with the user ID we got from the database
 	isDoctor, err := h.isUserDoctor(c.Context(), userID)
 	if err != nil {
 		h.logger.Error("failed to check if user is a doctor", zap.Error(err))
@@ -141,39 +150,41 @@ func (h *DoctorHandler) GetDoctorProfile(c *fiber.Ctx) error {
 
 	// Get basic user info and doctor-specific data in one query
 	var profile DoctorProfile
+	var specializationJSON []byte
+
 	err = h.pgPool.QueryRow(c.Context(),
 		`WITH doctor_data AS (
-			SELECT 
-				COALESCE(imr_number, '') as imr_number,
-				age,
-				COALESCE(specialization, '') as specialization,
-				is_active,
-				COALESCE(qualification, '') as qualification,
-				COALESCE(slot_duration, 30) as slot_duration
-			FROM doctors
-			WHERE doctor_id = $1
-		)
-		SELECT 
-			u.user_id,
-			u.auth_id,
-			COALESCE(u.username, '') as username,
-			COALESCE(u.profile_pic, '') as profile_pic,
-			COALESCE(u.name, '') as name,
-			COALESCE(CAST(u.mobile AS TEXT), '') as mobile,
-			COALESCE(u.email, $2) as email,
-			COALESCE(u.blood_group, '') as blood_group,
-			COALESCE(u.location, '') as location,
-			COALESCE(u.address, '') as address,
-			u.hospital_id,
-			d.imr_number,
-			d.age,
-			d.specialization,
-			d.is_active,
-			d.qualification,
-			d.slot_duration
-		FROM users u
-		JOIN doctor_data d ON true
-		WHERE u.auth_id = $3`,
+            SELECT 
+                COALESCE(imr_number, '') as imr_number,
+                age,
+                specialization,
+                is_active,
+                COALESCE(qualification, '') as qualification,
+                COALESCE(slot_duration, 30) as slot_duration
+            FROM doctors
+            WHERE doctor_id = $1
+        )
+        SELECT 
+            u.user_id,
+            u.auth_id,
+            COALESCE(u.username, '') as username,
+            COALESCE(u.profile_pic, '') as profile_pic,
+            COALESCE(u.name, '') as name,
+            COALESCE(CAST(u.mobile AS TEXT), '') as mobile,
+            COALESCE(u.email, $2) as email,
+            COALESCE(u.blood_group, '') as blood_group,
+            COALESCE(u.location, '') as location,
+            COALESCE(u.address, '') as address,
+            u.hospital_id,
+            d.imr_number,
+            d.age,
+            d.specialization,
+            d.is_active,
+            d.qualification,
+            d.slot_duration
+        FROM users u
+        JOIN doctor_data d ON true
+        WHERE u.auth_id = $3`,
 		userID, workosUser.Email, authID).Scan(
 		&profile.UserID,
 		&profile.AuthID,
@@ -188,7 +199,7 @@ func (h *DoctorHandler) GetDoctorProfile(c *fiber.Ctx) error {
 		&profile.HospitalID,
 		&profile.IMRNumber,
 		&profile.Age,
-		&profile.Specialization,
+		&specializationJSON,
 		&profile.IsActive,
 		&profile.Qualification,
 		&profile.SlotDuration,
@@ -197,6 +208,18 @@ func (h *DoctorHandler) GetDoctorProfile(c *fiber.Ctx) error {
 	if err != nil {
 		h.logger.Error("failed to fetch doctor profile", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch doctor profile"})
+	}
+
+	// Parse the JSONB specialization field
+	if len(specializationJSON) > 0 {
+		if err := json.Unmarshal(specializationJSON, &profile.Specialization); err != nil {
+			h.logger.Error("failed to parse specialization JSON", zap.Error(err))
+			// Continue without specialization rather than failing the whole request
+			profile.Specialization = Specialization{Primary: "Unknown"}
+		}
+	} else {
+		// Set default value if JSONB is null
+		profile.Specialization = Specialization{Primary: ""}
 	}
 
 	return c.JSON(profile)
@@ -335,6 +358,13 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Doctor profile not found"})
 	}
 
+	// Convert specialization struct to JSON
+	specializationJSON, err := json.Marshal(updateData.Specialization)
+	if err != nil {
+		h.logger.Error("failed to marshal specialization to JSON", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process specialization data"})
+	}
+
 	// Update in a single transaction
 	_, err = tx.Exec(c.Context(),
 		`UPDATE users SET username = $1, name = $2, mobile = $3, blood_group = $4, location = $5, address = $6
@@ -349,7 +379,7 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 	_, err = tx.Exec(c.Context(),
 		`UPDATE doctors SET imr_number = $1, age = $2, specialization = $3, is_active = $4, qualification = $5, slot_duration = $6
 		 WHERE doctor_id = $7`,
-		updateData.IMRNumber, updateData.Age, updateData.Specialization, updateData.IsActive,
+		updateData.IMRNumber, updateData.Age, specializationJSON, updateData.IsActive,
 		updateData.Qualification, updateData.SlotDuration, userID)
 	if err != nil {
 		h.logger.Error("failed to update doctor profile", zap.Error(err), zap.String("user_id", userID.String()))
@@ -498,8 +528,8 @@ func (h *DoctorHandler) validateDoctorProfileUpdate(profile *DoctorProfile) erro
 			"IMR number must not exceed 30 characters"},
 		{profile.Age < 18 || profile.Age > 100,
 			"age must be between 18 and 100"},
-		{len(profile.Specialization) > 100,
-			"specialization must not exceed 100 characters"},
+		{len(profile.Specialization.Primary) > 100,
+			"primary specialization must not exceed 100 characters"},
 		{len(profile.Qualification) > 200,
 			"qualification must not exceed 200 characters"},
 		{profile.SlotDuration < 5 || profile.SlotDuration > 120,
@@ -510,6 +540,41 @@ func (h *DoctorHandler) validateDoctorProfileUpdate(profile *DoctorProfile) erro
 		if v.condition {
 			h.logger.Error("validation error", zap.String("error", v.message))
 			return errors.New(v.message)
+		}
+	}
+
+	// Validate secondary specializations and tags if they exist
+	if len(profile.Specialization.Secondary) > 0 {
+		for i, s := range profile.Specialization.Secondary {
+			if len(s) > 100 {
+				return errors.New("secondary specialization item must not exceed 100 characters")
+			}
+			if len(profile.Specialization.Secondary) > 10 {
+				return errors.New("cannot have more than 10 secondary specializations")
+			}
+			// Check for duplicates
+			for j := i + 1; j < len(profile.Specialization.Secondary); j++ {
+				if s == profile.Specialization.Secondary[j] {
+					return errors.New("duplicate secondary specialization found")
+				}
+			}
+		}
+	}
+
+	if len(profile.Specialization.Tags) > 0 {
+		if len(profile.Specialization.Tags) > 20 {
+			return errors.New("cannot have more than 20 tags")
+		}
+		for i, tag := range profile.Specialization.Tags {
+			if len(tag) > 50 {
+				return errors.New("tag must not exceed 50 characters")
+			}
+			// Check for duplicates
+			for j := i + 1; j < len(profile.Specialization.Tags); j++ {
+				if tag == profile.Specialization.Tags[j] {
+					return errors.New("duplicate tag found")
+				}
+			}
 		}
 	}
 
@@ -538,4 +603,75 @@ func (h *DoctorHandler) validateFeesData(fees *DoctorFees) error {
 		return errors.New("fees cannot be negative")
 	}
 	return nil
+}
+
+// DeleteDoctorSchedule deletes a doctor's schedule entry
+func (h *DoctorHandler) DeleteDoctorSchedule(c *fiber.Ctx) error {
+	scheduleId := c.Params("id")
+	if scheduleId == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Schedule ID is required"})
+	}
+
+	// Get the authorized user
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	userID, err := h.getUserID(c.Context(), authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	// Delete the schedule, ensuring it belongs to the current doctor
+	result, err := h.pgPool.Exec(c.Context(),
+		`DELETE FROM doctorshifts WHERE id = $1 AND doctor_id = $2`, scheduleId, userID)
+	if err != nil {
+		h.logger.Error("failed to delete doctor schedule", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to delete schedule"})
+	}
+
+	rowsAffected := result.RowsAffected()
+	if rowsAffected == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Schedule not found or you don't have permission to delete it"})
+	}
+
+	return c.JSON(fiber.Map{"message": "Schedule deleted successfully"})
+}
+
+// DeleteDoctorFees deletes a doctor's fees entry
+func (h *DoctorHandler) DeleteDoctorFees(c *fiber.Ctx) error {
+	feesId := c.Params("id")
+	if feesId == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Fees ID is required"})
+	}
+	// Get the authorized user
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	userID, err := h.getUserID(c.Context(), authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	// Delete the fees entry, ensuring it belongs to the current doctor
+	result, err := h.pgPool.Exec(c.Context(),
+		`DELETE FROM doctor_fees WHERE id = $1 AND doctor_id = $2`, feesId, userID)
+	if err != nil {
+		h.logger.Error("failed to delete doctor fees", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to delete fees"})
+	}
+
+	rowsAffected := result.RowsAffected()
+	if rowsAffected == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Fees not found or you don't have permission to delete it"})
+	}
+
+	return c.JSON(fiber.Map{"message": "Fees deleted successfully"})
 }

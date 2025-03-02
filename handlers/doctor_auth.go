@@ -366,20 +366,19 @@ func (h *DoctorAuthHandler) LoginDoctor(c *fiber.Ctx) error {
 // GetDoctorProfile retrieves a doctor's profile
 func (h *DoctorAuthHandler) GetDoctorProfile(c *fiber.Ctx) error {
 	// Get user ID from context (set by AuthMiddleware)
-	userIDStr, ok := c.Locals("userID").(string)
+	authID, ok := c.Locals("authID").(string)
 	if !ok {
-		h.logger.Error("userID not found in context")
+		h.logger.Error("authID not found in context")
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 			"error": "User not authenticated",
 		})
 	}
 
-	userID, err := uuid.Parse(userIDStr)
+	var userID uuid.UUID
+	err := h.pgPool.QueryRow(c.Context(), "SELECT user_id FROM users WHERE auth_id = $1", authID).Scan(&userID)
 	if err != nil {
-		h.logger.Error("invalid userID format", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Invalid user ID format",
-		})
+		h.logger.Error("failed to get user ID", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
 	// Get doctor from database
