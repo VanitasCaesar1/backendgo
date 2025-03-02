@@ -267,14 +267,13 @@ func NewApp() (*App, error) {
 
 func (a *App) setupRoutes() error {
 	// Setup the auth middleware with WorkOS client
-	// Update: Handle both the middleware and error return values
 	authMiddleware, err := middleware.NewAuthMiddleware(middleware.AuthMiddlewareConfig{
 		Logger:       a.Logger,
 		Redis:        a.Redis,
 		Config:       a.Config,
-		CookieName:   "wos-session", // Changed from "session" to "wos-session"
+		CookieName:   "wos-session",
 		WorkosClient: a.WorkosClient,
-		ClientID:     a.Config.WorkOSClientId, // Added ClientID from config
+		ClientID:     a.Config.WorkOSClientId,
 	})
 
 	if err != nil {
@@ -287,13 +286,31 @@ func (a *App) setupRoutes() error {
 		return fmt.Errorf("failed to initialize user handler: %v", err)
 	}
 
+	// Initialize Doctor Auth Handler
+	doctorAuthHandler := handlers.NewDoctorAuthHandler(a.Config, a.Redis, a.Logger, a.Postgres, authMiddleware)
+
 	// Regular API routes - use auth middleware
 	api := a.Fiber.Group("/api", authMiddleware.Handler())
+
+	// User routes
 	userGroup := api.Group("/user")
 	userGroup.Get("/profile", userHandler.GetUserProfile)
 	userGroup.Put("/profile", userHandler.UpdateUserProfile)
 	userGroup.Post("/profile/picture", userHandler.UploadProfilePic)
 	userGroup.Get("/profile/picture/:filename", userHandler.GetProfilePic)
+
+	// Doctor routes that require authentication
+	doctorGroup := api.Group("/doctor")
+	doctorGroup.Get("/profile", doctorAuthHandler.GetDoctorProfile)
+	doctorGroup.Delete("/profile", doctorAuthHandler.DeleteDoctor)
+
+	// Auth routes (no authentication required)
+	authGroup := a.Fiber.Group("/auth")
+
+	// Doctor authentication routes (public)
+	doctorAuthGroup := authGroup.Group("/doctor")
+	doctorAuthGroup.Post("/register", doctorAuthHandler.RegisterDoctor)
+	doctorAuthGroup.Post("/login", doctorAuthHandler.LoginDoctor)
 
 	return nil
 }

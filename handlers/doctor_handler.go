@@ -1,0 +1,541 @@
+package handlers
+
+import (
+	"context"
+	"errors"
+	"regexp"
+	"time"
+
+	"github.com/VanitasCaesar1/backend/config"
+	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+	"github.com/workos/workos-go/v4/pkg/usermanagement"
+	"go.uber.org/zap"
+)
+
+type DoctorHandler struct {
+	config      *config.Config
+	redisClient *redis.Client
+	logger      *zap.Logger
+	pgPool      *pgxpool.Pool
+}
+
+type DoctorProfile struct {
+	UserID            uuid.UUID `json:"user_id"`
+	AuthID            string    `json:"auth_id,omitempty"`
+	Username          string    `json:"username"`
+	ProfilePictureURL string    `json:"profile_picture_url,omitempty"`
+	Name              string    `json:"name"`
+	Mobile            string    `json:"mobile"`
+	Email             string    `json:"email"`
+	BloodGroup        string    `json:"blood_group,omitempty"`
+	Location          string    `json:"location"`
+	Address           string    `json:"address,omitempty"`
+
+	IMRNumber      string `json:"imr_number,omitempty"`
+	Age            int    `json:"age,omitempty"`
+	Specialization string `json:"specialization,omitempty"`
+	IsActive       bool   `json:"is_active,omitempty"`
+	Qualification  string `json:"qualification,omitempty"`
+	SlotDuration   int    `json:"slot_duration,omitempty"`
+
+	HospitalID uuid.UUID `json:"hospital_id,omitempty"`
+
+	CreatedAt string `json:"created_at,omitempty"`
+	UpdatedAt string `json:"updated_at,omitempty"`
+}
+
+type DoctorSchedule struct {
+	DoctorID   uuid.UUID `json:"doctor_id"`
+	HospitalID uuid.UUID `json:"hospital_id"`
+	Weekday    string    `json:"weekday"`
+	StartTime  string    `json:"start_time"`
+	EndTime    string    `json:"end_time"`
+	IsActive   bool      `json:"is_active"`
+}
+
+type DoctorFees struct {
+	DoctorID      uuid.UUID `json:"doctor_id"`
+	HospitalID    uuid.UUID `json:"hospital_id"`
+	DoctorName    string    `json:"doctor_name"`
+	RecurringFees int       `json:"recurring_fees"`
+	DefaultFees   int       `json:"default_fees"`
+	EmergencyFees int       `json:"emergency_fees"`
+	CreatedAt     string    `json:"created_at,omitempty"`
+}
+
+func NewDoctorHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, pgPool *pgxpool.Pool) (*DoctorHandler, error) {
+	usermanagement.SetAPIKey(cfg.WorkOSApiKey)
+	return &DoctorHandler{
+		config:      cfg,
+		redisClient: rds,
+		logger:      logger,
+		pgPool:      pgPool,
+	}, nil
+}
+
+// Helper functions
+func (h *DoctorHandler) getUserID(ctx context.Context, authID string) (uuid.UUID, error) {
+	var userID uuid.UUID
+	err := h.pgPool.QueryRow(ctx, "SELECT user_id FROM users WHERE auth_id = $1", authID).Scan(&userID)
+	return userID, err
+}
+
+func (h *DoctorHandler) isUserDoctor(ctx context.Context, userID uuid.UUID) (bool, error) {
+	var isDoctor bool
+	err := h.pgPool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM doctors WHERE doctor_id = $1)", userID).Scan(&isDoctor)
+	return isDoctor, err
+}
+
+func (h *DoctorHandler) checkHospitalExists(ctx context.Context, hospitalID uuid.UUID) (bool, error) {
+	var exists bool
+	err := h.pgPool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM hospitals WHERE id = $1)", hospitalID).Scan(&exists)
+	return exists, err
+}
+
+func (h *DoctorHandler) getAuthID(c *fiber.Ctx) (string, error) {
+	authID, ok := c.Locals("authID").(string)
+	if !ok {
+		return "", errors.New("user ID not found")
+	}
+	return authID, nil
+}
+
+// GetDoctorProfile retrieves the doctor's complete profile
+func (h *DoctorHandler) GetDoctorProfile(c *fiber.Ctx) error {
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	h.logger.Info("processing doctor profile request", zap.String("authID", authID), zap.Any("all_claims", c.Locals("claims")))
+
+	// Get user from WorkOS
+	workosUser, err := usermanagement.GetUser(c.Context(), usermanagement.GetUserOpts{User: authID})
+	if err != nil {
+		h.logger.Error("failed to fetch user from WorkOS", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to fetch user profile from authentication provider",
+		})
+	}
+
+	// Get user ID and check if doctor
+	userID, err := h.getUserID(c.Context(), authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	isDoctor, err := h.isUserDoctor(c.Context(), userID)
+	if err != nil {
+		h.logger.Error("failed to check if user is a doctor", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	if !isDoctor {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Doctor profile not found"})
+	}
+
+	// Get basic user info and doctor-specific data in one query
+	var profile DoctorProfile
+	err = h.pgPool.QueryRow(c.Context(),
+		`WITH doctor_data AS (
+			SELECT 
+				COALESCE(imr_number, '') as imr_number,
+				age,
+				COALESCE(specialization, '') as specialization,
+				is_active,
+				COALESCE(qualification, '') as qualification,
+				COALESCE(slot_duration, 30) as slot_duration
+			FROM doctors
+			WHERE doctor_id = $1
+		)
+		SELECT 
+			u.user_id,
+			u.auth_id,
+			COALESCE(u.username, '') as username,
+			COALESCE(u.profile_pic, '') as profile_pic,
+			COALESCE(u.name, '') as name,
+			COALESCE(CAST(u.mobile AS TEXT), '') as mobile,
+			COALESCE(u.email, $2) as email,
+			COALESCE(u.blood_group, '') as blood_group,
+			COALESCE(u.location, '') as location,
+			COALESCE(u.address, '') as address,
+			u.hospital_id,
+			d.imr_number,
+			d.age,
+			d.specialization,
+			d.is_active,
+			d.qualification,
+			d.slot_duration
+		FROM users u
+		JOIN doctor_data d ON true
+		WHERE u.auth_id = $3`,
+		userID, workosUser.Email, authID).Scan(
+		&profile.UserID,
+		&profile.AuthID,
+		&profile.Username,
+		&profile.ProfilePictureURL,
+		&profile.Name,
+		&profile.Mobile,
+		&profile.Email,
+		&profile.BloodGroup,
+		&profile.Location,
+		&profile.Address,
+		&profile.HospitalID,
+		&profile.IMRNumber,
+		&profile.Age,
+		&profile.Specialization,
+		&profile.IsActive,
+		&profile.Qualification,
+		&profile.SlotDuration,
+	)
+
+	if err != nil {
+		h.logger.Error("failed to fetch doctor profile", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch doctor profile"})
+	}
+
+	return c.JSON(profile)
+}
+
+// GetDoctorSchedule retrieves the doctor's schedule
+func (h *DoctorHandler) GetDoctorSchedule(c *fiber.Ctx) error {
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	userID, err := h.getUserID(c.Context(), authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	rows, err := h.pgPool.Query(c.Context(),
+		`SELECT doctor_id, hospital_id, weekday, starttime, endtime, isactive
+		 FROM doctorshifts WHERE doctor_id = $1`, userID)
+	if err != nil {
+		h.logger.Error("failed to fetch doctor schedule", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch doctor schedule"})
+	}
+	defer rows.Close()
+
+	var schedules []DoctorSchedule
+	for rows.Next() {
+		var schedule DoctorSchedule
+		var startTime, endTime time.Time
+
+		if err := rows.Scan(&schedule.DoctorID, &schedule.HospitalID, &schedule.Weekday, &startTime, &endTime, &schedule.IsActive); err != nil {
+			h.logger.Error("failed to scan doctor schedule", zap.Error(err))
+			continue
+		}
+
+		schedule.StartTime = startTime.Format("15:04")
+		schedule.EndTime = endTime.Format("15:04")
+		schedules = append(schedules, schedule)
+	}
+
+	if err := rows.Err(); err != nil {
+		h.logger.Error("error during schedule rows scan", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process doctor schedule"})
+	}
+
+	return c.JSON(schedules)
+}
+
+// GetDoctorFees retrieves the doctor's fees structure
+func (h *DoctorHandler) GetDoctorFees(c *fiber.Ctx) error {
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	userID, err := h.getUserID(c.Context(), authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	rows, err := h.pgPool.Query(c.Context(),
+		`SELECT doctor_id, hospital_id, doctor_name, recurring_fees, default_fees, emergency_fees, created_at
+		 FROM doctor_fees WHERE doctor_id = $1`, userID)
+	if err != nil {
+		h.logger.Error("failed to fetch doctor fees", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch doctor fees"})
+	}
+	defer rows.Close()
+
+	var feesStructures []DoctorFees
+	for rows.Next() {
+		var fees DoctorFees
+		var createdAt time.Time
+
+		if err := rows.Scan(&fees.DoctorID, &fees.HospitalID, &fees.DoctorName, &fees.RecurringFees,
+			&fees.DefaultFees, &fees.EmergencyFees, &createdAt); err != nil {
+			h.logger.Error("failed to scan doctor fees", zap.Error(err))
+			continue
+		}
+
+		fees.CreatedAt = createdAt.Format(time.RFC3339)
+		feesStructures = append(feesStructures, fees)
+	}
+
+	if err := rows.Err(); err != nil {
+		h.logger.Error("error during fees rows scan", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process doctor fees"})
+	}
+
+	return c.JSON(feesStructures)
+}
+
+// UpdateDoctorProfile updates the doctor's profile information
+func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	var updateData DoctorProfile
+	if err := c.BodyParser(&updateData); err != nil {
+		h.logger.Error("failed to parse update data", zap.Error(err))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request data"})
+	}
+
+	if err := h.validateDoctorProfileUpdate(&updateData); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	tx, err := h.pgPool.Begin(c.Context())
+	if err != nil {
+		h.logger.Error("failed to begin transaction", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+	defer tx.Rollback(c.Context())
+
+	userID, err := h.getUserID(c.Context(), authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	isDoctor, err := h.isUserDoctor(c.Context(), userID)
+	if err != nil {
+		h.logger.Error("failed to check if user is a doctor", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	if !isDoctor {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Doctor profile not found"})
+	}
+
+	// Update in a single transaction
+	_, err = tx.Exec(c.Context(),
+		`UPDATE users SET username = $1, name = $2, mobile = $3, blood_group = $4, location = $5, address = $6
+		 WHERE auth_id = $7`,
+		updateData.Username, updateData.Name, updateData.Mobile, updateData.BloodGroup,
+		updateData.Location, updateData.Address, authID)
+	if err != nil {
+		h.logger.Error("failed to update user profile", zap.Error(err), zap.String("auth_id", authID))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update profile"})
+	}
+
+	_, err = tx.Exec(c.Context(),
+		`UPDATE doctors SET imr_number = $1, age = $2, specialization = $3, is_active = $4, qualification = $5, slot_duration = $6
+		 WHERE doctor_id = $7`,
+		updateData.IMRNumber, updateData.Age, updateData.Specialization, updateData.IsActive,
+		updateData.Qualification, updateData.SlotDuration, userID)
+	if err != nil {
+		h.logger.Error("failed to update doctor profile", zap.Error(err), zap.String("user_id", userID.String()))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update doctor profile"})
+	}
+
+	if err := tx.Commit(c.Context()); err != nil {
+		h.logger.Error("failed to commit transaction", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	return c.JSON(fiber.Map{"message": "Doctor profile updated successfully"})
+}
+
+// UpdateDoctorSchedule adds or updates the doctor's schedule
+func (h *DoctorHandler) UpdateDoctorSchedule(c *fiber.Ctx) error {
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	var scheduleData DoctorSchedule
+	if err := c.BodyParser(&scheduleData); err != nil {
+		h.logger.Error("failed to parse schedule data", zap.Error(err))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request data"})
+	}
+
+	if err := h.validateScheduleData(&scheduleData); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	userID, err := h.getUserID(c.Context(), authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	hospitalExists, err := h.checkHospitalExists(c.Context(), scheduleData.HospitalID)
+	if err != nil {
+		h.logger.Error("failed to check hospital existence", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	if !hospitalExists {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Hospital not found"})
+	}
+
+	startTime, err := time.Parse("15:04", scheduleData.StartTime)
+	if err != nil {
+		h.logger.Error("failed to parse start time", zap.Error(err))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid start time format. Use HH:MM (24-hour format)"})
+	}
+
+	endTime, err := time.Parse("15:04", scheduleData.EndTime)
+	if err != nil {
+		h.logger.Error("failed to parse end time", zap.Error(err))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid end time format. Use HH:MM (24-hour format)"})
+	}
+
+	_, err = h.pgPool.Exec(c.Context(),
+		`INSERT INTO doctorshifts (doctor_id, hospital_id, weekday, starttime, endtime, isactive) 
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 ON CONFLICT (doctor_id, weekday, hospital_id) 
+		 DO UPDATE SET starttime = $4, endtime = $5, isactive = $6`,
+		userID, scheduleData.HospitalID, scheduleData.Weekday, startTime, endTime, scheduleData.IsActive)
+	if err != nil {
+		h.logger.Error("failed to update doctor schedule", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update schedule"})
+	}
+
+	return c.JSON(fiber.Map{"message": "Schedule updated successfully"})
+}
+
+// UpdateDoctorFees adds or updates the doctor's fees structure
+func (h *DoctorHandler) UpdateDoctorFees(c *fiber.Ctx) error {
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	var feesData DoctorFees
+	if err := c.BodyParser(&feesData); err != nil {
+		h.logger.Error("failed to parse fees data", zap.Error(err))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request data"})
+	}
+
+	if err := h.validateFeesData(&feesData); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	var userID uuid.UUID
+	var userName string
+	err = h.pgPool.QueryRow(c.Context(), "SELECT user_id, name FROM users WHERE auth_id = $1", authID).Scan(&userID, &userName)
+	if err != nil {
+		h.logger.Error("failed to get user ID and name", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	hospitalExists, err := h.checkHospitalExists(c.Context(), feesData.HospitalID)
+	if err != nil {
+		h.logger.Error("failed to check hospital existence", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	if !hospitalExists {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Hospital not found"})
+	}
+
+	_, err = h.pgPool.Exec(c.Context(),
+		`INSERT INTO doctor_fees (doctor_id, hospital_id, doctor_name, recurring_fees, default_fees, emergency_fees, created_at) 
+		 VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)
+		 ON CONFLICT (doctor_id, hospital_id) 
+		 DO UPDATE SET doctor_name = $3, recurring_fees = $4, default_fees = $5, emergency_fees = $6, created_at = CURRENT_TIMESTAMP`,
+		userID, feesData.HospitalID, userName, feesData.RecurringFees, feesData.DefaultFees, feesData.EmergencyFees)
+	if err != nil {
+		h.logger.Error("failed to update doctor fees", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update fees"})
+	}
+
+	return c.JSON(fiber.Map{"message": "Fees updated successfully"})
+}
+
+// validateDoctorProfileUpdate validates the doctor profile update data
+func (h *DoctorHandler) validateDoctorProfileUpdate(profile *DoctorProfile) error {
+	validations := []struct {
+		condition bool
+		message   string
+	}{
+		{profile.Username != "" && (len(profile.Username) < 3 || len(profile.Username) > 30),
+			"username must be between 3 and 30 characters"},
+		{profile.Username != "" && !regexp.MustCompile(`^[a-zA-Z0-9_.]+$`).MatchString(profile.Username),
+			"username can only contain letters, numbers, underscores, and periods"},
+		{len(profile.Name) > 100,
+			"name must not exceed 100 characters"},
+		{profile.Mobile != "" && !regexp.MustCompile(`^\+?[0-9]{10,15}$`).MatchString(profile.Mobile),
+			"invalid mobile number format"},
+		{profile.BloodGroup != "" && !map[string]bool{"A+": true, "A-": true, "B+": true, "B-": true, "O+": true, "O-": true, "AB+": true, "AB-": true}[profile.BloodGroup],
+			"invalid blood group"},
+		{len(profile.Location) > 100,
+			"location must not exceed 100 characters"},
+		{len(profile.Address) > 500,
+			"address must not exceed 500 characters"},
+		{profile.IMRNumber != "" && len(profile.IMRNumber) > 30,
+			"IMR number must not exceed 30 characters"},
+		{profile.Age < 18 || profile.Age > 100,
+			"age must be between 18 and 100"},
+		{len(profile.Specialization) > 100,
+			"specialization must not exceed 100 characters"},
+		{len(profile.Qualification) > 200,
+			"qualification must not exceed 200 characters"},
+		{profile.SlotDuration < 5 || profile.SlotDuration > 120,
+			"slot duration must be between 5 and 120 minutes"},
+	}
+
+	for _, v := range validations {
+		if v.condition {
+			h.logger.Error("validation error", zap.String("error", v.message))
+			return errors.New(v.message)
+		}
+	}
+
+	return nil
+}
+
+// validateScheduleData validates the doctor schedule data
+func (h *DoctorHandler) validateScheduleData(schedule *DoctorSchedule) error {
+	validWeekdays := map[string]bool{
+		"Monday": true, "Tuesday": true, "Wednesday": true,
+		"Thursday": true, "Friday": true, "Saturday": true, "Sunday": true,
+	}
+
+	if !validWeekdays[schedule.Weekday] {
+		h.logger.Error("invalid weekday", zap.String("weekday", schedule.Weekday))
+		return errors.New("invalid weekday. Must be one of: Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday")
+	}
+
+	_, err := time.Parse("15:04", schedule.StartTime)
+	return err
+}
+
+// validateFeesData validates the doctor fees data
+func (h *DoctorHandler) validateFeesData(fees *DoctorFees) error {
+	if fees.RecurringFees < 0 || fees.DefaultFees < 0 || fees.EmergencyFees < 0 {
+		return errors.New("fees cannot be negative")
+	}
+	return nil
+}

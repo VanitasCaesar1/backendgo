@@ -85,7 +85,6 @@ func NewUserHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, p
 }
 
 // GetUserProfile retrieves the user's profile
-// GetUserProfile retrieves the user's profile
 func (h *UserHandler) GetUserProfile(c *fiber.Ctx) error {
 	// Get WorkOS user ID from context
 	authID, ok := c.Locals("authID").(string)
@@ -366,14 +365,13 @@ func (h *UserHandler) UpdateUserProfile(c *fiber.Ctx) error {
 	// Update in our database
 	commandTag, err := tx.Exec(c.Context(),
 		`UPDATE users 
-		 SET username = $1, 
-		     name = $2, 
-		     mobile = $3, 
-		     blood_group = $4, 
-		     location = $5, 
-		     address = $6,
-		     updated_at = CURRENT_TIMESTAMP
-		 WHERE auth_id = $7`,
+     SET username = $1, 
+         name = $2, 
+         mobile = $3, 
+         blood_group = $4, 
+         location = $5, 
+         address = $6
+     WHERE auth_id = $7`,
 		updateData.Username,
 		updateData.Name,
 		updateData.Mobile,
