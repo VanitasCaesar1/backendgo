@@ -218,9 +218,8 @@ func (h *UserHandler) GetUserProfile(c *fiber.Ctx) error {
 	_, err = tx.Exec(c.Context(),
 		`UPDATE users 
 		 SET email = $1, 
-		     name = $2, 
-		     profile_pic = $3,
-		     updated_at = CURRENT_TIMESTAMP
+			 name = $2, 
+			 profile_pic = $3
 		 WHERE auth_id = $4`,
 		workosUser.Email, fullName,
 		workosUser.ProfilePictureURL, authID)
