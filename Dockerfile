@@ -3,11 +3,18 @@ FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
+# Install git and other dependencies needed for go mod
+RUN apk add --no-cache git ca-certificates tzdata
+
 # Copy go mod and sum files
 COPY go.mod go.sum ./
 
+# Set environment variables to enable Go modules
+ENV GO111MODULE=on
+ENV GOPROXY=https://proxy.golang.org,direct
+
 # Download all dependencies
-RUN go mod download
+RUN go mod download || go mod tidy
 
 # Copy the source code
 COPY . .
