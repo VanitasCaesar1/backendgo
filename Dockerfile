@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.21-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
 
@@ -14,7 +14,7 @@ ENV GO111MODULE=on
 ENV GOPROXY=https://proxy.golang.org,direct
 
 # Download all dependencies
-RUN go mod download || go mod tidy
+RUN go mod download
 
 # Copy the source code
 COPY . .
