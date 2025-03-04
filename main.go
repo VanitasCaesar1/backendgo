@@ -10,13 +10,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gofiber/fiber/v2/middleware/limiter"
-
 	"github.com/VanitasCaesar1/backend/config"
 	"github.com/VanitasCaesar1/backend/handlers"
 	"github.com/VanitasCaesar1/backend/middleware"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
+	"github.com/gofiber/fiber/v2/middleware/limiter"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
@@ -29,6 +28,8 @@ import (
 	"github.com/workos/workos-go/v4/pkg/portal"
 	"github.com/workos/workos-go/v4/pkg/sso"
 	"github.com/workos/workos-go/v4/pkg/usermanagement"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.uber.org/zap"
 )
 
@@ -36,6 +37,7 @@ type App struct {
 	Fiber        *fiber.App
 	Postgres     *pgxpool.Pool
 	Redis        *redis.Client
+	MongoDB      *mongo.Client
 	MinioClient  *minio.Client
 	Ctx          context.Context
 	Config       *config.Config
@@ -66,6 +68,24 @@ func NewApp() (*App, error) {
 		return nil, fmt.Errorf("failed to initialize logger: %v", err)
 	}
 
+	// Setup MongoDB connection with retry logic
+
+	client, err := mongo.Connect(options.Client().ApplyURI(cfg.MongoDBURL))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create MongoDB client: %v", err)
+	}
+
+	// Check the connection
+	err = client.Ping(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to ping MongoDB: %v", err)
+	}
+
+	defer func() {
+		if err = client.Disconnect(ctx); err != nil {
+			panic(err)
+		}
+	}()
 	// Setup PostgreSQL connection with retry logic
 	var pgPool *pgxpool.Pool
 	maxRetries := 5
@@ -294,9 +314,16 @@ func (a *App) setupRoutes() error {
 	// Initialize Doctor Auth Handler
 	doctorAuthHandler := handlers.NewDoctorAuthHandler(a.Config, a.Redis, a.Logger, a.Postgres, authMiddleware)
 
+	// Auth routes (no authentication required)
+
+	authGroup := a.Fiber.Group("/auth")
+	authGroup.Post("/user/login", userHandler.GetUserProfile)
+	authGroup.Post("/user/logout", userHandler.GetUserProfile)
+	authGroup.Post("/doctor/login", doctorAuthHandler.DoctorLogin)
+	authGroup.Post("/doctor/register", doctorAuthHandler.RegisterDoctor)
+
 	// Regular API routes - use auth middleware
 	api := a.Fiber.Group("/api", authMiddleware.Handler())
-
 	// User routes
 	userGroup := api.Group("/user")
 	userGroup.Get("/profile", userHandler.GetUserProfile)
@@ -308,8 +335,6 @@ func (a *App) setupRoutes() error {
 	doctorGroup := api.Group("/doctors")
 	doctorGroup.Get("/profile", doctorAuthHandler.GetDoctorProfile)
 	doctorGroup.Delete("/profile", doctorAuthHandler.DeleteDoctor)
-
-	// Adding new doctor routes for profile, schedule and fees
 	doctorGroup.Get("/profile", doctorHandler.GetDoctorProfile)
 	doctorGroup.Put("/profile", doctorHandler.UpdateDoctorProfile)
 	doctorGroup.Get("/schedule", doctorHandler.GetDoctorSchedule)
@@ -318,14 +343,6 @@ func (a *App) setupRoutes() error {
 	doctorGroup.Put("/fees", doctorHandler.UpdateDoctorFees)
 	doctorGroup.Delete("/api/doctors/schedule/:id", doctorHandler.DeleteDoctorSchedule)
 	doctorGroup.Delete("/api/doctors/fees/:id", doctorHandler.DeleteDoctorFees)
-
-	// Auth routes (no authentication required)
-	authGroup := a.Fiber.Group("/auth")
-
-	// Doctor authentication routes (public)
-	doctorAuthGroup := authGroup.Group("/doctor")
-	doctorAuthGroup.Post("/register", doctorAuthHandler.RegisterDoctor)
-	doctorAuthGroup.Post("/login", doctorAuthHandler.LoginDoctor)
 
 	return nil
 }

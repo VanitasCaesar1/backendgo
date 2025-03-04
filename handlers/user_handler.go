@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"image"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,24 +43,40 @@ type UserHandler struct {
 	minioClient *minio.Client
 }
 
+type UserRegister struct {
+	Email      string `json:"email"`
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+	FirstName  string `json:"first_name"`
+	LastName   string `json:"last_name"`
+	Age        int    `json:"age"`
+	MobileNo   string `json:"mobile_no"`
+	BloodGroup string `json:"blood_group"`
+	Location   string `json:"location"`
+	Address    string `json:"address"`
+	HospitalID string `json:"hospital_id"`
+	AadhaarID  string `json:"aadhaar_id"`
+}
+
 type UserProfile struct {
-	UserID            uuid.UUID `json:"user_id"`
-	AuthID            string    `json:"auth_id,omitempty"` // WorkOS user ID
-	Username          string    `json:"username,omitempty"`
-	ProfilePic        string    `json:"profile_pic,omitempty"`
-	FirstName         string    `json:"first_name,omitempty"`
-	LastName          string    `json:"last_name,omitempty"`
-	Name              string    `json:"name,omitempty"`
-	Mobile            string    `json:"mobile,omitempty"`
-	Email             string    `json:"email"`
-	EmailVerified     bool      `json:"email_verified,omitempty"`
-	BloodGroup        string    `json:"blood_group,omitempty"`
-	Location          string    `json:"location,omitempty"`
-	Address           string    `json:"address,omitempty"`
-	ProfilePictureURL string    `json:"profile_picture_url,omitempty"`
-	LastSignInAt      string    `json:"last_sign_in_at,omitempty"`
-	CreatedAt         string    `json:"created_at,omitempty"`
-	UpdatedAt         string    `json:"updated_at,omitempty"`
+	UserID        uuid.UUID  `json:"user_id"`
+	AuthID        string     `json:"auth_id,omitempty"` // WorkOS user ID
+	Username      string     `json:"username,omitempty"`
+	ProfilePic    string     `json:"profile_pic,omitempty"`
+	FirstName     string     `json:"first_name,omitempty"`
+	LastName      string     `json:"last_name,omitempty"`
+	Name          string     `json:"name,omitempty"`
+	Mobile        string     `json:"mobile,omitempty"`
+	Email         string     `json:"email"`
+	EmailVerified bool       `json:"email_verified,omitempty"`
+	BloodGroup    string     `json:"blood_group,omitempty"`
+	Location      string     `json:"location,omitempty"`
+	Address       string     `json:"address,omitempty"`
+	HospitalID    *uuid.UUID `json:"hospital_id,omitempty"`
+	AadhaarID     string     `json:"aadhaar_id,omitempty"`
+	LastSignInAt  string     `json:"last_sign_in_at,omitempty"`
+	CreatedAt     string     `json:"created_at,omitempty"`
+	UpdatedAt     string     `json:"updated_at,omitempty"`
 }
 
 func NewUserHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, pgPool *pgxpool.Pool) (*UserHandler, error) {
@@ -82,6 +100,215 @@ func NewUserHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, p
 		pgPool:      pgPool,
 		minioClient: minioClient,
 	}, nil
+}
+
+// RegisterRoutes registers user-related routes
+func (h *UserHandler) handleRegister(c *fiber.Ctx) error {
+
+	var req UserRegister
+	if err := c.BodyParser(&req); err != nil {
+		h.logger.Error("failed to parse register request", zap.Error(err))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid request data",
+		})
+	}
+
+	var emailExists, usernameExists, aadhaarExists bool
+	err := h.pgPool.QueryRow(c.Context(),
+		`SELECT 
+			EXISTS(SELECT 1 FROM users WHERE email = $1), 
+			EXISTS(SELECT 1 FROM users WHERE username = $2),
+			EXISTS(SELECT 1 FROM users WHERE aadhaar_id = $3)`,
+		req.Email, req.Username, req.AadhaarID).Scan(&emailExists, &usernameExists, &aadhaarExists)
+	if err != nil {
+		h.logger.Error("failed to check user existence", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Database error",
+		})
+	}
+
+	if emailExists {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error": "This email is already registered",
+		})
+	}
+
+	if usernameExists {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error": "This username is already taken",
+		})
+	}
+
+	if aadhaarExists {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error": "This Aadhaar ID is already registered",
+		})
+	}
+
+	workosUser, err := usermanagement.CreateUser(
+		c.Context(),
+		usermanagement.CreateUserOpts{
+			Email:     req.Email,
+			FirstName: req.FirstName,
+			LastName:  req.LastName,
+			Password:  req.Password,
+		},
+	)
+
+	if err != nil {
+		h.logger.Error("failed to create user in WorkOS", zap.Error(err))
+		// Check for specific WorkOS errors
+		if strings.Contains(err.Error(), "already exists") {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error": "This email is already registered",
+			})
+		}
+
+		if strings.Contains(err.Error(), "password") {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error":   "Invalid password",
+				"message": "Password must be at least 8 characters",
+			})
+		}
+
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to create user account",
+		})
+	}
+
+	// Start transaction
+	tx, err := h.pgPool.Begin(c.Context())
+	if err != nil {
+		h.logger.Error("failed to begin transaction", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Database error",
+		})
+	}
+	defer tx.Rollback(c.Context()) // Rollback if not committed
+
+	UserId := uuid.New()
+
+	_, err = tx.Exec(c.Context(),
+		`INSERT INTO users (user_id, auth_id, email, name, age, mobile, blood_group, location, address, hospital_id, aadhaar_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		UserId, workosUser.ID, req.Email, req.FirstName+" "+req.LastName, req.Age, req.MobileNo, req.BloodGroup, req.Location, req.Address, req.HospitalID, req.AadhaarID)
+
+	if err != nil {
+		h.logger.Error("failed to create user in database", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to create user account",
+		})
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(c.Context()); err != nil {
+		h.logger.Error("failed to commit transaction", zap.Error(err))
+		h.tryDeleteWorkOSUser(c.Context(), workosUser.ID, "commit failure")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Database error",
+		})
+	}
+
+	h.logger.Info("new user created",
+		zap.String("user_id", UserId.String()),
+		zap.String("auth_id", workosUser.ID))
+
+	return c.JSON(fiber.Map{
+		"message": "User registered successfully",
+	})
+
+}
+
+// tryDeleteWorkOSUser centralizes WorkOS user deletion to reduce code duplication
+func (h *UserHandler) tryDeleteWorkOSUser(c context.Context, workosUserID string, reason string) {
+	if err := usermanagement.DeleteUser(
+		c,
+		usermanagement.DeleteUserOpts{
+			User: workosUserID,
+		},
+	); err != nil {
+		h.logger.Error("failed to delete WorkOS user after "+reason,
+			zap.Error(err),
+			zap.String("workos_id", workosUserID))
+	}
+}
+func (h *UserHandler) validateRegister(c *fiber.Ctx, register *UserRegister) error {
+
+	if register.Email == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Email is required",
+		})
+	}
+
+	if register.Password == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Password is required",
+		})
+	}
+
+	if register.Age < 18 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Age must be 18 or above",
+		})
+	}
+
+	if register.MobileNo != "" {
+		// Basic mobile number validation - adjust pattern as needed
+		mobilePattern := regexp.MustCompile(`^\+?[0-9]{10,15}$`)
+		if !mobilePattern.MatchString(register.MobileNo) {
+			h.logger.Error("invalid mobile number format",
+				zap.String("mobile", register.MobileNo))
+			return errors.New("invalid mobile number format")
+		}
+
+		// Verify it can be parsed as a number since it's stored as numeric in DB
+		if _, err := strconv.ParseFloat(register.MobileNo, 64); err != nil {
+			h.logger.Error("mobile not numeric",
+				zap.String("mobile", register.MobileNo),
+				zap.Error(err))
+			return errors.New("mobile number must be numeric")
+		}
+	}
+
+	if register.BloodGroup != "" {
+		validBloodGroups := map[string]bool{
+			"A+": true, "A-": true,
+			"B+": true, "B-": true,
+			"O+": true, "O-": true,
+			"AB+": true, "AB-": true,
+		}
+		if !validBloodGroups[register.BloodGroup] {
+			h.logger.Error("invalid blood group",
+				zap.String("blood_group", register.BloodGroup))
+			return errors.New("invalid blood group")
+		}
+	}
+
+	if register.Location == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Location is required",
+		})
+	}
+
+	if register.Address == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Address is required",
+		})
+	}
+
+	if register.HospitalID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Hospital ID is required",
+		})
+	}
+
+	if register.AadhaarID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Aadhaar ID is required",
+		})
+	}
+
+	return nil
 }
 
 // GetUserProfile retrieves the user's profile
@@ -238,6 +465,7 @@ func (h *UserHandler) GetUserProfile(c *fiber.Ctx) error {
 
 	// Get additional profile data from our database using a direct query, not a transaction
 	var profile UserProfile
+	var mobileStr sql.NullString
 	err = h.pgPool.QueryRow(c.Context(),
 		`SELECT 
 			user_id,
@@ -249,20 +477,24 @@ func (h *UserHandler) GetUserProfile(c *fiber.Ctx) error {
 			COALESCE(email, $2) as email,
 			COALESCE(blood_group, '') as blood_group,
 			COALESCE(location, '') as location,
-			COALESCE(address, '') as address
+			COALESCE(address, '') as address,
+			hospital_id,
+			COALESCE(aadhaar_id, '') as aadhaar_id
 		FROM users 
 		WHERE auth_id = $1`,
 		authID, workosUser.Email).Scan(
 		&profile.UserID,
 		&profile.AuthID,
 		&profile.Username,
-		&profile.ProfilePictureURL,
+		&profile.ProfilePic,
 		&profile.Name,
-		&profile.Mobile,
+		&mobileStr,
 		&profile.Email,
 		&profile.BloodGroup,
 		&profile.Location,
 		&profile.Address,
+		&profile.HospitalID,
+		&profile.AadhaarID,
 	)
 
 	if err != nil {
@@ -270,6 +502,11 @@ func (h *UserHandler) GetUserProfile(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to fetch user profile",
 		})
+	}
+
+	// Convert mobile from string to the format needed for response
+	if mobileStr.Valid {
+		profile.Mobile = mobileStr.String
 	}
 
 	// Merge WorkOS data with our database data
@@ -361,6 +598,25 @@ func (h *UserHandler) UpdateUserProfile(c *fiber.Ctx) error {
 		}
 	}
 
+	// Convert mobile string to numeric for DB if provided
+	var mobileVal interface{} = nil
+	if updateData.Mobile != "" {
+		// Verify mobile is numeric before attempting conversion
+		if _, err := strconv.ParseFloat(updateData.Mobile, 64); err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Mobile number must be numeric",
+			})
+		}
+		mobileVal = updateData.Mobile
+	}
+
+	// Validate Aadhaar ID if provided
+	if updateData.AadhaarID != "" && !regexp.MustCompile(`^\d{12}$`).MatchString(updateData.AadhaarID) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Aadhaar ID must be 12 digits",
+		})
+	}
+
 	// Update in our database
 	commandTag, err := tx.Exec(c.Context(),
 		`UPDATE users 
@@ -369,14 +625,18 @@ func (h *UserHandler) UpdateUserProfile(c *fiber.Ctx) error {
          mobile = $3, 
          blood_group = $4, 
          location = $5, 
-         address = $6
-     WHERE auth_id = $7`,
+         address = $6,
+         hospital_id = $7,
+         aadhaar_id = $8
+     WHERE auth_id = $9`,
 		updateData.Username,
 		updateData.Name,
-		updateData.Mobile,
+		mobileVal,
 		updateData.BloodGroup,
 		updateData.Location,
 		updateData.Address,
+		updateData.HospitalID,
+		updateData.AadhaarID,
 		authID,
 	)
 
@@ -384,6 +644,22 @@ func (h *UserHandler) UpdateUserProfile(c *fiber.Ctx) error {
 		h.logger.Error("failed to update user profile",
 			zap.Error(err),
 			zap.String("auth_id", authID))
+
+		// Check for foreign key violations
+		if strings.Contains(err.Error(), "violates foreign key constraint") &&
+			strings.Contains(err.Error(), "fk_references_hosp_id") {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Invalid hospital ID provided",
+			})
+		}
+
+		// Check for Aadhaar validation errors
+		if strings.Contains(err.Error(), "violates check constraint \"valid_aadhaar\"") {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Aadhaar ID must be exactly 12 digits",
+			})
+		}
+
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to update profile",
 		})
@@ -483,6 +759,14 @@ func (h *UserHandler) validateProfileUpdate(profile *UserProfile) error {
 				zap.String("mobile", profile.Mobile))
 			return errors.New("invalid mobile number format")
 		}
+
+		// Verify it can be parsed as a number since it's stored as numeric in DB
+		if _, err := strconv.ParseFloat(profile.Mobile, 64); err != nil {
+			h.logger.Error("mobile not numeric",
+				zap.String("mobile", profile.Mobile),
+				zap.Error(err))
+			return errors.New("mobile number must be numeric")
+		}
 	}
 
 	// Blood group validation
@@ -512,6 +796,16 @@ func (h *UserHandler) validateProfileUpdate(profile *UserProfile) error {
 		h.logger.Error("address too long",
 			zap.String("address", profile.Address))
 		return errors.New("address must not exceed 500 characters")
+	}
+
+	// Aadhaar ID validation
+	if profile.AadhaarID != "" {
+		aadhaarPattern := regexp.MustCompile(`^\d{12}$`)
+		if !aadhaarPattern.MatchString(profile.AadhaarID) {
+			h.logger.Error("invalid aadhaar id format",
+				zap.String("aadhaar_id", profile.AadhaarID))
+			return errors.New("aadhaar ID must be exactly 12 digits")
+		}
 	}
 
 	return nil
@@ -727,6 +1021,19 @@ func (h *UserHandler) updateProfilePicURL(ctx context.Context, authID string, im
 
 // GetProfilePic retrieves a profile picture from MinIO
 func (h *UserHandler) GetProfilePic(c *fiber.Ctx) error {
+	authID, ok := c.Locals("authID").(string)
+	if !ok {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "User ID not found",
+		})
+	}
+
+	h.logger.Info("processing user profile request",
+		zap.String("authID", authID),
+		zap.Any("all_claims", c.Locals("claims")),
+	)
+
 	filename := c.Params("filename")
 
 	// Basic validation to prevent path traversal
@@ -818,4 +1125,65 @@ func (h *UserHandler) GetProfilePic(c *fiber.Ctx) error {
 	}
 
 	return nil
+}
+
+// DeleteProfilePic deletes a profile picture from MinIO
+func (h *UserHandler) DeleteProfilePic(c *fiber.Ctx) error {
+	authID, ok := c.Locals("authID").(string)
+
+	if !ok {
+
+		h.logger.Info("processing user profile request",
+			zap.String("authID", authID),
+			zap.Any("all_claims", c.Locals("claims")),
+		)
+	} else {
+		h.logger.Error("authID not found in context")
+	}
+
+	filename := c.Params("profilePic")
+
+	// Basic validation to prevent path traversal
+	if strings.Contains(filename, "/") || strings.Contains(filename, "\\") {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid filename",
+		})
+	}
+
+	// Increase timeout for image deletion
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Add retry mechanism for MinIO connection
+	var err error
+
+	// Try up to 3 times with exponential backoff
+	for attempt := 0; attempt < 3; attempt++ {
+		err = h.minioClient.RemoveObject(ctx, bucketName, filename, minio.RemoveObjectOptions{})
+		if err == nil {
+			break
+		}
+
+		h.logger.Warn("attempt to remove object from minio failed, retrying...",
+			zap.Error(err),
+			zap.String("filename", filename),
+			zap.Int("attempt", attempt+1))
+
+		// Don't sleep on the last
+		if attempt < 2 {
+			time.Sleep(time.Duration(100*(2<<attempt)) * time.Millisecond)
+		}
+	}
+
+	if err != nil {
+		h.logger.Error("all attempts to remove object from minio failed",
+			zap.Error(err),
+			zap.String("filename", filename))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to delete image",
+		})
+	}
+	return c.JSON(fiber.Map{
+		"message": "Profile picture successfully deleted",
+	})
 }

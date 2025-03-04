@@ -122,7 +122,7 @@ func (m *AuthMiddleware) Handler() fiber.Handler {
 
 		// 3. WorkOS AuthKit specific header
 		if token == "" {
-			workosAuth := c.Get("X-WorkOS-Token")
+			workosAuth := c.Get("X-WorkOS-Session-Token")
 			if workosAuth != "" {
 				token = workosAuth
 				m.logger.Debug("found token in X-WorkOS-Token header")

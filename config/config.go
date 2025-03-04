@@ -12,19 +12,19 @@ type Config struct {
 	PostgresURL string
 	RedisURL    string
 
-	PublicKey        string
-	ServerPort       string
-	AllowedOrigins   string
-	ExpectedIssuer   string
-	ExpectedAudience string
-	CookieDomain     string
-	Environment      string
-	PostLogoutURI    string
-	MinioAccessKey   string
-	MinioSecretKey   string
-	MinioEndpoint    string
-	MeiliSearch      string
-
+	PublicKey              string
+	ServerPort             string
+	AllowedOrigins         string
+	ExpectedIssuer         string
+	ExpectedAudience       string
+	CookieDomain           string
+	Environment            string
+	PostLogoutURI          string
+	MinioAccessKey         string
+	MinioSecretKey         string
+	MinioEndpoint          string
+	MeiliSearch            string
+	MongoDBURL             string
 	WorkOSApiKey           string
 	WorkOSClientId         string
 	WorkOSCookiePassword   string
@@ -37,6 +37,7 @@ type Config struct {
 	WorkOSPortal           string
 	WorkOSUserManagement   string
 	WorkOSJWKSURL          string
+	SessionDuration        string
 }
 
 // getEnvWithDefault gets an environment variable with a default value
@@ -81,17 +82,17 @@ func LoadConfig() (*Config, error) {
 		Environment: env,
 		PublicKey:   string(publicKeyBytes),
 
-		AllowedOrigins:   getEnvWithDefault("ALLOWED_ORIGINS", "*"),
-		PostgresURL:      os.Getenv("POSTGRES_URL"),
-		RedisURL:         os.Getenv("REDIS_URL"),
-		ServerPort:       getEnvWithDefault("SERVER_PORT", "8080"),
-		CookieDomain:     getEnvWithDefault("COOKIE_DOMAIN", ""),
-		ExpectedIssuer:   os.Getenv("EXPECTED_ISSUER"),
-		ExpectedAudience: os.Getenv("EXPECTED_AUDIENCE"),
-		MinioAccessKey:   os.Getenv("MINIO_ACCESS_KEY"),
-		MinioSecretKey:   os.Getenv("MINIO_SECRET_KEY"),
-		MinioEndpoint:    os.Getenv("MINIO_ENDPOINT"),
-
+		AllowedOrigins:         getEnvWithDefault("ALLOWED_ORIGINS", "*"),
+		PostgresURL:            os.Getenv("POSTGRES_URL"),
+		RedisURL:               os.Getenv("REDIS_URL"),
+		ServerPort:             getEnvWithDefault("SERVER_PORT", "8080"),
+		CookieDomain:           getEnvWithDefault("COOKIE_DOMAIN", ""),
+		ExpectedIssuer:         os.Getenv("EXPECTED_ISSUER"),
+		ExpectedAudience:       os.Getenv("EXPECTED_AUDIENCE"),
+		MinioAccessKey:         os.Getenv("MINIO_ACCESS_KEY"),
+		MinioSecretKey:         os.Getenv("MINIO_SECRET_KEY"),
+		MinioEndpoint:          os.Getenv("MINIO_ENDPOINT"),
+		MongoDBURL:             os.Getenv("MONGODB_URL"),
 		WorkOSApiKey:           os.Getenv("WORKOS_API_KEY"),
 		WorkOSClientId:         os.Getenv("WORKOS_CLIENT_ID"),
 		WorkOSCookiePassword:   os.Getenv("WORKOS_COOKIE_PASSOWRD"),
@@ -103,6 +104,7 @@ func LoadConfig() (*Config, error) {
 		WorkOSPortal:           os.Getenv("WORKOS_PORTAL"),
 		WorkOSUserManagement:   os.Getenv("WORKOS_USER_M_KEY"),
 		WorkOSJWKSURL:          os.Getenv("WORKOS_JWKS_URL"),
+		SessionDuration:        getEnvWithDefault("SESSION_DURATION", "12"),
 	}
 
 	return config, nil

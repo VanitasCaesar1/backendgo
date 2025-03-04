@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -26,16 +27,17 @@ type DoctorAuthHandler struct {
 
 type DoctorRegistrationRequest struct {
 	// User details
-	Email      string  `json:"email"`
-	Password   string  `json:"password"`
-	Name       string  `json:"name"`
-	Mobile     string  `json:"mobile"`
-	BloodGroup string  `json:"bloodGroup"`
-	Location   string  `json:"location"`
-	Address    string  `json:"address"`
-	Username   string  `json:"username"`
-	ProfilePic string  `json:"profilePic"`
-	HospitalID *string `json:"hospitalId"`
+	Email      string `json:"email"`
+	Password   string `json:"password"`
+	Name       string `json:"name"`
+	Mobile     string `json:"mobile"`
+	BloodGroup string `json:"bloodGroup"`
+	Location   string `json:"location"`
+	Address    string `json:"address"`
+	Username   string `json:"username"`
+	ProfilePic string `json:"profilePic"`
+	HospitalID string `json:"hospitalId"`
+	AadhaarID  string `json:"aadhaar_id"`
 
 	// Doctor-specific details
 	IMRNumber      string `json:"imrNumber"`
@@ -78,6 +80,7 @@ func (h *DoctorAuthHandler) tryDeleteWorkOSUser(ctx context.Context, workosUserI
 }
 
 // RegisterDoctor handles doctor registration
+// RegisterDoctor handles doctor registration
 func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 	var req DoctorRegistrationRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -87,11 +90,21 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 		})
 	}
 
-	// Check if user already exists with this email or username (combined query)
-	var emailExists, usernameExists bool
+	// Validate Aadhaar ID format (12 digits)
+	if req.AadhaarID == "" || len(req.AadhaarID) != 12 || !isNumeric(req.AadhaarID) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Aadhaar ID must be a 12-digit number",
+		})
+	}
+
+	// Check if user already exists with this email, username, or Aadhaar ID
+	var emailExists, usernameExists, aadhaarExists bool
 	err := h.pgPool.QueryRow(c.Context(),
-		"SELECT EXISTS(SELECT 1 FROM users WHERE email = $1), EXISTS(SELECT 1 FROM users WHERE username = $2)",
-		req.Email, req.Username).Scan(&emailExists, &usernameExists)
+		`SELECT 
+			EXISTS(SELECT 1 FROM users WHERE email = $1), 
+			EXISTS(SELECT 1 FROM users WHERE username = $2),
+			EXISTS(SELECT 1 FROM users WHERE aadhaar_id = $3)`,
+		req.Email, req.Username, req.AadhaarID).Scan(&emailExists, &usernameExists, &aadhaarExists)
 	if err != nil {
 		h.logger.Error("failed to check user existence", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -108,6 +121,12 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 	if usernameExists {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 			"error": "This username is already taken",
+		})
+	}
+
+	if aadhaarExists {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error": "This Aadhaar ID is already registered",
 		})
 	}
 
@@ -181,8 +200,9 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
             address,
             username,
             hospital_id,
+            aadhaar_id,
             auth_id
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
 		userID,
 		req.ProfilePic,
 		req.Name,
@@ -193,6 +213,7 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 		req.Address,
 		req.Username,
 		req.HospitalID,
+		req.AadhaarID,
 		workosUser.ID,
 	)
 	if err != nil {
@@ -257,110 +278,14 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 	})
 }
 
-// LoginDoctor handles doctor login
-func (h *DoctorAuthHandler) LoginDoctor(c *fiber.Ctx) error {
-	var req DoctorLoginRequest
-	if err := c.BodyParser(&req); err != nil {
-		h.logger.Error("failed to parse login request", zap.Error(err))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid request format",
-		})
-	}
-
-	// Validate request
-	if req.Email == "" || req.Password == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Email and password are required",
-		})
-	}
-
-	// Authenticate with WorkOS
-	authResponse, err := usermanagement.AuthenticateWithPassword(
-		c.Context(),
-		usermanagement.AuthenticateWithPasswordOpts{
-			Email:    req.Email,
-			Password: req.Password,
-		},
-	)
-	if err != nil {
-		h.logger.Error("WorkOS authentication failed",
-			zap.Error(err),
-			zap.String("email", req.Email))
-
-		// Check if this is an invalid credentials error
-		if strings.Contains(err.Error(), "invalid credentials") ||
-			strings.Contains(err.Error(), "not found") {
-			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-				"error": "Invalid email or password",
-			})
+// Helper function to check if a string contains only digits
+func isNumeric(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
 		}
-
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Authentication failed",
-		})
 	}
-
-	// Check if this user exists in our doctors table
-	var doctorExists bool
-	var userID uuid.UUID
-	err = h.pgPool.QueryRow(c.Context(),
-		`SELECT EXISTS(
-			SELECT 1 FROM users u
-			JOIN doctors d ON u.user_id = d.doctor_id
-			WHERE u.auth_id = $1
-		), u.user_id FROM users u WHERE u.auth_id = $1`,
-		authResponse.User.ID).Scan(&doctorExists, &userID)
-	if err != nil {
-		h.logger.Error("failed to check doctor existence", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Database error",
-		})
-	}
-
-	if !doctorExists {
-		h.logger.Warn("login attempt for non-doctor user",
-			zap.String("email", req.Email),
-			zap.String("auth_id", authResponse.User.ID))
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-			"error": "This account is not registered as a doctor",
-		})
-	}
-
-	// Create a session using the AuthMiddleware
-	sessionID, err := h.authMiddleware.CreateSession(
-		c.Context(),
-		userID.String(),
-		req.Email,
-		authResponse.AccessToken,
-		"",           // No refresh token in this flow
-		24*time.Hour, // Session expiration
-	)
-	if err != nil {
-		h.logger.Error("failed to create session", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to create session",
-		})
-	}
-
-	// Construct a login URL with the session ID
-	loginUrl := fmt.Sprintf("%s/doctor/dashboard?token=%s", h.config.CookieDomain, sessionID)
-
-	// Set the session cookie
-	c.Cookie(&fiber.Cookie{
-		Name:     h.authMiddleware.GetCookieName(),
-		Value:    sessionID,
-		Expires:  time.Now().Add(24 * time.Hour),
-		HTTPOnly: true,
-		Secure:   h.config.Environment != "development",
-		SameSite: "Lax",
-		Path:     "/",
-	})
-
-	return c.JSON(fiber.Map{
-		"message":  "Login successful",
-		"loginUrl": loginUrl,
-		"token":    sessionID,
-	})
+	return true
 }
 
 // GetDoctorProfile retrieves a doctor's profile
@@ -383,24 +308,25 @@ func (h *DoctorAuthHandler) GetDoctorProfile(c *fiber.Ctx) error {
 
 	// Get doctor from database
 	var doctorProfile struct {
-		UserID         uuid.UUID  `json:"user_id"`
-		DoctorID       uuid.UUID  `json:"doctor_id"`
-		AuthID         string     `json:"auth_id"`
-		Name           string     `json:"name"`
-		Email          string     `json:"email"`
-		Mobile         int64      `json:"mobile"`
-		BloodGroup     string     `json:"blood_group"`
-		Location       string     `json:"location"`
-		Address        string     `json:"address"`
-		Username       string     `json:"username"`
-		ProfilePic     string     `json:"profile_pic"`
-		HospitalID     *uuid.UUID `json:"hospital_id"`
-		IMRNumber      string     `json:"imr_number"`
-		Age            int        `json:"age"`
-		Specialization string     `json:"specialization"`
-		Qualification  string     `json:"qualification"`
-		IsActive       bool       `json:"is_active"`
-		SlotDuration   int        `json:"slot_duration"`
+		UserID         uuid.UUID      `json:"user_id"`
+		DoctorID       uuid.UUID      `json:"doctor_id"`
+		AuthID         sql.NullString `json:"auth_id"`
+		Name           sql.NullString `json:"name"`
+		Email          sql.NullString `json:"email"`
+		Mobile         int64          `json:"mobile"`
+		BloodGroup     sql.NullString `json:"blood_group"`
+		Location       sql.NullString `json:"location"`
+		Address        sql.NullString `json:"address"`
+		Username       sql.NullString `json:"username"`
+		ProfilePic     sql.NullString `json:"profile_pic"`
+		HospitalID     uuid.NullUUID  `json:"hospital_id"`
+		AadhaarID      sql.NullString `json:"aadhaar_id"`
+		IMRNumber      sql.NullString `json:"imr_number"`
+		Age            sql.NullInt32  `json:"age"`
+		Specialization sql.NullString `json:"specialization"`
+		Qualification  sql.NullString `json:"qualification"`
+		IsActive       bool           `json:"is_active"`
+		SlotDuration   sql.NullInt32  `json:"slot_duration"`
 	}
 
 	err = h.pgPool.QueryRow(c.Context(),
@@ -417,6 +343,7 @@ func (h *DoctorAuthHandler) GetDoctorProfile(c *fiber.Ctx) error {
 			u.username,
 			u.profile_pic,
 			u.hospital_id,
+			u.aadhaar_id,
 			d.imr_number,
 			d.age,
 			d.specialization,
@@ -439,6 +366,7 @@ func (h *DoctorAuthHandler) GetDoctorProfile(c *fiber.Ctx) error {
 		&doctorProfile.Username,
 		&doctorProfile.ProfilePic,
 		&doctorProfile.HospitalID,
+		&doctorProfile.AadhaarID,
 		&doctorProfile.IMRNumber,
 		&doctorProfile.Age,
 		&doctorProfile.Specialization,
@@ -454,7 +382,52 @@ func (h *DoctorAuthHandler) GetDoctorProfile(c *fiber.Ctx) error {
 		})
 	}
 
-	return c.JSON(doctorProfile)
+	// Convert NullXXX types to pointer types for JSON marshaling
+	response := fiber.Map{
+		"user_id":    doctorProfile.UserID,
+		"doctor_id":  doctorProfile.DoctorID,
+		"auth_id":    doctorProfile.AuthID,
+		"name":       doctorProfile.Name,
+		"email":      doctorProfile.Email,
+		"mobile":     doctorProfile.Mobile,
+		"username":   doctorProfile.Username,
+		"aadhaar_id": doctorProfile.AadhaarID,
+		"is_active":  doctorProfile.IsActive,
+	}
+
+	// Conditionally add fields that might be NULL
+	if doctorProfile.BloodGroup.Valid {
+		response["blood_group"] = doctorProfile.BloodGroup.String
+	}
+	if doctorProfile.Location.Valid {
+		response["location"] = doctorProfile.Location.String
+	}
+	if doctorProfile.Address.Valid {
+		response["address"] = doctorProfile.Address.String
+	}
+	if doctorProfile.ProfilePic.Valid {
+		response["profile_pic"] = doctorProfile.ProfilePic.String
+	}
+	if doctorProfile.HospitalID.Valid {
+		response["hospital_id"] = doctorProfile.HospitalID.UUID
+	}
+	if doctorProfile.IMRNumber.Valid {
+		response["imr_number"] = doctorProfile.IMRNumber.String
+	}
+	if doctorProfile.Age.Valid {
+		response["age"] = doctorProfile.Age.Int32
+	}
+	if doctorProfile.Specialization.Valid {
+		response["specialization"] = doctorProfile.Specialization.String
+	}
+	if doctorProfile.Qualification.Valid {
+		response["qualification"] = doctorProfile.Qualification.String
+	}
+	if doctorProfile.SlotDuration.Valid {
+		response["slot_duration"] = doctorProfile.SlotDuration.Int32
+	}
+
+	return c.JSON(response)
 }
 
 // DeleteDoctor handles doctor account deletion
@@ -544,5 +517,96 @@ func (h *DoctorAuthHandler) DeleteDoctor(c *fiber.Ctx) error {
 
 	return c.JSON(fiber.Map{
 		"message": "Doctor account successfully deleted",
+	})
+}
+
+// DoctorLogin handles doctor login
+func (h *DoctorAuthHandler) DoctorLogin(c *fiber.Ctx) error {
+	var req DoctorLoginRequest
+	if err := c.BodyParser(&req); err != nil {
+		h.logger.Error("failed to parse login request", zap.Error(err))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid request format",
+		})
+	}
+
+	// Get user ID from database
+	var userID uuid.UUID
+	var authID string
+	err := h.pgPool.QueryRow(c.Context(),
+		"SELECT user_id, auth_id FROM users WHERE email = $1",
+		req.Email).Scan(&userID, &authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err))
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "Invalid email or password",
+		})
+	}
+
+	// Verify password
+	response, err := usermanagement.AuthenticateWithPassword(
+		c.Context(),
+		usermanagement.AuthenticateWithPasswordOpts{
+			ClientID: h.config.WorkOSClientId,
+			Email:    req.Email,
+			Password: req.Password,
+		},
+	)
+	// Prepare response
+	loginResponse := map[string]interface{}{
+		"access_token":  response.AccessToken,
+		"refresh_token": response.RefreshToken,
+		"user": map[string]interface{}{
+			"id":         response.User.ID,
+			"email":      response.User.Email,
+			"first_name": response.User.FirstName,
+			"last_name":  response.User.LastName,
+		},
+		"organization_id": response.OrganizationID,
+	}
+	h.logger.Info("login response", zap.Any("response", loginResponse))
+
+	c.Locals("refresh_token", response.RefreshToken)
+
+	if err != nil {
+		h.logger.Error("failed to authenticate user", zap.Error(err))
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "Invalid email or password",
+		})
+	}
+
+	// Check if user is a doctor
+	var isDoctor bool
+	err = h.pgPool.QueryRow(c.Context(),
+		"SELECT EXISTS(SELECT 1 FROM doctors WHERE doctor_id = $1)",
+		userID).Scan(&isDoctor)
+	if err != nil {
+		h.logger.Error("failed to check if user is a doctor", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Database error",
+		})
+	}
+
+	if !isDoctor {
+		h.logger.Info("user is not a doctor", zap.String("email", req.Email))
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "User is not a doctor",
+		})
+	}
+
+	// Generate session ID
+	sessionID := uuid.New().String()
+
+	// Save session in Redis
+	sessionKey := fmt.Sprintf("session:%s", sessionID)
+	if err := h.redisClient.Set(c.Context(), sessionKey, authID, time.Hour*12).Err(); err != nil {
+		h.logger.Error("failed to save session in Redis", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to create session",
+		})
+	}
+	return c.JSON(fiber.Map{
+		"message":    "Login successful",
+		"session_id": sessionID,
 	})
 }
