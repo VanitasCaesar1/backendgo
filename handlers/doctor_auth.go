@@ -80,7 +80,6 @@ func (h *DoctorAuthHandler) tryDeleteWorkOSUser(ctx context.Context, workosUserI
 }
 
 // RegisterDoctor handles doctor registration
-// RegisterDoctor handles doctor registration
 func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 	var req DoctorRegistrationRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -564,6 +563,7 @@ func (h *DoctorAuthHandler) DoctorLogin(c *fiber.Ctx) error {
 		},
 		"organization_id": response.OrganizationID,
 	}
+
 	h.logger.Info("login response", zap.Any("response", loginResponse))
 
 	c.Locals("refresh_token", response.RefreshToken)

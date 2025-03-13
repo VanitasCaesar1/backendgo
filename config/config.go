@@ -38,6 +38,9 @@ type Config struct {
 	WorkOSUserManagement   string
 	WorkOSJWKSURL          string
 	SessionDuration        string
+	CookieEncryptionKey    string
+	JwtSecret              string
+	DevMode                string
 }
 
 // getEnvWithDefault gets an environment variable with a default value
@@ -105,6 +108,9 @@ func LoadConfig() (*Config, error) {
 		WorkOSUserManagement:   os.Getenv("WORKOS_USER_M_KEY"),
 		WorkOSJWKSURL:          os.Getenv("WORKOS_JWKS_URL"),
 		SessionDuration:        getEnvWithDefault("SESSION_DURATION", "12"),
+		CookieEncryptionKey:    os.Getenv("COOKIE_ENCRYPTION_KEY"),
+		JwtSecret:              os.Getenv("JWT_SECRET"),
+		DevMode:                os.Getenv("DEVMODE"),
 	}
 
 	return config, nil

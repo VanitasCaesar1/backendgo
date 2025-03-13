@@ -3,7 +3,11 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"image"
@@ -17,6 +21,7 @@ import (
 	"time"
 
 	"github.com/VanitasCaesar1/backend/config"
+	"github.com/VanitasCaesar1/backend/middleware"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -36,11 +41,12 @@ const (
 )
 
 type UserHandler struct {
-	config      *config.Config
-	redisClient *redis.Client
-	logger      *zap.Logger
-	pgPool      *pgxpool.Pool
-	minioClient *minio.Client
+	config         *config.Config
+	redisClient    *redis.Client
+	logger         *zap.Logger
+	pgPool         *pgxpool.Pool
+	minioClient    *minio.Client
+	authMiddleware *middleware.AuthMiddleware // Added this field
 }
 
 type UserRegister struct {
@@ -79,7 +85,7 @@ type UserProfile struct {
 	UpdatedAt     string     `json:"updated_at,omitempty"`
 }
 
-func NewUserHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, pgPool *pgxpool.Pool) (*UserHandler, error) {
+func NewUserHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, pgPool *pgxpool.Pool, authMiddleware *middleware.AuthMiddleware) (*UserHandler, error) {
 	// Initialize Minio client
 	minioClient, err := minio.New(cfg.MinioEndpoint, &minio.Options{
 		Creds:  credentials.NewStaticV4(cfg.MinioAccessKey, cfg.MinioSecretKey, ""),
@@ -94,17 +100,18 @@ func NewUserHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, p
 	usermanagement.SetAPIKey(cfg.WorkOSApiKey)
 
 	return &UserHandler{
-		config:      cfg,
-		redisClient: rds,
-		logger:      logger,
-		pgPool:      pgPool,
-		minioClient: minioClient,
+		config:         cfg,
+		redisClient:    rds,
+		logger:         logger,
+		pgPool:         pgPool,
+		minioClient:    minioClient,
+		authMiddleware: authMiddleware, // Initialize the field
 	}, nil
 }
 
 // RegisterRoutes registers user-related routes
-func (h *UserHandler) handleRegister(c *fiber.Ctx) error {
-
+func (h *UserHandler) RegisterUser(c *fiber.Ctx) error {
+	// Parse request body
 	var req UserRegister
 	if err := c.BodyParser(&req); err != nil {
 		h.logger.Error("failed to parse register request", zap.Error(err))
@@ -113,13 +120,21 @@ func (h *UserHandler) handleRegister(c *fiber.Ctx) error {
 		})
 	}
 
+	// Validate the registration request
+	if err := h.validateRegister(c, &req); err != nil {
+		// validateRegister method should have already set the appropriate status and error response
+		return err
+	}
+
+	// Check for existing users
 	var emailExists, usernameExists, aadhaarExists bool
 	err := h.pgPool.QueryRow(c.Context(),
-		`SELECT 
-			EXISTS(SELECT 1 FROM users WHERE email = $1), 
-			EXISTS(SELECT 1 FROM users WHERE username = $2),
-			EXISTS(SELECT 1 FROM users WHERE aadhaar_id = $3)`,
+		`SELECT
+            EXISTS(SELECT 1 FROM users WHERE email = $1),
+            EXISTS(SELECT 1 FROM users WHERE username = $2),
+            EXISTS(SELECT 1 FROM users WHERE aadhaar_id = $3)`,
 		req.Email, req.Username, req.AadhaarID).Scan(&emailExists, &usernameExists, &aadhaarExists)
+
 	if err != nil {
 		h.logger.Error("failed to check user existence", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -127,34 +142,34 @@ func (h *UserHandler) handleRegister(c *fiber.Ctx) error {
 		})
 	}
 
+	// Check for existing email, username, and Aadhaar ID
 	if emailExists {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 			"error": "This email is already registered",
 		})
 	}
-
 	if usernameExists {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 			"error": "This username is already taken",
 		})
 	}
-
 	if aadhaarExists {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 			"error": "This Aadhaar ID is already registered",
 		})
 	}
 
+	// Create user in WorkOS
 	workosUser, err := usermanagement.CreateUser(
 		c.Context(),
 		usermanagement.CreateUserOpts{
-			Email:     req.Email,
-			FirstName: req.FirstName,
-			LastName:  req.LastName,
-			Password:  req.Password,
+			Email:         req.Email,
+			FirstName:     req.FirstName,
+			LastName:      req.LastName,
+			Password:      req.Password,
+			EmailVerified: true,
 		},
 	)
-
 	if err != nil {
 		h.logger.Error("failed to create user in WorkOS", zap.Error(err))
 		// Check for specific WorkOS errors
@@ -163,18 +178,19 @@ func (h *UserHandler) handleRegister(c *fiber.Ctx) error {
 				"error": "This email is already registered",
 			})
 		}
-
 		if strings.Contains(err.Error(), "password") {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error":   "Invalid password",
 				"message": "Password must be at least 8 characters",
 			})
 		}
-
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to create user account",
 		})
 	}
+	h.logger.Debug("processing registration request",
+		zap.String("email", req.Email),
+		zap.String("username", req.Username))
 
 	// Start transaction
 	tx, err := h.pgPool.Begin(c.Context())
@@ -186,15 +202,18 @@ func (h *UserHandler) handleRegister(c *fiber.Ctx) error {
 	}
 	defer tx.Rollback(c.Context()) // Rollback if not committed
 
-	UserId := uuid.New()
-
-	_, err = tx.Exec(c.Context(),
-		`INSERT INTO users (user_id, auth_id, email, name, age, mobile, blood_group, location, address, hospital_id, aadhaar_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-		UserId, workosUser.ID, req.Email, req.FirstName+" "+req.LastName, req.Age, req.MobileNo, req.BloodGroup, req.Location, req.Address, req.HospitalID, req.AadhaarID)
+	// Insert user into database - let the database generate the UUID
+	var userId uuid.UUID
+	err = tx.QueryRow(c.Context(),
+		`INSERT INTO users (auth_id, email, name, age, mobile, blood_group, location, address, aadhaar_id, username)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        RETURNING user_id`,
+		workosUser.ID, req.Email, req.FirstName+" "+req.LastName, req.Age, req.MobileNo,
+		req.BloodGroup, req.Location, req.Address, req.AadhaarID, req.Username).Scan(&userId)
 
 	if err != nil {
 		h.logger.Error("failed to create user in database", zap.Error(err))
+		h.tryDeleteWorkOSUser(c.Context(), workosUser.ID, "database insertion failure")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to create user account",
 		})
@@ -209,14 +228,15 @@ func (h *UserHandler) handleRegister(c *fiber.Ctx) error {
 		})
 	}
 
+	// Log successful user creation
 	h.logger.Info("new user created",
-		zap.String("user_id", UserId.String()),
+		zap.String("user_id", userId.String()),
 		zap.String("auth_id", workosUser.ID))
 
-	return c.JSON(fiber.Map{
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
 		"message": "User registered successfully",
+		"user_id": userId.String(), // Convert UUID to string for JSON
 	})
-
 }
 
 // tryDeleteWorkOSUser centralizes WorkOS user deletion to reduce code duplication
@@ -232,6 +252,7 @@ func (h *UserHandler) tryDeleteWorkOSUser(c context.Context, workosUserID string
 			zap.String("workos_id", workosUserID))
 	}
 }
+
 func (h *UserHandler) validateRegister(c *fiber.Ctx, register *UserRegister) error {
 
 	if register.Email == "" {
@@ -1186,4 +1207,232 @@ func (h *UserHandler) DeleteProfilePic(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"message": "Profile picture successfully deleted",
 	})
+}
+
+// Password Reset Token Generator
+func (h *UserHandler) ResetPassword(c *fiber.Ctx) error {
+	// Path matching should be based on the relative path or route pattern
+	// rather than comparing to full path directly
+
+	// Get the last part of the path
+	pathSegments := strings.Split(c.Path(), "/")
+	lastSegment := pathSegments[len(pathSegments)-1]
+
+	// 1. Request a password reset token (only needs email)
+	if lastSegment == "request-reset" {
+		var requestBody struct {
+			Email string `json:"email"`
+		}
+		if err := c.BodyParser(&requestBody); err != nil {
+			h.logger.Error("failed to parse request body", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Invalid request body",
+			})
+		}
+
+		// Generate password reset token
+		response, err := usermanagement.CreatePasswordReset(
+			context.Background(),
+			usermanagement.CreatePasswordResetOpts{
+				Email: requestBody.Email,
+			},
+		)
+		if err != nil {
+			h.logger.Error("failed to generate password reset token",
+				zap.Error(err),
+				zap.String("email", requestBody.Email))
+			// Still return success for security (don't reveal if email exists)
+			return c.JSON(fiber.Map{
+				"message": "If this email exists, a password reset link has been sent",
+			})
+		}
+
+		// Here you would send an email with the reset link
+		// For development, you could log the token or URL
+		h.logger.Info("password reset token generated",
+			zap.String("resetURL", response.PasswordResetUrl))
+		return c.JSON(fiber.Map{
+			"message": "If this email exists, a password reset link has been sent",
+		})
+	}
+
+	// 2. Apply the password reset (needs token and new password)
+	if lastSegment == "reset-password" {
+		var requestBody struct {
+			Token       string `json:"token"`
+			NewPassword string `json:"newPassword"`
+		}
+		if err := c.BodyParser(&requestBody); err != nil {
+			h.logger.Error("failed to parse request body", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Invalid request body",
+			})
+		}
+		if requestBody.Token == "" || requestBody.NewPassword == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Token and new password are required",
+			})
+		}
+
+		// Reset password using the token
+		user, err := usermanagement.ResetPassword(
+			context.Background(),
+			usermanagement.ResetPasswordOpts{
+				Token:       requestBody.Token,
+				NewPassword: requestBody.NewPassword,
+			},
+		)
+		if err != nil {
+			h.logger.Error("failed to reset password", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Invalid or expired token",
+			})
+		}
+		h.logger.Info("password reset successful",
+			zap.String("userId", user.User.ID))
+		return c.JSON(fiber.Map{
+			"message": "Password reset successfully",
+		})
+	}
+
+	// 3. Validate a token (optional, if you want to check token validity)
+	if lastSegment == "validate-reset-token" {
+		token := c.Query("token")
+		if token == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Token is required",
+			})
+		}
+
+		// Use GetPasswordReset to validate token
+		// Note: WorkOS doesn't have a direct validate token method
+		// so we need to improvise by fetching reset details
+		response, err := usermanagement.GetPasswordReset(
+			context.Background(),
+			usermanagement.GetPasswordResetOpts{
+				PasswordReset: token, // Note: This should be the reset ID, not token
+			},
+		)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"valid": false,
+				"error": "Invalid token",
+			})
+		}
+
+		// Check if token is expired
+		// Parse the expires_at time
+		expiresAt, err := time.Parse(time.RFC3339, response.ExpiresAt)
+		if err != nil || time.Now().After(expiresAt) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"valid": false,
+				"error": "Token expired",
+			})
+		}
+		return c.JSON(fiber.Map{
+			"valid": true,
+		})
+	}
+
+	// If none of the paths match
+	return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+		"error": "Endpoint not found",
+	})
+}
+
+// EncryptCookie encrypts the cookie value using AES
+func (h *UserHandler) EncryptCookie(value string) (string, error) {
+	key := []byte(h.config.CookieEncryptionKey) // 32 bytes for AES-256
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+
+	// Create a random IV
+	iv := make([]byte, aes.BlockSize)
+	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+		return "", err
+	}
+
+	// Pad the value to be encrypted
+	paddedValue := pkcs7Pad([]byte(value), aes.BlockSize)
+
+	// Encrypt the value
+	encrypted := make([]byte, len(paddedValue))
+	mode := cipher.NewCBCEncrypter(block, iv)
+	mode.CryptBlocks(encrypted, paddedValue)
+
+	// Combine IV and encrypted value
+	result := make([]byte, len(iv)+len(encrypted))
+	copy(result, iv)
+	copy(result[len(iv):], encrypted)
+
+	// Base64 encode for cookie storage
+	return base64.StdEncoding.EncodeToString(result), nil
+}
+
+// DecryptCookie decrypts the cookie value
+func (h *UserHandler) DecryptCookie(encryptedValue string) (string, error) {
+	// Base64 decode
+	ciphertext, err := base64.StdEncoding.DecodeString(encryptedValue)
+	if err != nil {
+		return "", err
+	}
+
+	key := []byte(h.config.CookieEncryptionKey)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+
+	// Check if the ciphertext is valid
+	if len(ciphertext) < aes.BlockSize {
+		return "", errors.New("ciphertext too short")
+	}
+
+	// Extract IV
+	iv := ciphertext[:aes.BlockSize]
+	ciphertext = ciphertext[aes.BlockSize:]
+
+	// Decrypt
+	decrypted := make([]byte, len(ciphertext))
+	mode := cipher.NewCBCDecrypter(block, iv)
+	mode.CryptBlocks(decrypted, ciphertext)
+
+	// Unpad
+	unpaddedValue, err := pkcs7Unpad(decrypted, aes.BlockSize)
+	if err != nil {
+		return "", err
+	}
+
+	return string(unpaddedValue), nil
+}
+
+// pkcs7Pad adds padding to a byte slice
+func pkcs7Pad(data []byte, blockSize int) []byte {
+	padding := blockSize - (len(data) % blockSize)
+	padtext := bytes.Repeat([]byte{byte(padding)}, padding)
+	return append(data, padtext...)
+}
+
+// pkcs7Unpad removes padding from a byte slice
+func pkcs7Unpad(data []byte, blockSize int) ([]byte, error) {
+	length := len(data)
+	if length == 0 {
+		return nil, errors.New("empty data")
+	}
+
+	padding := int(data[length-1])
+	if padding > blockSize || padding == 0 {
+		return nil, errors.New("invalid padding")
+	}
+
+	// Check padding integrity
+	for i := length - padding; i < length; i++ {
+		if data[i] != byte(padding) {
+			return nil, errors.New("invalid padding")
+		}
+	}
+
+	return data[:length-padding], nil
 }

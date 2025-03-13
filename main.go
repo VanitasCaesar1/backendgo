@@ -86,6 +86,7 @@ func NewApp() (*App, error) {
 			panic(err)
 		}
 	}()
+
 	// Setup PostgreSQL connection with retry logic
 	var pgPool *pgxpool.Pool
 	maxRetries := 5
@@ -222,15 +223,23 @@ func NewApp() (*App, error) {
 	// Add recover middleware
 	fiberApp.Use(recover.New())
 
-	// CORS configuration
+	// Updated CORS middleware configuration
 	fiberApp.Use(cors.New(cors.Config{
 		AllowOrigins:     "http://localhost:3000",
 		AllowMethods:     "GET,POST,HEAD,PUT,DELETE,PATCH,OPTIONS",
-		AllowHeaders:     "Origin, Content-Type, Accept, Authorization",
+		AllowHeaders:     "Origin, Content-Type, Accept, Authorization, Cookie",
 		AllowCredentials: true,
 		ExposeHeaders:    "Set-Cookie",
 		MaxAge:           300,
 	}))
+
+	// Add session debug middleware
+	fiberApp.Use(func(c *fiber.Ctx) error {
+		logger.Debug("Request cookies",
+			zap.String("path", c.Path()),
+			zap.String("cookies", c.Get("Cookie")))
+		return c.Next()
+	})
 
 	// CSP configuration
 	fiberApp.Use(func(c *fiber.Ctx) error {
@@ -285,22 +294,47 @@ func NewApp() (*App, error) {
 	}, nil
 }
 
+// setupRoutes sets up all the routes for the application
 func (a *App) setupRoutes() error {
 	// Setup the auth middleware with WorkOS client
-	authMiddleware, err := middleware.NewAuthMiddleware(middleware.AuthMiddlewareConfig{
-		Logger:       a.Logger,
-		Redis:        a.Redis,
-		Config:       a.Config,
-		CookieName:   "wos-session",
-		WorkosClient: a.WorkosClient,
-		ClientID:     a.Config.WorkOSClientId,
-	})
+	authMiddleware, err := middleware.NewAuthMiddleware(
+		middleware.AuthMiddlewareConfig{
+			Logger:       a.Logger,
+			Redis:        a.Redis,
+			Config:       a.Config,
+			WorkosClient: a.WorkosClient,
+			ClientID:     a.Config.WorkOSClientId,
+			JWTSecret:    a.Config.JwtSecret,
+			DevMode:      a.Config.Environment != "production",
+		},
+		a.Config, // Add this second argument
+	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize auth middleware: %v", err)
 	}
 
+	a.Fiber.Post("/api/auth/session", authMiddleware.CreateSessionHandler())
+	a.Fiber.Get("/api/auth/validate", authMiddleware.Handler(), func(c *fiber.Ctx) error {
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"authenticated":   true,
+			"user_id":         c.Locals("userID"),
+			"auth_id":         c.Locals("authID"),
+			"email":           c.Locals("email"),
+			"first_name":      c.Locals("first_name"),
+			"last_name":       c.Locals("last_name"),
+			"organization_id": c.Locals("organizationID"),
+		})
+	})
+	a.Fiber.Post("/api/auth/refresh", func(c *fiber.Ctx) error {
+		// Implementation for refreshing tokens
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"message": "Token refreshed",
+		})
+	})
+	a.Fiber.Post("/api/auth/logout", authMiddleware.LogoutHandler())
+
 	// User handler
-	userHandler, err := handlers.NewUserHandler(a.Config, a.Redis, a.Logger, a.Postgres)
+	userHandler, err := handlers.NewUserHandler(a.Config, a.Redis, a.Logger, a.Postgres, authMiddleware)
 	if err != nil {
 		return fmt.Errorf("failed to initialize user handler: %v", err)
 	}
@@ -314,35 +348,62 @@ func (a *App) setupRoutes() error {
 	// Initialize Doctor Auth Handler
 	doctorAuthHandler := handlers.NewDoctorAuthHandler(a.Config, a.Redis, a.Logger, a.Postgres, authMiddleware)
 
-	// Auth routes (no authentication required)
+	// Health check route - publicly accessible
+	a.Fiber.Get("/health", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"status": "ok",
+			"time":   time.Now().Format(time.RFC3339),
+		})
+	})
 
+	// Auth routes (no authentication required)
 	authGroup := a.Fiber.Group("/auth")
-	authGroup.Post("/user/login", userHandler.GetUserProfile)
-	authGroup.Post("/user/logout", userHandler.GetUserProfile)
+	authGroup.Post("/user/register", userHandler.RegisterUser)
+	authGroup.Post("/request-reset", userHandler.ResetPassword)
+	authGroup.Post("/reset-password", userHandler.ResetPassword)
+	authGroup.Get("/validate-reset-token", userHandler.ResetPassword)
 	authGroup.Post("/doctor/login", doctorAuthHandler.DoctorLogin)
 	authGroup.Post("/doctor/register", doctorAuthHandler.RegisterDoctor)
 
-	// Regular API routes - use auth middleware
-	api := a.Fiber.Group("/api", authMiddleware.Handler())
-	// User routes
-	userGroup := api.Group("/user")
+	// WorkOS specific auth routes
+	workosAuthGroup := a.Fiber.Group("/workos-auth")
+
+	// Add callback handler for WorkOS authentication
+	workosAuthGroup.Get("/callback", func(c *fiber.Ctx) error {
+		code := c.Query("code")
+		if code == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Missing authorization code",
+			})
+		}
+		return c.Redirect("/app")
+	})
+
+	// Apply the middleware to protected API routes
+
+	// User routes - protected
+	userGroup := a.Fiber.Group("/api/user", authMiddleware.Handler())
 	userGroup.Get("/profile", userHandler.GetUserProfile)
 	userGroup.Put("/profile", userHandler.UpdateUserProfile)
 	userGroup.Post("/profile/picture", userHandler.UploadProfilePic)
 	userGroup.Get("/profile/picture/:filename", userHandler.GetProfilePic)
 
-	// Doctor routes that require authentication
-	doctorGroup := api.Group("/doctors")
-	doctorGroup.Get("/profile", doctorAuthHandler.GetDoctorProfile)
-	doctorGroup.Delete("/profile", doctorAuthHandler.DeleteDoctor)
+	// Doctor routes - protected
+	doctorGroup := a.Fiber.Group("/api/doctors", authMiddleware.Handler())
 	doctorGroup.Get("/profile", doctorHandler.GetDoctorProfile)
 	doctorGroup.Put("/profile", doctorHandler.UpdateDoctorProfile)
+	doctorGroup.Delete("/profile", doctorAuthHandler.DeleteDoctor)
 	doctorGroup.Get("/schedule", doctorHandler.GetDoctorSchedule)
 	doctorGroup.Put("/schedule", doctorHandler.UpdateDoctorSchedule)
 	doctorGroup.Get("/fees", doctorHandler.GetDoctorFees)
 	doctorGroup.Put("/fees", doctorHandler.UpdateDoctorFees)
-	doctorGroup.Delete("/api/doctors/schedule/:id", doctorHandler.DeleteDoctorSchedule)
-	doctorGroup.Delete("/api/doctors/fees/:id", doctorHandler.DeleteDoctorFees)
+	doctorGroup.Delete("/schedule/:id", doctorHandler.DeleteDoctorSchedule)
+	doctorGroup.Delete("/fees/:id", doctorHandler.DeleteDoctorFees)
+
+	// Additional protected API routes from the middleware file
+	a.Fiber.Use("/api/protected/*", authMiddleware.Handler())
+	a.Fiber.Use("/api/user/*", authMiddleware.Handler())
+	a.Fiber.Use("/api/data/*", authMiddleware.Handler())
 
 	return nil
 }
