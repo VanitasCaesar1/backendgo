@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"regexp"
 	"time"
 
@@ -674,4 +675,118 @@ func (h *DoctorHandler) DeleteDoctorFees(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(fiber.Map{"message": "Fees deleted successfully"})
+}
+
+// GetOrganizationDoctors retrieves all doctors in the same organization
+func (h *DoctorHandler) GetOrganizationDoctors(c *fiber.Ctx) error {
+	// Get organization ID from context
+	orgID := c.Get("X-Organization-ID")
+	if orgID == "" {
+		h.logger.Error("organization ID not found in context")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID is required"})
+	}
+
+	// Verify user is authenticated
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+	fmt.Println(authID)
+	// Query to get all doctors in the same organization
+	rows, err := h.pgPool.Query(c.Context(), `
+		SELECT 
+			d.doctor_id,
+			u.auth_id,
+			COALESCE(u.username, '') as username,
+			COALESCE(u.profile_pic, '') as profile_pic,
+			COALESCE(u.name, '') as name,
+			COALESCE(CAST(u.mobile AS TEXT), '') as mobile,
+			COALESCE(u.email, '') as email,
+			COALESCE(u.location, '') as location,
+			d.specialization,
+			d.is_active,
+			COALESCE(d.qualification, '') as qualification
+		FROM 
+			doctors d
+		JOIN 
+			users u ON d.doctor_id = u.user_id
+		WHERE 
+			u.organization_id = $1
+	`, orgID)
+
+	if err != nil {
+		h.logger.Error("failed to fetch organization doctors", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch doctors"})
+	}
+	defer rows.Close()
+
+	var doctors []map[string]interface{}
+
+	for rows.Next() {
+		var (
+			doctorID           uuid.UUID
+			authID             string
+			username           string
+			profilePic         string
+			name               string
+			mobile             string
+			email              string
+			location           string
+			specializationJSON []byte
+			isActive           bool
+			qualification      string
+		)
+
+		if err := rows.Scan(
+			&doctorID,
+			&authID,
+			&username,
+			&profilePic,
+			&name,
+			&mobile,
+			&email,
+			&location,
+			&specializationJSON,
+			&isActive,
+			&qualification,
+		); err != nil {
+			h.logger.Error("failed to scan doctor row", zap.Error(err))
+			continue
+		}
+
+		// Parse specialization JSON
+		var specialization Specialization
+		if len(specializationJSON) > 0 {
+			if err := json.Unmarshal(specializationJSON, &specialization); err != nil {
+				h.logger.Error("failed to parse specialization JSON", zap.Error(err))
+				specialization = Specialization{Primary: "Unknown"}
+			}
+		} else {
+			specialization = Specialization{Primary: ""}
+		}
+
+		doctor := map[string]interface{}{
+			"doctor_id":           doctorID,
+			"auth_id":             authID,
+			"username":            username,
+			"profile_picture_url": profilePic,
+			"name":                name,
+			"mobile":              mobile,
+			"email":               email,
+			"location":            location,
+			"specialization":      specialization,
+			"is_active":           isActive,
+			"qualification":       qualification,
+		}
+
+		doctors = append(doctors, doctor)
+	}
+
+	if err := rows.Err(); err != nil {
+		h.logger.Error("error during doctors rows scan", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process doctors data"})
+	}
+
+	return c.JSON(doctors)
 }

@@ -399,6 +399,11 @@ func (a *App) setupRoutes() error {
 	doctorGroup.Put("/fees", doctorHandler.UpdateDoctorFees)
 	doctorGroup.Delete("/schedule/:id", doctorHandler.DeleteDoctorSchedule)
 	doctorGroup.Delete("/fees/:id", doctorHandler.DeleteDoctorFees)
+	doctorGroup.Get("/")
+	//hospitalGroup := a.Fiber.Group("/api/hopsital")
+	////hospitalGroup.Post("/create")
+	//hospitalGroup.Get("/:id")
+	//	hospitalGroup.Get("/all")
 
 	// Additional protected API routes from the middleware file
 	a.Fiber.Use("/api/protected/*", authMiddleware.Handler())
