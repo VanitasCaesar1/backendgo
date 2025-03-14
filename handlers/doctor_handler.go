@@ -701,12 +701,8 @@ func (h *DoctorHandler) GetOrganizationDoctors(c *fiber.Ctx) error {
 			COALESCE(u.username, '') as username,
 			COALESCE(u.profile_pic, '') as profile_pic,
 			COALESCE(u.name, '') as name,
-			COALESCE(CAST(u.mobile AS TEXT), '') as mobile,
-			COALESCE(u.email, '') as email,
-			COALESCE(u.location, '') as location,
 			d.specialization,
 			d.is_active,
-			COALESCE(d.qualification, '') as qualification
 		FROM 
 			doctors d
 		JOIN 
@@ -730,12 +726,8 @@ func (h *DoctorHandler) GetOrganizationDoctors(c *fiber.Ctx) error {
 			username           string
 			profilePic         string
 			name               string
-			mobile             string
-			email              string
-			location           string
 			specializationJSON []byte
 			isActive           bool
-			qualification      string
 		)
 
 		if err := rows.Scan(
@@ -744,12 +736,8 @@ func (h *DoctorHandler) GetOrganizationDoctors(c *fiber.Ctx) error {
 			&username,
 			&profilePic,
 			&name,
-			&mobile,
-			&email,
-			&location,
 			&specializationJSON,
 			&isActive,
-			&qualification,
 		); err != nil {
 			h.logger.Error("failed to scan doctor row", zap.Error(err))
 			continue
@@ -772,12 +760,8 @@ func (h *DoctorHandler) GetOrganizationDoctors(c *fiber.Ctx) error {
 			"username":            username,
 			"profile_picture_url": profilePic,
 			"name":                name,
-			"mobile":              mobile,
-			"email":               email,
-			"location":            location,
 			"specialization":      specialization,
 			"is_active":           isActive,
-			"qualification":       qualification,
 		}
 
 		doctors = append(doctors, doctor)

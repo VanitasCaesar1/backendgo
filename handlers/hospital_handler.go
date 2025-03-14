@@ -11,7 +11,6 @@ import (
 	"github.com/VanitasCaesar1/backend/config"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/workos/workos-go/v4/pkg/organizations"
@@ -25,29 +24,28 @@ type HospitalHandler struct {
 	pgPool      *pgxpool.Pool
 }
 
-type HospitalAddress struct {
-	Street     string `json:"street"`
-	City       string `json:"city"`
-	State      string `json:"state"`
-	PostalCode string `json:"postal_code"`
-	Country    string `json:"country"`
+type HospitalFee struct {
+	ID        uuid.UUID `json:"id,omitempty"`
+	FeeType   string    `json:"fee_type"`
+	Amount    float64   `json:"amount"`
+	CreatedAt string    `json:"created_at,omitempty"`
 }
 
 type Hospital struct {
-	ID              uuid.UUID       `json:"id,omitempty"`
-	OrgID           string          `json:"org_id"`
-	Name            string          `json:"name"`
-	Email           string          `json:"email"`
-	Phone           string          `json:"phone,omitempty"`
-	Address         HospitalAddress `json:"address"`
-	Website         string          `json:"website,omitempty"`
-	Description     string          `json:"description,omitempty"`
-	Logo            string          `json:"logo,omitempty"`
-	EstablishedYear int             `json:"established_year,omitempty"`
-	IsActive        bool            `json:"is_active"`
-	AdminUserID     uuid.UUID       `json:"admin_user_id,omitempty"`
-	CreatedAt       string          `json:"created_at,omitempty"`
-	UpdatedAt       string          `json:"updated_at,omitempty"`
+	AdminID       uuid.UUID       `json:"admin_id"`
+	OrgID         string          `json:"org_id"`
+	Name          string          `json:"name"`
+	Email         string          `json:"email"`
+	Number        int64           `json:"number"`
+	Address       string          `json:"address"`
+	LicenseNumber string          `json:"license_number,omitempty"`
+	StartTime     time.Time       `json:"start_time"`
+	EndTime       time.Time       `json:"end_time"`
+	Location      string          `json:"location"`
+	HospitalPics  json.RawMessage `json:"hospital_pics,omitempty"`
+	Speciality    string          `json:"speciality,omitempty"`
+	CreatedAt     string          `json:"created_at,omitempty"`
+	Fees          []HospitalFee   `json:"fees,omitempty"`
 }
 
 func NewHospitalHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, pgPool *pgxpool.Pool) (*HospitalHandler, error) {
@@ -78,14 +76,6 @@ func (h *HospitalHandler) getAuthID(c *fiber.Ctx) (string, error) {
 func (h *HospitalHandler) isUserAdmin(ctx context.Context, userID uuid.UUID) (bool, error) {
 	var isAdmin bool
 	err := h.pgPool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM admins WHERE user_id = $1)", userID).Scan(&isAdmin)
-	return isAdmin, err
-}
-
-func (h *HospitalHandler) isHospitalAdmin(ctx context.Context, userID uuid.UUID, hospitalID uuid.UUID) (bool, error) {
-	var isAdmin bool
-	err := h.pgPool.QueryRow(ctx,
-		"SELECT EXISTS(SELECT 1 FROM hospital_admins WHERE user_id = $1 AND hospital_id = $2)",
-		userID, hospitalID).Scan(&isAdmin)
 	return isAdmin, err
 }
 
@@ -124,30 +114,10 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 	}
 
 	// Create a WorkOS organization for the hospital
-	domain := ""
-	if hospitalData.Website != "" {
-		// Extract domain from website
-		re := regexp.MustCompile(`^(?:https?:\/\/)?(?:[^@\n]+@)?(?:www\.)?([^:\/\n]+)`)
-		matches := re.FindStringSubmatch(hospitalData.Website)
-		if len(matches) > 1 {
-			domain = matches[1]
-		}
-	}
-
-	var domainData []organizations.OrganizationDomainData
-	if domain != "" {
-		domainData = []organizations.OrganizationDomainData{
-			{
-				Domain: domain,
-			},
-		}
-	}
-
 	org, err := organizations.CreateOrganization(
 		c.Context(),
 		organizations.CreateOrganizationOpts{
-			Name:       hospitalData.Name,
-			DomainData: domainData,
+			Name: hospitalData.Name,
 		},
 	)
 	if err != nil {
@@ -165,40 +135,35 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 	}
 	defer tx.Rollback(c.Context())
 
-	// Create new UUID for the hospital
-	hospitalID := uuid.New()
-
-	// Convert address to JSON
-	addressJSON, err := json.Marshal(hospitalData.Address)
-	if err != nil {
-		h.logger.Error("failed to marshal address to JSON", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process address data"})
-	}
-
 	// Insert hospital data
 	_, err = tx.Exec(c.Context(),
 		`INSERT INTO hospitals (
-			id, org_id, name, email, phone, address, website, 
-			description, logo, established_year, is_active, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`,
-		hospitalID, org.ID, hospitalData.Name, hospitalData.Email, hospitalData.Phone, addressJSON,
-		hospitalData.Website, hospitalData.Description, hospitalData.Logo, hospitalData.EstablishedYear,
-		hospitalData.IsActive,
+			admin_id, org_id, name, email, number, address, license_number, 
+			start_time, end_time, location, hospital_pics, speciality, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)`,
+		userID, org.ID, hospitalData.Name, hospitalData.Email, hospitalData.Number, hospitalData.Address,
+		hospitalData.LicenseNumber, hospitalData.StartTime, hospitalData.EndTime, hospitalData.Location,
+		hospitalData.HospitalPics, hospitalData.Speciality,
 	)
 	if err != nil {
 		h.logger.Error("failed to insert hospital data", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create hospital"})
 	}
 
-	// Insert hospital admin relationship
-	_, err = tx.Exec(c.Context(),
-		`INSERT INTO hospital_admins (hospital_id, user_id, created_at)
-		 VALUES ($1, $2, CURRENT_TIMESTAMP)`,
-		hospitalID, userID,
-	)
-	if err != nil {
-		h.logger.Error("failed to insert hospital admin relationship", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to assign admin to hospital"})
+	// Insert fee data if provided
+	if hospitalData.Fees != nil && len(hospitalData.Fees) > 0 {
+		for _, fee := range hospitalData.Fees {
+			_, err = tx.Exec(c.Context(),
+				`INSERT INTO hospital_fees (
+					fee_type, amount, hospital_id, created_at
+				) VALUES ($1, $2, $3, CURRENT_TIMESTAMP)`,
+				fee.FeeType, fee.Amount, userID,
+			)
+			if err != nil {
+				h.logger.Error("failed to insert fee data", zap.Error(err))
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to add hospital fees"})
+			}
+		}
 	}
 
 	if err := tx.Commit(c.Context()); err != nil {
@@ -207,9 +172,9 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 	}
 
 	// Return the created hospital with its ID
-	hospitalData.ID = hospitalID
+	hospitalData.AdminID = userID
 	hospitalData.OrgID = org.ID
-	hospitalData.AdminUserID = userID
+	hospitalData.CreatedAt = time.Now().Format(time.RFC3339)
 
 	return c.Status(fiber.StatusCreated).JSON(hospitalData)
 }
@@ -239,41 +204,60 @@ func (h *HospitalHandler) GetHospital(c *fiber.Ctx) error {
 	}
 
 	var hospital Hospital
-	var addressJSON []byte
-	var createdAt, updatedAt time.Time
+	var createdAt time.Time
 
 	err = h.pgPool.QueryRow(c.Context(),
-		`SELECT id, org_id, name, email, phone, address, website, 
-			description, logo, established_year, is_active, created_at, updated_at
-		 FROM hospitals WHERE id = $1`,
+		`SELECT 
+			admin_id, org_id, name, email, number, address, license_number, 
+			start_time, end_time, location, hospital_pics, speciality, created_at
+		FROM hospitals WHERE admin_id = $1`,
 		parsedHospitalID).Scan(
-		&hospital.ID,
+		&hospital.AdminID,
 		&hospital.OrgID,
 		&hospital.Name,
 		&hospital.Email,
-		&hospital.Phone,
-		&addressJSON,
-		&hospital.Website,
-		&hospital.Description,
-		&hospital.Logo,
-		&hospital.EstablishedYear,
-		&hospital.IsActive,
+		&hospital.Number,
+		&hospital.Address,
+		&hospital.LicenseNumber,
+		&hospital.StartTime,
+		&hospital.EndTime,
+		&hospital.Location,
+		&hospital.HospitalPics,
+		&hospital.Speciality,
 		&createdAt,
-		&updatedAt,
 	)
 	if err != nil {
 		h.logger.Error("failed to fetch hospital", zap.Error(err))
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Hospital not found"})
 	}
 
-	// Parse the JSONB address field
-	if err := json.Unmarshal(addressJSON, &hospital.Address); err != nil {
-		h.logger.Error("failed to parse address JSON", zap.Error(err))
-		hospital.Address = HospitalAddress{}
-	}
-
 	hospital.CreatedAt = createdAt.Format(time.RFC3339)
-	hospital.UpdatedAt = updatedAt.Format(time.RFC3339)
+
+	// Get hospital fees
+	rows, err := h.pgPool.Query(c.Context(),
+		`SELECT id, fee_type, amount, created_at
+		FROM hospital_fees
+		WHERE hospital_id = $1`,
+		parsedHospitalID)
+	if err != nil {
+		h.logger.Error("failed to fetch hospital fees", zap.Error(err))
+	} else {
+		defer rows.Close()
+
+		for rows.Next() {
+			var fee HospitalFee
+			var feeCreatedAt time.Time
+
+			err := rows.Scan(&fee.ID, &fee.FeeType, &fee.Amount, &feeCreatedAt)
+			if err != nil {
+				h.logger.Error("failed to scan fee row", zap.Error(err))
+				continue
+			}
+
+			fee.CreatedAt = feeCreatedAt.Format(time.RFC3339)
+			hospital.Fees = append(hospital.Fees, fee)
+		}
+	}
 
 	return c.JSON(hospital)
 }
@@ -302,14 +286,14 @@ func (h *HospitalHandler) UpdateHospital(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
-	// Check if user is a hospital admin
-	isAdmin, err := h.isHospitalAdmin(c.Context(), userID, parsedHospitalID)
+	// Only allow the admin to update their own hospital or if user is system admin
+	isSystemAdmin, err := h.isUserAdmin(c.Context(), userID)
 	if err != nil {
-		h.logger.Error("failed to check hospital admin status", zap.Error(err))
+		h.logger.Error("failed to check admin status", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
-	if !isAdmin {
+	if !isSystemAdmin && userID != parsedHospitalID {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "You don't have permission to update this hospital"})
 	}
 
@@ -323,16 +307,9 @@ func (h *HospitalHandler) UpdateHospital(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	// Convert address to JSON
-	addressJSON, err := json.Marshal(updateData.Address)
-	if err != nil {
-		h.logger.Error("failed to marshal address to JSON", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process address data"})
-	}
-
 	// Get the current WorkOS organization ID
 	var orgID string
-	err = h.pgPool.QueryRow(c.Context(), "SELECT org_id FROM hospitals WHERE id = $1", parsedHospitalID).Scan(&orgID)
+	err = h.pgPool.QueryRow(c.Context(), "SELECT org_id FROM hospitals WHERE admin_id = $1", parsedHospitalID).Scan(&orgID)
 	if err != nil {
 		h.logger.Error("failed to get hospital org_id", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
@@ -351,15 +328,22 @@ func (h *HospitalHandler) UpdateHospital(c *fiber.Ctx) error {
 		// Continue anyway, as the database update is more important
 	}
 
+	// Start a transaction
+	tx, err := h.pgPool.Begin(c.Context())
+	if err != nil {
+		h.logger.Error("failed to begin transaction", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+	defer tx.Rollback(c.Context())
+
 	// Update the hospital in the database
-	// Update the hospital in the database
-	_, err = h.pgPool.Exec(c.Context(),
+	_, err = tx.Exec(c.Context(),
 		`UPDATE hospitals SET 
-	name = $1, email = $2, phone = $3, address = $4, website = $5,
-	description = $6, logo = $7, established_year = $8, is_active = $9, updated_at = CURRENT_TIMESTAMP
-WHERE id = $10`,
-		updateData.Name, updateData.Email, updateData.Phone, addressJSON, updateData.Website,
-		updateData.Description, updateData.Logo, updateData.EstablishedYear, updateData.IsActive,
+			name = $1, email = $2, number = $3, address = $4, license_number = $5,
+			start_time = $6, end_time = $7, location = $8, hospital_pics = $9, speciality = $10
+		WHERE admin_id = $11`,
+		updateData.Name, updateData.Email, updateData.Number, updateData.Address, updateData.LicenseNumber,
+		updateData.StartTime, updateData.EndTime, updateData.Location, updateData.HospitalPics, updateData.Speciality,
 		parsedHospitalID,
 	)
 	if err != nil {
@@ -367,44 +351,36 @@ WHERE id = $10`,
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update hospital"})
 	}
 
-	// Fetch the updated hospital data to return
-	var hospital Hospital
-	var createdAt, updatedAt time.Time
+	// Update fees if provided
+	if updateData.Fees != nil && len(updateData.Fees) > 0 {
+		// Delete existing fees
+		_, err = tx.Exec(c.Context(), "DELETE FROM hospital_fees WHERE hospital_id = $1", parsedHospitalID)
+		if err != nil {
+			h.logger.Error("failed to delete existing fees", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update hospital fees"})
+		}
 
-	err = h.pgPool.QueryRow(c.Context(),
-		`SELECT id, org_id, name, email, phone, address, website, 
-	description, logo, established_year, is_active, created_at, updated_at
- FROM hospitals WHERE id = $1`,
-		parsedHospitalID).Scan(
-		&hospital.ID,
-		&hospital.OrgID,
-		&hospital.Name,
-		&hospital.Email,
-		&hospital.Phone,
-		&addressJSON,
-		&hospital.Website,
-		&hospital.Description,
-		&hospital.Logo,
-		&hospital.EstablishedYear,
-		&hospital.IsActive,
-		&createdAt,
-		&updatedAt,
-	)
-	if err != nil {
-		h.logger.Error("failed to fetch updated hospital", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Hospital updated but failed to retrieve data"})
+		// Insert new fees
+		for _, fee := range updateData.Fees {
+			_, err = tx.Exec(c.Context(),
+				`INSERT INTO hospital_fees (fee_type, amount, hospital_id, created_at)
+				VALUES ($1, $2, $3, CURRENT_TIMESTAMP)`,
+				fee.FeeType, fee.Amount, parsedHospitalID,
+			)
+			if err != nil {
+				h.logger.Error("failed to insert fee data", zap.Error(err))
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update hospital fees"})
+			}
+		}
 	}
 
-	// Parse the JSONB address field
-	if err := json.Unmarshal(addressJSON, &hospital.Address); err != nil {
-		h.logger.Error("failed to parse address JSON", zap.Error(err))
-		hospital.Address = HospitalAddress{}
+	if err := tx.Commit(c.Context()); err != nil {
+		h.logger.Error("failed to commit transaction", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
-	hospital.CreatedAt = createdAt.Format(time.RFC3339)
-	hospital.UpdatedAt = updatedAt.Format(time.RFC3339)
-
-	return c.JSON(hospital)
+	// Return updated hospital data
+	return h.GetHospital(c)
 }
 
 // DeleteHospital removes a hospital
@@ -438,13 +414,13 @@ func (h *HospitalHandler) DeleteHospital(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
-	if !isAdmin {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Only system administrators can delete hospitals"})
+	if !isAdmin && userID != parsedHospitalID {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Only system administrators or the hospital admin can delete this hospital"})
 	}
 
 	// Get the WorkOS organization ID
 	var orgID string
-	err = h.pgPool.QueryRow(c.Context(), "SELECT org_id FROM hospitals WHERE id = $1", parsedHospitalID).Scan(&orgID)
+	err = h.pgPool.QueryRow(c.Context(), "SELECT org_id FROM hospitals WHERE admin_id = $1", parsedHospitalID).Scan(&orgID)
 	if err != nil {
 		h.logger.Error("failed to get hospital org_id", zap.Error(err))
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Hospital not found"})
@@ -458,15 +434,15 @@ func (h *HospitalHandler) DeleteHospital(c *fiber.Ctx) error {
 	}
 	defer tx.Rollback(c.Context())
 
-	// Delete hospital admin relationships
-	_, err = tx.Exec(c.Context(), "DELETE FROM hospital_admins WHERE hospital_id = $1", parsedHospitalID)
+	// Delete hospital fees
+	_, err = tx.Exec(c.Context(), "DELETE FROM hospital_fees WHERE hospital_id = $1", parsedHospitalID)
 	if err != nil {
-		h.logger.Error("failed to delete hospital admin relationships", zap.Error(err))
+		h.logger.Error("failed to delete hospital fees", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
 	// Delete hospital
-	_, err = tx.Exec(c.Context(), "DELETE FROM hospitals WHERE id = $1", parsedHospitalID)
+	_, err = tx.Exec(c.Context(), "DELETE FROM hospitals WHERE admin_id = $1", parsedHospitalID)
 	if err != nil {
 		h.logger.Error("failed to delete hospital", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
@@ -505,32 +481,13 @@ func (h *HospitalHandler) ListHospitals(c *fiber.Ctx) error {
 		h.logger.Error("failed to get user ID", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
-
-	// Check if user is a system admin
-	isAdmin, err := h.isUserAdmin(c.Context(), userID)
-	if err != nil {
-		h.logger.Error("failed to check admin status", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
-	}
-
-	var rows pgx.Rows
-	if isAdmin {
-		// System admins can see all hospitals
-		rows, err = h.pgPool.Query(c.Context(),
-			`SELECT id, org_id, name, email, phone, address, website, 
-			description, logo, established_year, is_active, created_at, updated_at
-		 FROM hospitals ORDER BY name`)
-	} else {
-		// Regular users can only see hospitals they're admins of
-		rows, err = h.pgPool.Query(c.Context(),
-			`SELECT h.id, h.org_id, h.name, h.email, h.phone, h.address, h.website, 
-			h.description, h.logo, h.established_year, h.is_active, h.created_at, h.updated_at
-		 FROM hospitals h
-		 JOIN hospital_admins ha ON h.id = ha.hospital_id
-		 WHERE ha.user_id = $1
-		 ORDER BY h.name`, userID)
-	}
-
+	fmt.Println(userID)
+	// Get all hospitals
+	rows, err := h.pgPool.Query(c.Context(),
+		`SELECT 
+			admin_id, org_id, name, email, number, address, license_number, 
+			start_time, end_time, location, hospital_pics, speciality, created_at
+		FROM hospitals ORDER BY name`)
 	if err != nil {
 		h.logger.Error("failed to query hospitals", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
@@ -540,38 +497,59 @@ func (h *HospitalHandler) ListHospitals(c *fiber.Ctx) error {
 	hospitals := []Hospital{}
 	for rows.Next() {
 		var hospital Hospital
-		var addressJSON []byte
-		var createdAt, updatedAt time.Time
+		var createdAt time.Time
 
 		err := rows.Scan(
-			&hospital.ID,
+			&hospital.AdminID,
 			&hospital.OrgID,
 			&hospital.Name,
 			&hospital.Email,
-			&hospital.Phone,
-			&addressJSON,
-			&hospital.Website,
-			&hospital.Description,
-			&hospital.Logo,
-			&hospital.EstablishedYear,
-			&hospital.IsActive,
+			&hospital.Number,
+			&hospital.Address,
+			&hospital.LicenseNumber,
+			&hospital.StartTime,
+			&hospital.EndTime,
+			&hospital.Location,
+			&hospital.HospitalPics,
+			&hospital.Speciality,
 			&createdAt,
-			&updatedAt,
 		)
 		if err != nil {
 			h.logger.Error("failed to scan hospital row", zap.Error(err))
 			continue
 		}
 
-		// Parse the JSONB address field
-		if err := json.Unmarshal(addressJSON, &hospital.Address); err != nil {
-			h.logger.Error("failed to parse address JSON", zap.Error(err))
-			hospital.Address = HospitalAddress{}
+		hospital.CreatedAt = createdAt.Format(time.RFC3339)
+		hospitals = append(hospitals, hospital)
+	}
+
+	// Get fees for all hospitals in one query for efficiency
+	feesMap := make(map[uuid.UUID][]HospitalFee)
+	feeRows, err := h.pgPool.Query(c.Context(),
+		`SELECT id, hospital_id, fee_type, amount, created_at
+		FROM hospital_fees`)
+	if err == nil {
+		defer feeRows.Close()
+
+		for feeRows.Next() {
+			var fee HospitalFee
+			var hospitalID uuid.UUID
+			var createdAt time.Time
+
+			err := feeRows.Scan(&fee.ID, &hospitalID, &fee.FeeType, &fee.Amount, &createdAt)
+			if err != nil {
+				h.logger.Error("failed to scan fee row", zap.Error(err))
+				continue
+			}
+
+			fee.CreatedAt = createdAt.Format(time.RFC3339)
+			feesMap[hospitalID] = append(feesMap[hospitalID], fee)
 		}
 
-		hospital.CreatedAt = createdAt.Format(time.RFC3339)
-		hospital.UpdatedAt = updatedAt.Format(time.RFC3339)
-		hospitals = append(hospitals, hospital)
+		// Add fees to their respective hospitals
+		for i := range hospitals {
+			hospitals[i].Fees = feesMap[hospitals[i].AdminID]
+		}
 	}
 
 	return c.JSON(hospitals)
@@ -593,10 +571,25 @@ func (h *HospitalHandler) validateHospitalData(hospital *Hospital) error {
 		return errors.New("invalid email format")
 	}
 
-	if hospital.Address.Street == "" || hospital.Address.City == "" ||
-		hospital.Address.State == "" || hospital.Address.PostalCode == "" ||
-		hospital.Address.Country == "" {
-		return errors.New("complete address information is required")
+	if hospital.Address == "" {
+		return errors.New("Hospital address is required")
+	}
+
+	if hospital.Location == "" {
+		return errors.New("Hospital location is required")
+	}
+
+	if hospital.Number == 0 {
+		return errors.New("Hospital number is required")
+	}
+
+	// Validate time range
+	if hospital.StartTime.IsZero() || hospital.EndTime.IsZero() {
+		return errors.New("Start time and end time are required")
+	}
+
+	if hospital.EndTime.Before(hospital.StartTime) {
+		return errors.New("End time must be after start time")
 	}
 
 	return nil
