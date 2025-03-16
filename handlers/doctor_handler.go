@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"regexp"
@@ -676,7 +677,6 @@ func (h *DoctorHandler) DeleteDoctorFees(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"message": "Fees deleted successfully"})
 }
 
-// GetOrganizationDoctors retrieves all doctors in the same organization
 // GetDoctorsByOrganization retrieves all doctors in the same organization
 func (h *DoctorHandler) GetDoctorsByOrganization(c *fiber.Ctx) error {
 	// Get organization ID from context
@@ -697,28 +697,35 @@ func (h *DoctorHandler) GetDoctorsByOrganization(c *fiber.Ctx) error {
 		zap.String("orgID", orgID),
 		zap.String("authID", authID))
 
-	// Based on the schema provided, we know that hospital_id in users table links to hospitals,
-	// and hospitals have an org_id column, so we can use a straightforward join
+	// Improved query with more efficient join and better field selection
 	query := `
 		SELECT
 			d.doctor_id,
 			u.auth_id,
-			COALESCE(u.username, '') as username,
-			COALESCE(u.profile_pic, '') as profile_pic,
-			COALESCE(d.name, '') as name,
+			u.username,
+			u.profile_pic,
+			u.name,
 			d.specialization,
-			d.is_active
+			d.is_active,
+			d.qualification,
+			d.imr_number,
+			d.slot_duration
 		FROM
 			doctors d
-		JOIN
+		INNER JOIN
 			users u ON d.doctor_id = u.user_id
-		JOIN
+		INNER JOIN
 			hospitals h ON u.hospital_id = h.hospital_id
 		WHERE
 			h.org_id = $1
+		ORDER BY
+			u.name ASC
 	`
 
-	rows, err := h.pgPool.Query(c.Context(), query, orgID)
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+	defer cancel()
+
+	rows, err := h.pgPool.Query(ctx, query, orgID)
 	if err != nil {
 		h.logger.Error("failed to fetch doctors", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -732,11 +739,14 @@ func (h *DoctorHandler) GetDoctorsByOrganization(c *fiber.Ctx) error {
 		var (
 			doctorID           uuid.UUID
 			authID             string
-			username           string
-			profilePic         string
-			name               string
+			username           sql.NullString
+			profilePic         sql.NullString
+			name               sql.NullString
 			specializationJSON []byte
 			isActive           bool
+			qualification      sql.NullString
+			imrNumber          sql.NullString
+			slotDuration       sql.NullInt32
 		)
 
 		if err := rows.Scan(
@@ -747,6 +757,9 @@ func (h *DoctorHandler) GetDoctorsByOrganization(c *fiber.Ctx) error {
 			&name,
 			&specializationJSON,
 			&isActive,
+			&qualification,
+			&imrNumber,
+			&slotDuration,
 		); err != nil {
 			h.logger.Error("failed to scan doctor row", zap.Error(err))
 			continue
@@ -756,7 +769,9 @@ func (h *DoctorHandler) GetDoctorsByOrganization(c *fiber.Ctx) error {
 		var specialization Specialization
 		if len(specializationJSON) > 0 {
 			if err := json.Unmarshal(specializationJSON, &specialization); err != nil {
-				h.logger.Error("failed to parse specialization JSON", zap.Error(err))
+				h.logger.Error("failed to parse specialization JSON",
+					zap.Error(err),
+					zap.String("doctorID", doctorID.String()))
 				specialization = Specialization{Primary: "Unknown"}
 			}
 		} else {
@@ -766,11 +781,14 @@ func (h *DoctorHandler) GetDoctorsByOrganization(c *fiber.Ctx) error {
 		doctors = append(doctors, map[string]interface{}{
 			"doctor_id":           doctorID,
 			"auth_id":             authID,
-			"username":            username,
-			"profile_picture_url": profilePic,
-			"name":                name,
+			"username":            username.String,
+			"profile_picture_url": profilePic.String,
+			"name":                name.String,
 			"specialization":      specialization,
 			"is_active":           isActive,
+			"qualification":       qualification.String,
+			"imr_number":          imrNumber.String,
+			"slot_duration":       slotDuration.Int32,
 		})
 	}
 
@@ -779,6 +797,13 @@ func (h *DoctorHandler) GetDoctorsByOrganization(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process doctors data"})
 	}
 
-	h.logger.Info("successfully fetched doctors", zap.Int("count", len(doctors)))
-	return c.JSON(doctors)
+	h.logger.Info("successfully fetched doctors",
+		zap.Int("count", len(doctors)),
+		zap.String("orgID", orgID))
+
+	return c.JSON(map[string]interface{}{
+		"status": "success",
+		"count":  len(doctors),
+		"data":   doctors,
+	})
 }

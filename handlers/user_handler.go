@@ -1,20 +1,11 @@
 package handlers
 
 import (
-	"bytes"
 	"context"
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
 	"database/sql"
-	"encoding/base64"
 	"errors"
 	"fmt"
-	"image"
-	"image/jpeg"
 	_ "image/png" // Register PNG decoder
-	"io"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -27,17 +18,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-	"github.com/nfnt/resize"
 	"github.com/redis/go-redis/v9"
 	"github.com/workos/workos-go/v4/pkg/usermanagement"
 	"go.uber.org/zap"
-)
-
-const (
-	maxFileSize  = 5 * 1024 * 1024 // 5MB
-	bucketName   = "profile-pics"
-	maxDimension = 500 // Maximum width/height for profile pictures
-	jpegQuality  = 85  // JPEG compression quality
 )
 
 type UserHandler struct {
@@ -191,6 +174,12 @@ func (h *UserHandler) RegisterUser(c *fiber.Ctx) error {
 	h.logger.Debug("processing registration request",
 		zap.String("email", req.Email),
 		zap.String("username", req.Username))
+	// Add this to your validateRegister function in the Go code
+	if req.AadhaarID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Aadhaar ID is required",
+		})
+	}
 
 	// Start transaction
 	tx, err := h.pgPool.Begin(c.Context())
@@ -328,7 +317,12 @@ func (h *UserHandler) validateRegister(c *fiber.Ctx, register *UserRegister) err
 			"error": "Aadhaar ID is required",
 		})
 	}
-
+	// In your Go validateRegister function
+	aadhaarIDStr := register.AadhaarID
+	h.logger.Debug("Validating Aadhaar ID",
+		zap.String("aadhaar_id", aadhaarIDStr),
+		zap.Int("length", len(aadhaarIDStr)),
+		zap.Bool("regex_match", regexp.MustCompile(`^\d{12}$`).MatchString(aadhaarIDStr)))
 	return nil
 }
 
@@ -819,378 +813,7 @@ func (h *UserHandler) validateProfileUpdate(profile *UserProfile) error {
 		return errors.New("address must not exceed 500 characters")
 	}
 
-	// Aadhaar ID validation
-	if profile.AadhaarID != "" {
-		aadhaarPattern := regexp.MustCompile(`^\d{12}$`)
-		if !aadhaarPattern.MatchString(profile.AadhaarID) {
-			h.logger.Error("invalid aadhaar id format",
-				zap.String("aadhaar_id", profile.AadhaarID))
-			return errors.New("aadhaar ID must be exactly 12 digits")
-		}
-	}
-
 	return nil
-}
-
-func (h *UserHandler) testMinioConnection(ctx context.Context) error {
-	_, err := h.minioClient.ListBuckets(ctx)
-	if err != nil {
-		if err.Error() == "Found" {
-			// "Found" indicates a successful connection
-			return nil
-		}
-		h.logger.Error("failed to connect to minio",
-			zap.Error(err),
-			zap.String("endpoint", h.config.MinioEndpoint))
-		return err
-	}
-	return nil
-}
-
-// UploadProfilePic has been modified to update the profile picture in WorkOS
-func (h *UserHandler) UploadProfilePic(c *fiber.Ctx) error {
-	// Get user ID from context
-	authID, ok := c.Locals("authID").(string)
-	if !ok {
-		h.logger.Error("authID not found in context")
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-			"error": "User ID not found",
-		})
-	}
-
-	if err := h.testMinioConnection(context.Background()); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Storage service unavailable",
-		})
-	}
-	// Parse multipart form
-	file, err := c.FormFile("profilePic")
-	if err != nil {
-		h.logger.Error("failed to get file from form", zap.Error(err))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "No file uploaded",
-		})
-	}
-
-	// Validate file size
-	if file.Size > maxFileSize {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": fmt.Sprintf("File size exceeds maximum limit of %d MB", maxFileSize/(1024*1024)),
-		})
-	}
-
-	// Validate file type
-	ext := strings.ToLower(filepath.Ext(file.Filename))
-	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Only JPG and PNG files are allowed",
-		})
-	}
-
-	// Open the uploaded file
-	src, err := file.Open()
-	if err != nil {
-		h.logger.Error("failed to open uploaded file", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to process uploaded file",
-		})
-	}
-	defer src.Close()
-
-	// Decode image
-	img, _, err := image.Decode(src)
-	if err != nil {
-		h.logger.Error("failed to decode image", zap.Error(err))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid image format",
-		})
-	}
-
-	// Resize image to 512x512
-	resized := resize.Resize(512, 512, img, resize.Lanczos3)
-
-	// Convert to JPEG and compress
-	buf := new(bytes.Buffer)
-	if err := jpeg.Encode(buf, resized, &jpeg.Options{Quality: jpegQuality}); err != nil {
-		h.logger.Error("failed to encode image", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to process image",
-		})
-	}
-
-	// Generate unique filename
-	filename := fmt.Sprintf("%s.jpg", uuid.New().String())
-
-	// Create a context with timeout for MinIO operations
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Check if bucket exists, create if it doesn't
-	exists, err := h.minioClient.BucketExists(ctx, bucketName)
-	h.logger.Info("bucket status",
-		zap.String("bucket", bucketName),
-		zap.Bool("exists", exists),
-		zap.Error(err))
-
-	if err != nil && err.Error() != "Found" {
-		h.logger.Error("failed to check bucket existence",
-			zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to check storage configuration",
-		})
-	}
-
-	// Only try to create bucket if it doesn't exist and we didn't get a "Found" error
-	if !exists && err == nil {
-		err = h.minioClient.MakeBucket(ctx, bucketName, minio.MakeBucketOptions{
-			Region: "india-s-1",
-		})
-		if err != nil && !strings.Contains(err.Error(), "already exists") {
-			h.logger.Error("failed to create bucket", zap.Error(err))
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"error": "Failed to configure storage",
-			})
-		}
-	}
-
-	// Upload to MinIO with proper content length and type
-	info, err := h.minioClient.PutObject(
-		ctx,
-		bucketName,
-		filename,
-		bytes.NewReader(buf.Bytes()),
-		int64(buf.Len()),
-		minio.PutObjectOptions{
-			ContentType: "image/jpeg",
-		},
-	)
-
-	if err != nil {
-		h.logger.Error("failed to upload to minio",
-			zap.Error(err),
-			zap.String("bucketName", bucketName),
-			zap.String("filename", filename))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to store image",
-		})
-	}
-
-	// Verify upload was successful
-	if info.Size == 0 {
-		h.logger.Error("upload completed but file size is 0",
-			zap.String("filename", filename))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to store image properly",
-		})
-	}
-
-	_, err = h.minioClient.StatObject(ctx, bucketName, filename, minio.StatObjectOptions{})
-	if err != nil {
-		h.logger.Error("failed to verify uploaded object",
-			zap.Error(err),
-			zap.String("filename", filename))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to verify uploaded image",
-		})
-	}
-
-	h.logger.Info("successfully uploaded file to minio",
-		zap.String("bucket", bucketName),
-		zap.String("filename", filename),
-		zap.Any("info", info),
-	)
-
-	// Generate full URL for the image
-	imageURL := fmt.Sprintf("%s/%s/%s", h.config.MinioEndpoint, bucketName, filename)
-
-	// Update user profile in database
-	if err := h.updateProfilePicURL(c.Context(), authID, imageURL); err != nil {
-		h.logger.Error("failed to update profile pic URL", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to update profile picture",
-		})
-	}
-
-	return c.JSON(fiber.Map{
-		"message": "Profile picture updated successfully",
-		"url":     imageURL,
-	})
-}
-
-func (h *UserHandler) updateProfilePicURL(ctx context.Context, authID string, imageURL string) error {
-	_, err := h.pgPool.Exec(ctx,
-		"UPDATE users SET profile_picture_url = $1 WHERE auth_id = $2",
-		imageURL, authID)
-	return err
-}
-
-// GetProfilePic retrieves a profile picture from MinIO
-func (h *UserHandler) GetProfilePic(c *fiber.Ctx) error {
-	authID, ok := c.Locals("authID").(string)
-	if !ok {
-		h.logger.Error("authID not found in context")
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-			"error": "User ID not found",
-		})
-	}
-
-	h.logger.Info("processing user profile request",
-		zap.String("authID", authID),
-		zap.Any("all_claims", c.Locals("claims")),
-	)
-
-	filename := c.Params("filename")
-
-	// Basic validation to prevent path traversal
-	if strings.Contains(filename, "/") || strings.Contains(filename, "\\") {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid filename",
-		})
-	}
-
-	// Increase timeout for image retrieval
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Add retry mechanism for MinIO connection
-	var obj *minio.Object
-	var err error
-
-	// Try up to 3 times with exponential backoff
-	for attempt := 0; attempt < 3; attempt++ {
-		obj, err = h.minioClient.GetObject(ctx, bucketName, filename, minio.GetObjectOptions{})
-		if err == nil {
-			break
-		}
-
-		h.logger.Warn("attempt to get object from minio failed, retrying...",
-			zap.Error(err),
-			zap.String("filename", filename),
-			zap.Int("attempt", attempt+1))
-
-		// Don't sleep on the last attempt
-		if attempt < 2 {
-			time.Sleep(time.Duration(100*(2<<attempt)) * time.Millisecond)
-		}
-	}
-
-	if err != nil {
-		h.logger.Error("all attempts to get object from minio failed",
-			zap.Error(err),
-			zap.String("filename", filename))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to retrieve image",
-		})
-	}
-
-	// Get object info to set content-type with retry
-	var objInfo minio.ObjectInfo
-	for attempt := 0; attempt < 3; attempt++ {
-		objInfo, err = obj.Stat()
-		if err == nil {
-			break
-		}
-
-		h.logger.Warn("attempt to get object stats failed, retrying...",
-			zap.Error(err),
-			zap.String("filename", filename),
-			zap.Int("attempt", attempt+1))
-
-		// Don't sleep on the last attempt
-		if attempt < 2 {
-			time.Sleep(time.Duration(100*(2<<attempt)) * time.Millisecond)
-		}
-	}
-
-	if err != nil {
-		h.logger.Error("all attempts to get object stats failed",
-			zap.Error(err),
-			zap.String("filename", filename))
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-			"error": "Image not found",
-		})
-	}
-
-	// Set appropriate headers
-	c.Set("Content-Type", objInfo.ContentType)
-	c.Set("Content-Length", fmt.Sprintf("%d", objInfo.Size))
-	c.Set("Cache-Control", "public, max-age=86400") // Cache for 24 hours
-	c.Set("ETag", objInfo.ETag)
-
-	// Stream the file to the client with a more robust approach
-	buffer := make([]byte, 32*1024) // 32KB buffer
-	_, err = io.CopyBuffer(c, obj, buffer)
-	if err != nil {
-		h.logger.Error("failed to stream file to client",
-			zap.Error(err),
-			zap.String("filename", filename))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to stream image data",
-		})
-	}
-
-	return nil
-}
-
-// DeleteProfilePic deletes a profile picture from MinIO
-func (h *UserHandler) DeleteProfilePic(c *fiber.Ctx) error {
-	authID, ok := c.Locals("authID").(string)
-
-	if !ok {
-
-		h.logger.Info("processing user profile request",
-			zap.String("authID", authID),
-			zap.Any("all_claims", c.Locals("claims")),
-		)
-	} else {
-		h.logger.Error("authID not found in context")
-	}
-
-	filename := c.Params("profilePic")
-
-	// Basic validation to prevent path traversal
-	if strings.Contains(filename, "/") || strings.Contains(filename, "\\") {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid filename",
-		})
-	}
-
-	// Increase timeout for image deletion
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	// Add retry mechanism for MinIO connection
-	var err error
-
-	// Try up to 3 times with exponential backoff
-	for attempt := 0; attempt < 3; attempt++ {
-		err = h.minioClient.RemoveObject(ctx, bucketName, filename, minio.RemoveObjectOptions{})
-		if err == nil {
-			break
-		}
-
-		h.logger.Warn("attempt to remove object from minio failed, retrying...",
-			zap.Error(err),
-			zap.String("filename", filename),
-			zap.Int("attempt", attempt+1))
-
-		// Don't sleep on the last
-		if attempt < 2 {
-			time.Sleep(time.Duration(100*(2<<attempt)) * time.Millisecond)
-		}
-	}
-
-	if err != nil {
-		h.logger.Error("all attempts to remove object from minio failed",
-			zap.Error(err),
-			zap.String("filename", filename))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to delete image",
-		})
-	}
-	return c.JSON(fiber.Map{
-		"message": "Profile picture successfully deleted",
-	})
 }
 
 // Password Reset Token Generator
@@ -1322,101 +945,4 @@ func (h *UserHandler) ResetPassword(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 		"error": "Endpoint not found",
 	})
-}
-
-// EncryptCookie encrypts the cookie value using AES
-func (h *UserHandler) EncryptCookie(value string) (string, error) {
-	key := []byte(h.config.CookieEncryptionKey) // 32 bytes for AES-256
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", err
-	}
-
-	// Create a random IV
-	iv := make([]byte, aes.BlockSize)
-	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
-		return "", err
-	}
-
-	// Pad the value to be encrypted
-	paddedValue := pkcs7Pad([]byte(value), aes.BlockSize)
-
-	// Encrypt the value
-	encrypted := make([]byte, len(paddedValue))
-	mode := cipher.NewCBCEncrypter(block, iv)
-	mode.CryptBlocks(encrypted, paddedValue)
-
-	// Combine IV and encrypted value
-	result := make([]byte, len(iv)+len(encrypted))
-	copy(result, iv)
-	copy(result[len(iv):], encrypted)
-
-	// Base64 encode for cookie storage
-	return base64.StdEncoding.EncodeToString(result), nil
-}
-
-// DecryptCookie decrypts the cookie value
-func (h *UserHandler) DecryptCookie(encryptedValue string) (string, error) {
-	// Base64 decode
-	ciphertext, err := base64.StdEncoding.DecodeString(encryptedValue)
-	if err != nil {
-		return "", err
-	}
-
-	key := []byte(h.config.CookieEncryptionKey)
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return "", err
-	}
-
-	// Check if the ciphertext is valid
-	if len(ciphertext) < aes.BlockSize {
-		return "", errors.New("ciphertext too short")
-	}
-
-	// Extract IV
-	iv := ciphertext[:aes.BlockSize]
-	ciphertext = ciphertext[aes.BlockSize:]
-
-	// Decrypt
-	decrypted := make([]byte, len(ciphertext))
-	mode := cipher.NewCBCDecrypter(block, iv)
-	mode.CryptBlocks(decrypted, ciphertext)
-
-	// Unpad
-	unpaddedValue, err := pkcs7Unpad(decrypted, aes.BlockSize)
-	if err != nil {
-		return "", err
-	}
-
-	return string(unpaddedValue), nil
-}
-
-// pkcs7Pad adds padding to a byte slice
-func pkcs7Pad(data []byte, blockSize int) []byte {
-	padding := blockSize - (len(data) % blockSize)
-	padtext := bytes.Repeat([]byte{byte(padding)}, padding)
-	return append(data, padtext...)
-}
-
-// pkcs7Unpad removes padding from a byte slice
-func pkcs7Unpad(data []byte, blockSize int) ([]byte, error) {
-	length := len(data)
-	if length == 0 {
-		return nil, errors.New("empty data")
-	}
-
-	padding := int(data[length-1])
-	if padding > blockSize || padding == 0 {
-		return nil, errors.New("invalid padding")
-	}
-
-	// Check padding integrity
-	for i := length - padding; i < length; i++ {
-		if data[i] != byte(padding) {
-			return nil, errors.New("invalid padding")
-		}
-	}
-
-	return data[:length-padding], nil
 }

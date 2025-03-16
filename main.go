@@ -410,9 +410,6 @@ func (a *App) setupRoutes() error {
 	userGroup := a.Fiber.Group("/api/user", authMiddleware.Handler())
 	userGroup.Get("/profile", userHandler.GetUserProfile)
 	userGroup.Put("/profile", userHandler.UpdateUserProfile)
-	userGroup.Post("/profile/picture", userHandler.UploadProfilePic)
-	userGroup.Get("/profile/picture/:filename", userHandler.GetProfilePic)
-	userGroup.Delete("/profile/picture/:filename", userHandler.DeleteProfilePic)
 
 	// Doctor routes - protected
 	doctorGroup := a.Fiber.Group("/api/doctors", authMiddleware.Handler())
