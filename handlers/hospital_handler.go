@@ -1,19 +1,29 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/jpeg"
+	"mime/multipart"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/VanitasCaesar1/backend/config"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/nfnt/resize"
 	"github.com/redis/go-redis/v9"
 	"github.com/workos/workos-go/v4/pkg/organizations"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.uber.org/zap"
 )
 
@@ -21,7 +31,9 @@ type HospitalHandler struct {
 	config      *config.Config
 	redisClient *redis.Client
 	logger      *zap.Logger
+	mongoClient *mongo.Client
 	pgPool      *pgxpool.Pool
+	minioClient *minio.Client
 }
 
 type HospitalFee struct {
@@ -32,29 +44,41 @@ type HospitalFee struct {
 }
 
 type Hospital struct {
-	AdminID       uuid.UUID       `json:"admin_id"`
-	OrgID         string          `json:"org_id"`
-	Name          string          `json:"name"`
-	Email         string          `json:"email"`
-	Number        int64           `json:"number"`
-	Address       string          `json:"address"`
-	LicenseNumber string          `json:"license_number,omitempty"`
-	StartTime     time.Time       `json:"start_time"`
-	EndTime       time.Time       `json:"end_time"`
-	Location      string          `json:"location"`
-	HospitalPics  json.RawMessage `json:"hospital_pics,omitempty"`
-	Speciality    string          `json:"speciality,omitempty"`
-	CreatedAt     string          `json:"created_at,omitempty"`
-	Fees          []HospitalFee   `json:"fees,omitempty"`
+	ID            uuid.UUID     `json:"id,omitempty"`
+	AdminID       uuid.UUID     `json:"admin_id"`
+	OrgID         string        `json:"org_id"`
+	Name          string        `json:"name"`
+	Email         string        `json:"email"`
+	Number        int64         `json:"number"`
+	Address       string        `json:"address"`
+	LicenseNumber string        `json:"license_number,omitempty"`
+	StartTime     string        `json:"startTime" validate:"required"` // Time as string HH:MM:SS
+	EndTime       string        `json:"endTime" validate:"required"`   //
+	Location      string        `json:"location"`
+	Speciality    string        `json:"speciality,omitempty"`
+	CreatedAt     string        `json:"created_at,omitempty"`
+	Fees          []HospitalFee `json:"fees,omitempty"`
+	HospitalPics  []string      `json:"hospital_pics,omitempty"` // Changed to []string for URLs only
 }
 
-func NewHospitalHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, pgPool *pgxpool.Pool) (*HospitalHandler, error) {
+func NewHospitalHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, mongoClient *mongo.Client, pgPool *pgxpool.Pool) (*HospitalHandler, error) {
+	minioClient, err := minio.New(cfg.MinioEndpoint, &minio.Options{
+		Creds:  credentials.NewStaticV4(cfg.MinioAccessKey, cfg.MinioSecretKey, ""),
+		Secure: true,
+		Region: "india-s-1",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize minio client: %w", err)
+	}
+
 	organizations.SetAPIKey(cfg.WorkOSApiKey)
 	return &HospitalHandler{
 		config:      cfg,
 		redisClient: rds,
 		logger:      logger,
+		mongoClient: mongoClient,
 		pgPool:      pgPool,
+		minioClient: minioClient,
 	}, nil
 }
 
@@ -73,24 +97,356 @@ func (h *HospitalHandler) getAuthID(c *fiber.Ctx) (string, error) {
 	return authID, nil
 }
 
-func (h *HospitalHandler) isUserAdmin(ctx context.Context, userID uuid.UUID) (bool, error) {
-	var isAdmin bool
-	err := h.pgPool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM admins WHERE user_id = $1)", userID).Scan(&isAdmin)
-	return isAdmin, err
+// UploadHospitalImages handles uploading multiple hospital images to MinIO
+// and storing references in MongoDB
+func (h *HospitalHandler) UploadHospitalImages(c *fiber.Ctx, hospitalID, organizationID string) ([]string, error) {
+	// Get form files
+	form, err := c.MultipartForm()
+	if err != nil {
+		h.logger.Error("failed to get multipart form", zap.Error(err))
+		return nil, fiber.NewError(fiber.StatusBadRequest, "No files uploaded")
+	}
+
+	files := form.File["hospitalPics"]
+	if len(files) == 0 {
+		return []string{}, nil // Return empty array if no files uploaded
+	}
+
+	if err := h.testMinioConnection(context.Background()); err != nil {
+		return nil, fiber.NewError(fiber.StatusInternalServerError, "Storage service unavailable")
+	}
+
+	// Bucket for hospital pictures
+	const hospitalBucketName = "hospital-pics"
+	const maxHospitalFileSize = 10 * 1024 * 1024 // 10MB
+	const jpegQuality = 85
+
+	// Create a context with timeout for MinIO operations
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Check if bucket exists, create if it doesn't
+	exists, err := h.minioClient.BucketExists(ctx, hospitalBucketName)
+	h.logger.Info("bucket status",
+		zap.String("bucket", hospitalBucketName),
+		zap.Bool("exists", exists),
+		zap.Error(err))
+
+	if err != nil && err.Error() != "Found" {
+		h.logger.Error("failed to check bucket existence", zap.Error(err))
+		return nil, fiber.NewError(fiber.StatusInternalServerError, "Failed to check storage configuration")
+	}
+
+	// Only try to create bucket if it doesn't exist and we didn't get a "Found" error
+	if !exists && err == nil {
+		err = h.minioClient.MakeBucket(ctx, hospitalBucketName, minio.MakeBucketOptions{
+			Region: "india-s-1",
+		})
+		if err != nil && !strings.Contains(err.Error(), "already exists") {
+			h.logger.Error("failed to create bucket", zap.Error(err))
+			return nil, fiber.NewError(fiber.StatusInternalServerError, "Failed to configure storage")
+		}
+	}
+
+	// Store only filenames instead of full URLs
+	filenames := make([]string, 0, len(files))
+	mongoImageDocs := make([]interface{}, 0, len(files))
+
+	// Process each file
+	for _, file := range files {
+		// Validate file size
+		if file.Size > maxHospitalFileSize {
+			return nil, fiber.NewError(fiber.StatusBadRequest,
+				fmt.Sprintf("File size exceeds maximum limit of %d MB", maxHospitalFileSize/(1024*1024)))
+		}
+
+		// Validate file type
+		ext := strings.ToLower(filepath.Ext(file.Filename))
+		if ext != ".jpg" && ext != ".jpeg" && ext != ".png" {
+			return nil, fiber.NewError(fiber.StatusBadRequest, "Only JPG and PNG files are allowed")
+		}
+
+		// Open the uploaded file
+		src, err := file.Open()
+		if err != nil {
+			h.logger.Error("failed to open uploaded file", zap.Error(err))
+			return nil, fiber.NewError(fiber.StatusInternalServerError, "Failed to process uploaded file")
+		}
+
+		// Use defer in a closure to ensure file is closed after processing
+		func(src multipart.File) {
+			defer src.Close()
+
+			// Decode image
+			img, _, err := image.Decode(src)
+			if err != nil {
+				h.logger.Error("failed to decode image", zap.Error(err))
+				return
+			}
+
+			// Resize image to 1024x768 (hospital images can be larger)
+			resized := resize.Resize(1024, 768, img, resize.Lanczos3)
+
+			// Convert to JPEG and compress
+			buf := new(bytes.Buffer)
+			if err := jpeg.Encode(buf, resized, &jpeg.Options{Quality: jpegQuality}); err != nil {
+				h.logger.Error("failed to encode image", zap.Error(err))
+				return
+			}
+
+			// Generate unique filename
+			filename := fmt.Sprintf("%s.jpg", uuid.New().String())
+
+			// Upload to MinIO
+			info, err := h.minioClient.PutObject(
+				ctx,
+				hospitalBucketName,
+				filename,
+				bytes.NewReader(buf.Bytes()),
+				int64(buf.Len()),
+				minio.PutObjectOptions{
+					ContentType: "image/jpeg",
+				},
+			)
+
+			if err != nil {
+				h.logger.Error("failed to upload to minio",
+					zap.Error(err),
+					zap.String("bucketName", hospitalBucketName),
+					zap.String("filename", filename))
+				return
+			}
+
+			// Verify upload was successful
+			if info.Size == 0 {
+				h.logger.Error("upload completed but file size is 0",
+					zap.String("filename", filename))
+				return
+			}
+
+			_, err = h.minioClient.StatObject(ctx, hospitalBucketName, filename, minio.StatObjectOptions{})
+			if err != nil {
+				h.logger.Error("failed to verify uploaded object",
+					zap.Error(err),
+					zap.String("filename", filename))
+				return
+			}
+
+			h.logger.Info("successfully uploaded hospital image to minio",
+				zap.String("bucket", hospitalBucketName),
+				zap.String("filename", filename),
+				zap.Any("info", info),
+			)
+
+			// Store only the filename
+			filenames = append(filenames, filename)
+
+			// Prepare document for MongoDB
+			mongoImageDocs = append(mongoImageDocs, bson.M{
+				"filename":        filename,
+				"hospital_id":     hospitalID,
+				"organization_id": organizationID,
+				"bucket":          hospitalBucketName,
+				"content_type":    "image/jpeg",
+				"size":            info.Size,
+				"created_at":      time.Now(),
+			})
+		}(src)
+	}
+
+	// Insert image references into MongoDB
+	if len(mongoImageDocs) > 0 {
+		// Get MongoDB collection
+		collection := h.mongoClient.Database("hospital_db").Collection("hospital_images")
+
+		// Insert documents
+		_, err := collection.InsertMany(ctx, mongoImageDocs)
+		if err != nil {
+			h.logger.Error("failed to store image references in MongoDB",
+				zap.Error(err),
+				zap.String("hospital_id", hospitalID))
+			return nil, fiber.NewError(fiber.StatusInternalServerError, "Failed to store image references")
+		}
+
+		h.logger.Info("successfully stored image references in MongoDB",
+			zap.Int("count", len(mongoImageDocs)),
+			zap.String("hospital_id", hospitalID))
+	}
+
+	return filenames, nil
 }
 
-// CreateHospital creates a new hospital with a WorkOS organization
+// DeleteHospitalImage deletes a specific hospital image
+func (h *HospitalHandler) DeleteHospitalImage(c *fiber.Ctx) error {
+	hospitalID := c.Params("hospitalId")
+	filename := c.Params("filename")
+
+	if hospitalID == "" || filename == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Hospital ID and filename are required",
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+	defer cancel()
+
+	// Find the image document to get the bucket name
+	collection := h.mongoClient.Database("hospital_db").Collection("hospital_images")
+	var imageDoc struct {
+		Bucket string `bson:"bucket"`
+	}
+
+	err := collection.FindOne(ctx, bson.M{
+		"hospital_id": hospitalID,
+		"filename":    filename,
+	}).Decode(&imageDoc)
+
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"error": "Image not found",
+			})
+		}
+		h.logger.Error("failed to find image document", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to retrieve image information",
+		})
+	}
+
+	// Delete the image from MinIO
+	err = h.minioClient.RemoveObject(ctx, imageDoc.Bucket, filename, minio.RemoveObjectOptions{})
+	if err != nil {
+		h.logger.Error("failed to delete image from MinIO",
+			zap.Error(err),
+			zap.String("bucket", imageDoc.Bucket),
+			zap.String("filename", filename))
+		// Continue to delete from MongoDB even if MinIO delete fails
+	}
+
+	// Delete the image reference from MongoDB
+	result, err := collection.DeleteOne(ctx, bson.M{
+		"hospital_id": hospitalID,
+		"filename":    filename,
+	})
+
+	if err != nil {
+		h.logger.Error("failed to delete image reference from MongoDB", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to delete image reference",
+		})
+	}
+
+	if result.DeletedCount == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Image not found",
+		})
+	}
+
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"message":  "Image successfully deleted",
+		"filename": filename,
+	})
+}
+
+// GetHospitalImages retrieves all images for a specific hospital from MongoDB
+func (h *HospitalHandler) GetHospitalImages(c *fiber.Ctx) error {
+	hospitalID := c.Params("hospitalId")
+	if hospitalID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Hospital ID is required"})
+	}
+
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+	defer cancel()
+
+	// Get MongoDB collection
+	collection := h.mongoClient.Database("hospital_db").Collection("hospital_images")
+
+	// Find all images for this hospital
+	cursor, err := collection.Find(ctx, bson.M{"hospital_id": hospitalID})
+	if err != nil {
+		h.logger.Error("failed to query hospital images from MongoDB",
+			zap.Error(err),
+			zap.String("hospital_id", hospitalID))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve hospital images"})
+	}
+	defer cursor.Close(ctx)
+
+	// Decode the results
+	var images []struct {
+		Filename  string    `bson:"filename"`
+		Bucket    string    `bson:"bucket"`
+		CreatedAt time.Time `bson:"created_at"`
+	}
+
+	if err := cursor.All(ctx, &images); err != nil {
+		h.logger.Error("failed to decode hospital images from MongoDB", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process hospital images"})
+	}
+
+	// Convert to response format
+	var response []map[string]interface{}
+	for _, img := range images {
+		imageURL := fmt.Sprintf("%s/%s/%s", h.config.MinioEndpoint, img.Bucket, img.Filename)
+		response = append(response, map[string]interface{}{
+			"filename":   img.Filename,
+			"url":        imageURL,
+			"created_at": img.CreatedAt,
+		})
+	}
+
+	return c.Status(fiber.StatusOK).JSON(response)
+}
+
+// CreateHospital function to handle hospital creation with MongoDB for images
 func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
+	// Check for Admin role in X-Role header
+	roleHeader := c.Get("X-Role")
+	if roleHeader == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Role information missing"})
+	}
+	h.logger.Info("Role header", zap.String("role", roleHeader))
+
+	// Check if "Admin" is one of the roles (allows for multiple roles like "Admin,Doctor")
+	roles := strings.Split(roleHeader, ",")
+	hasAdminRole := false
+	for _, role := range roles {
+		if strings.TrimSpace(role) == "admin" {
+			hasAdminRole = true
+			break
+		}
+	}
+	if !hasAdminRole {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "You don't have permission to create a hospital"})
+	}
+
+	// Get the auth ID from context
 	authID, err := h.getAuthID(c)
 	if err != nil {
 		h.logger.Error("authID not found in context")
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
 	}
 
+	// Parse the rest of the form data
 	var hospitalData Hospital
 	if err := c.BodyParser(&hospitalData); err != nil {
 		h.logger.Error("failed to parse hospital data", zap.Error(err))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request data"})
+	}
+
+	// Validate start and end times are provided
+	if hospitalData.StartTime == "" || hospitalData.EndTime == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "start time and end time are required"})
+	}
+
+	// Validate time format
+	_, err = time.Parse("15:04:05", hospitalData.StartTime)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid start time format, use HH:MM:SS"})
+	}
+
+	_, err = time.Parse("15:04:05", hospitalData.EndTime)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid end time format, use HH:MM:SS"})
 	}
 
 	if err := h.validateHospitalData(&hospitalData); err != nil {
@@ -101,16 +457,6 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 	if err != nil {
 		h.logger.Error("failed to get user ID", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
-	}
-
-	isAdmin, err := h.isUserAdmin(c.Context(), userID)
-	if err != nil {
-		h.logger.Error("failed to check if user is admin", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
-	}
-
-	if !isAdmin {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Only administrators can create hospitals"})
 	}
 
 	// Create a WorkOS organization for the hospital
@@ -127,7 +473,7 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 		})
 	}
 
-	// Start a transaction
+	// Start a transaction for PostgreSQL operations
 	tx, err := h.pgPool.Begin(c.Context())
 	if err != nil {
 		h.logger.Error("failed to begin transaction", zap.Error(err))
@@ -135,48 +481,64 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 	}
 	defer tx.Rollback(c.Context())
 
-	// Insert hospital data
-	_, err = tx.Exec(c.Context(),
+	// Insert hospital data into PostgreSQL (without hospital_pics field)
+	var hospitalID string
+	err = tx.QueryRow(c.Context(),
 		`INSERT INTO hospitals (
-			admin_id, org_id, name, email, number, address, license_number, 
-			start_time, end_time, location, hospital_pics, speciality, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)`,
+			admin_id, org_id, name, email, number, address, license_number,
+			start_time, end_time, location, speciality
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		RETURNING hospital_id`,
 		userID, org.ID, hospitalData.Name, hospitalData.Email, hospitalData.Number, hospitalData.Address,
 		hospitalData.LicenseNumber, hospitalData.StartTime, hospitalData.EndTime, hospitalData.Location,
-		hospitalData.HospitalPics, hospitalData.Speciality,
-	)
+		hospitalData.Speciality,
+	).Scan(&hospitalID)
+
 	if err != nil {
 		h.logger.Error("failed to insert hospital data", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create hospital"})
 	}
 
-	// Insert fee data if provided
-	if hospitalData.Fees != nil && len(hospitalData.Fees) > 0 {
-		for _, fee := range hospitalData.Fees {
-			_, err = tx.Exec(c.Context(),
-				`INSERT INTO hospital_fees (
-					fee_type, amount, hospital_id, created_at
-				) VALUES ($1, $2, $3, CURRENT_TIMESTAMP)`,
-				fee.FeeType, fee.Amount, userID,
-			)
-			if err != nil {
-				h.logger.Error("failed to insert fee data", zap.Error(err))
-				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to add hospital fees"})
-			}
-		}
-	}
-
+	// Commit the PostgreSQL transaction
 	if err := tx.Commit(c.Context()); err != nil {
 		h.logger.Error("failed to commit transaction", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
-	// Return the created hospital with its ID
-	hospitalData.AdminID = userID
-	hospitalData.OrgID = org.ID
-	hospitalData.CreatedAt = time.Now().Format(time.RFC3339)
+	// Now upload hospital images and store references in MongoDB
+	filenames, err := h.UploadHospitalImages(c, hospitalID, org.ID)
+	if err != nil {
+		h.logger.Error("failed to upload hospital images", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+	}
 
+	// For the response, construct full URLs from the filenames
+	imageURLs := make([]string, len(filenames))
+	for i, filename := range filenames {
+		imageURLs[i] = fmt.Sprintf("%s/%s/%s", h.config.MinioEndpoint, "hospital-pics", filename)
+	}
+
+	// Add the image URLs to the response
+	hospitalData.HospitalPics = imageURLs
+	hospitalData.ID = uuid.MustParse(hospitalID)
+
+	// Return the created hospital with its ID
 	return c.Status(fiber.StatusCreated).JSON(hospitalData)
+}
+
+// testMinioConnection checks if the MinIO connection is working
+func (h *HospitalHandler) testMinioConnection(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	// A simple operation to check if MinIO is available
+	_, err := h.minioClient.ListBuckets(ctx)
+	if err != nil {
+		h.logger.Error("MinIO connection test failed", zap.Error(err))
+		return err
+	}
+
+	return nil
 }
 
 // GetHospital retrieves a specific hospital by ID
@@ -186,18 +548,6 @@ func (h *HospitalHandler) GetHospital(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Hospital ID is required"})
 	}
 
-	authID, err := h.getAuthID(c)
-	if err != nil {
-		h.logger.Error("authID not found in context")
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
-	}
-
-	userID, err := h.getUserID(c.Context(), authID)
-	if err != nil {
-		h.logger.Error("failed to get user ID", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
-	}
-	fmt.Println(userID)
 	parsedHospitalID, err := uuid.Parse(hospitalID)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid hospital ID format"})
@@ -206,12 +556,14 @@ func (h *HospitalHandler) GetHospital(c *fiber.Ctx) error {
 	var hospital Hospital
 	var createdAt time.Time
 
+	// Get hospital data from PostgreSQL (without hospital_pics field)
 	err = h.pgPool.QueryRow(c.Context(),
 		`SELECT 
-			admin_id, org_id, name, email, number, address, license_number, 
-			start_time, end_time, location, hospital_pics, speciality, created_at
-		FROM hospitals WHERE admin_id = $1`,
+			id, admin_id, org_id, name, email, number, address, license_number, 
+			start_time, end_time, location, speciality, created_at
+		FROM hospitals WHERE id = $1`,
 		parsedHospitalID).Scan(
+		&hospital.ID,
 		&hospital.AdminID,
 		&hospital.OrgID,
 		&hospital.Name,
@@ -222,7 +574,6 @@ func (h *HospitalHandler) GetHospital(c *fiber.Ctx) error {
 		&hospital.StartTime,
 		&hospital.EndTime,
 		&hospital.Location,
-		&hospital.HospitalPics,
 		&hospital.Speciality,
 		&createdAt,
 	)
@@ -259,6 +610,35 @@ func (h *HospitalHandler) GetHospital(c *fiber.Ctx) error {
 		}
 	}
 
+	// Get hospital images from MongoDB
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
+	defer cancel()
+
+	collection := h.mongoClient.Database("hospital_db").Collection("hospital_images")
+	cursor, err := collection.Find(ctx, bson.M{"hospital_id": hospitalID})
+
+	if err == nil {
+		defer cursor.Close(ctx)
+
+		var images []struct {
+			Filename string `bson:"filename"`
+			Bucket   string `bson:"bucket"`
+		}
+
+		if err := cursor.All(ctx, &images); err == nil {
+			imageURLs := make([]string, 0, len(images))
+			for _, img := range images {
+				imageURL := fmt.Sprintf("%s/%s/%s", h.config.MinioEndpoint, img.Bucket, img.Filename)
+				imageURLs = append(imageURLs, imageURL)
+			}
+			hospital.HospitalPics = imageURLs
+		} else {
+			h.logger.Error("failed to decode hospital images", zap.Error(err))
+		}
+	} else {
+		h.logger.Error("failed to query hospital images", zap.Error(err))
+	}
+
 	return c.JSON(hospital)
 }
 
@@ -274,27 +654,25 @@ func (h *HospitalHandler) UpdateHospital(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid hospital ID format"})
 	}
 
-	authID, err := h.getAuthID(c)
-	if err != nil {
-		h.logger.Error("authID not found in context")
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	// Check permissions
+	roleHeader := c.Get("X-Role")
+	if roleHeader == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Role information missing"})
 	}
 
-	userID, err := h.getUserID(c.Context(), authID)
-	if err != nil {
-		h.logger.Error("failed to get user ID", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	// Check if "Admin" or "Manager" is one of the roles
+	roles := strings.Split(roleHeader, ",")
+	hasRequiredRole := false
+	for _, role := range roles {
+		trimmedRole := strings.TrimSpace(role)
+		if trimmedRole == "admin" || trimmedRole == "manager" {
+			hasRequiredRole = true
+			break
+		}
 	}
 
-	// Only allow the admin to update their own hospital or if user is system admin
-	isSystemAdmin, err := h.isUserAdmin(c.Context(), userID)
-	if err != nil {
-		h.logger.Error("failed to check admin status", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
-	}
-
-	if !isSystemAdmin && userID != parsedHospitalID {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "You don't have permission to update this hospital"})
+	if !hasRequiredRole {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "You don't have permission to update a hospital"})
 	}
 
 	var updateData Hospital
@@ -309,7 +687,9 @@ func (h *HospitalHandler) UpdateHospital(c *fiber.Ctx) error {
 
 	// Get the current WorkOS organization ID
 	var orgID string
-	err = h.pgPool.QueryRow(c.Context(), "SELECT org_id FROM hospitals WHERE admin_id = $1", parsedHospitalID).Scan(&orgID)
+	err = h.pgPool.QueryRow(c.Context(),
+		"SELECT org_id FROM hospitals WHERE id = $1",
+		parsedHospitalID).Scan(&orgID)
 	if err != nil {
 		h.logger.Error("failed to get hospital org_id", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
@@ -336,14 +716,14 @@ func (h *HospitalHandler) UpdateHospital(c *fiber.Ctx) error {
 	}
 	defer tx.Rollback(c.Context())
 
-	// Update the hospital in the database
+	// Update the hospital in the database (without hospital_pics field)
 	_, err = tx.Exec(c.Context(),
 		`UPDATE hospitals SET 
 			name = $1, email = $2, number = $3, address = $4, license_number = $5,
-			start_time = $6, end_time = $7, location = $8, hospital_pics = $9, speciality = $10
-		WHERE admin_id = $11`,
+			start_time = $6, end_time = $7, location = $8, speciality = $9
+		WHERE id = $10`,
 		updateData.Name, updateData.Email, updateData.Number, updateData.Address, updateData.LicenseNumber,
-		updateData.StartTime, updateData.EndTime, updateData.Location, updateData.HospitalPics, updateData.Speciality,
+		updateData.StartTime, updateData.EndTime, updateData.Location, updateData.Speciality,
 		parsedHospitalID,
 	)
 	if err != nil {
@@ -351,32 +731,22 @@ func (h *HospitalHandler) UpdateHospital(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update hospital"})
 	}
 
-	// Update fees if provided
-	if updateData.Fees != nil && len(updateData.Fees) > 0 {
-		// Delete existing fees
-		_, err = tx.Exec(c.Context(), "DELETE FROM hospital_fees WHERE hospital_id = $1", parsedHospitalID)
-		if err != nil {
-			h.logger.Error("failed to delete existing fees", zap.Error(err))
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update hospital fees"})
-		}
-
-		// Insert new fees
-		for _, fee := range updateData.Fees {
-			_, err = tx.Exec(c.Context(),
-				`INSERT INTO hospital_fees (fee_type, amount, hospital_id, created_at)
-				VALUES ($1, $2, $3, CURRENT_TIMESTAMP)`,
-				fee.FeeType, fee.Amount, parsedHospitalID,
-			)
-			if err != nil {
-				h.logger.Error("failed to insert fee data", zap.Error(err))
-				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update hospital fees"})
-			}
-		}
-	}
-
 	if err := tx.Commit(c.Context()); err != nil {
 		h.logger.Error("failed to commit transaction", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	// If new images are uploaded, process them
+	if form, err := c.MultipartForm(); err == nil && form.File["hospitalPics"] != nil && len(form.File["hospitalPics"]) > 0 {
+		filenames, err := h.UploadHospitalImages(c, hospitalID, orgID)
+		if err != nil {
+			h.logger.Error("failed to upload new hospital images", zap.Error(err))
+			// Continue anyway to return the updated hospital data
+		} else {
+			h.logger.Info("uploaded new hospital images",
+				zap.Int("count", len(filenames)),
+				zap.String("hospital_id", hospitalID))
+		}
 	}
 
 	// Return updated hospital data
@@ -395,27 +765,25 @@ func (h *HospitalHandler) DeleteHospital(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid hospital ID format"})
 	}
 
-	authID, err := h.getAuthID(c)
-	if err != nil {
-		h.logger.Error("authID not found in context")
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	// Only allow the admin to update their own hospital or if user is system admin
+	roleHeader := c.Get("X-Role")
+	if roleHeader == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Role information missing"})
 	}
 
-	userID, err := h.getUserID(c.Context(), authID)
-	if err != nil {
-		h.logger.Error("failed to get user ID", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	// Check if "Admin", "Doctor", or "Manager" is one of the roles
+	roles := strings.Split(roleHeader, ",")
+	hasRequiredRole := false
+	for _, role := range roles {
+		trimmedRole := strings.TrimSpace(role)
+		if trimmedRole == "Admin" || trimmedRole == "Manager" {
+			hasRequiredRole = true
+			break
+		}
 	}
 
-	// Check if user is a system admin
-	isAdmin, err := h.isUserAdmin(c.Context(), userID)
-	if err != nil {
-		h.logger.Error("failed to check admin status", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
-	}
-
-	if !isAdmin && userID != parsedHospitalID {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Only system administrators or the hospital admin can delete this hospital"})
+	if !hasRequiredRole {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "You don't have permission to create a hospital"})
 	}
 
 	// Get the WorkOS organization ID
@@ -581,15 +949,6 @@ func (h *HospitalHandler) validateHospitalData(hospital *Hospital) error {
 
 	if hospital.Number == 0 {
 		return errors.New("Hospital number is required")
-	}
-
-	// Validate time range
-	if hospital.StartTime.IsZero() || hospital.EndTime.IsZero() {
-		return errors.New("Start time and end time are required")
-	}
-
-	if hospital.EndTime.Before(hospital.StartTime) {
-		return errors.New("End time must be after start time")
 	}
 
 	return nil

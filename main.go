@@ -30,6 +30,7 @@ import (
 	"github.com/workos/workos-go/v4/pkg/usermanagement"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 	"go.uber.org/zap"
 )
 
@@ -69,23 +70,43 @@ func NewApp() (*App, error) {
 	}
 
 	// Setup MongoDB connection with retry logic
+	var mongoClient *mongo.Client
+	maxMongoRetries := 5
 
-	client, err := mongo.Connect(options.Client().ApplyURI(cfg.MongoDBURL))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create MongoDB client: %v", err)
-	}
+	for i := 0; i < maxMongoRetries; i++ {
+		client, err := mongo.Connect(options.Client().ApplyURI(cfg.MongoDBURL).
+			SetMaxPoolSize(10).
+			SetMinPoolSize(2).
+			SetMaxConnIdleTime(30 * time.Minute).
+			SetServerSelectionTimeout(5 * time.Second))
+		if err == nil {
+			// Test the connection with a timeout context
+			pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			err = client.Ping(pingCtx, readpref.Primary())
+			cancel()
 
-	// Check the connection
-	err = client.Ping(ctx, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to ping MongoDB: %v", err)
-	}
+			if err == nil {
+				mongoClient = client
+				break
+			}
 
-	defer func() {
-		if err = client.Disconnect(ctx); err != nil {
-			panic(err)
+			// Close the connection if ping fails
+			if closeErr := client.Disconnect(ctx); closeErr != nil {
+				logger.Error("failed to disconnect from MongoDB after failed ping",
+					zap.Error(closeErr),
+					zap.Int("attempt", i+1))
+			}
 		}
-	}()
+
+		logger.Warn("failed to connect to MongoDB, retrying...",
+			zap.Error(err),
+			zap.Int("attempt", i+1))
+		time.Sleep(time.Second * time.Duration(i+1))
+	}
+
+	if mongoClient == nil {
+		return nil, fmt.Errorf("MongoDB connection failed after %d attempts", maxMongoRetries)
+	}
 
 	// Setup PostgreSQL connection with retry logic
 	var pgPool *pgxpool.Pool
@@ -225,12 +246,12 @@ func NewApp() (*App, error) {
 
 	// Updated CORS middleware configuration
 	fiberApp.Use(cors.New(cors.Config{
-		AllowOrigins:     "http://localhost:3000",
-		AllowMethods:     "GET,POST,HEAD,PUT,DELETE,PATCH,OPTIONS",
-		AllowHeaders:     "Origin, Content-Type, Accept, Authorization, Cookie",
+		AllowOrigins:     "http://localhost:3000", // Or specify domains like "http://localhost:3000, https://yourdomain.com"
+		AllowMethods:     "GET,POST,PUT,DELETE,OPTIONS",
+		AllowHeaders:     "Origin, Content-Type, Accept, Authorization, X-Organization-ID, X-Role, X-Permissions, X-Session-ID",
 		AllowCredentials: true,
-		ExposeHeaders:    "Set-Cookie",
-		MaxAge:           300,
+		ExposeHeaders:    "Content-Length, Content-Type",
+		MaxAge:           86400, // 24 hours
 	}))
 
 	// Add session debug middleware
@@ -287,6 +308,7 @@ func NewApp() (*App, error) {
 		Postgres:     pgPool,
 		Redis:        redisClient,
 		MinioClient:  minioClient,
+		MongoDB:      mongoClient,
 		Ctx:          ctx,
 		Config:       cfg,
 		Logger:       logger,
@@ -344,7 +366,10 @@ func (a *App) setupRoutes() error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize doctor handler: %v", err)
 	}
-
+	hospitalHandler, err := handlers.NewHospitalHandler(a.Config, a.Redis, a.Logger, a.MongoDB, a.Postgres)
+	if err != nil {
+		return fmt.Errorf("failed to initialize hospital handler: %v", err)
+	}
 	// Initialize Doctor Auth Handler
 	doctorAuthHandler := handlers.NewDoctorAuthHandler(a.Config, a.Redis, a.Logger, a.Postgres, authMiddleware)
 
@@ -387,28 +412,52 @@ func (a *App) setupRoutes() error {
 	userGroup.Put("/profile", userHandler.UpdateUserProfile)
 	userGroup.Post("/profile/picture", userHandler.UploadProfilePic)
 	userGroup.Get("/profile/picture/:filename", userHandler.GetProfilePic)
+	userGroup.Delete("/profile/picture/:filename", userHandler.DeleteProfilePic)
 
 	// Doctor routes - protected
 	doctorGroup := a.Fiber.Group("/api/doctors", authMiddleware.Handler())
 	doctorGroup.Get("/profile", doctorHandler.GetDoctorProfile)
 	doctorGroup.Put("/profile", doctorHandler.UpdateDoctorProfile)
 	doctorGroup.Delete("/profile", doctorAuthHandler.DeleteDoctor)
-	doctorGroup.Get("/schedule", doctorHandler.GetDoctorSchedule)
+	doctorGroup.Get("/organization", doctorHandler.GetDoctorsByOrganization)
+	doctorGroup.Get("/schedule", doctorHandler.GetDoctorSchedule) // Add query param support for doctorId
 	doctorGroup.Put("/schedule", doctorHandler.UpdateDoctorSchedule)
-	doctorGroup.Get("/fees", doctorHandler.GetDoctorFees)
-	doctorGroup.Put("/fees", doctorHandler.UpdateDoctorFees)
 	doctorGroup.Delete("/schedule/:id", doctorHandler.DeleteDoctorSchedule)
+	doctorGroup.Get("/fees", doctorHandler.GetDoctorFees) // Add query param support for doctorId
+	doctorGroup.Put("/fees", doctorHandler.UpdateDoctorFees)
 	doctorGroup.Delete("/fees/:id", doctorHandler.DeleteDoctorFees)
 
-	//hospitalGroup := a.Fiber.Group("/api/hopsital")
-	////hospitalGroup.Post("/create")
-	//hospitalGroup.Get("/:id")
-	//	hospitalGroup.Get("/all")
+	// Hospital routes - protected
+	hospitalGroup := a.Fiber.Group("/api/hospital", authMiddleware.Handler())
+	hospitalGroup.Post("/create", hospitalHandler.CreateHospital)
+	hospitalGroup.Get("/:id", hospitalHandler.GetHospital)
+	hospitalGroup.Get("/:id", hospitalHandler.GetHospital)
+	hospitalGroup.Put("/:id", hospitalHandler.UpdateHospital)
+	hospitalGroup.Delete("/:id", hospitalHandler.DeleteHospital)
+	hospitalGroup.Get("/:id/picture", hospitalHandler.GetHospitalImages)
+	// Create a wrapper handler that extracts the hospitalID from the params and calls the actual function
+	hospitalGroup.Post("/:id/picture", func(c *fiber.Ctx) error {
+		hospitalID := c.Params("id")
+		// Get organizationID from JWT token or request context after authentication
+		organizationID := c.Locals("organizationID").(string) // Adjust based on how your auth middleware stores this
+
+		filenames, err := hospitalHandler.UploadHospitalImages(c, hospitalID, organizationID)
+		if err != nil {
+			return err // Fiber will handle the error response
+		}
+
+		return c.JSON(fiber.Map{
+			"success":   true,
+			"filenames": filenames,
+		})
+	})
+	hospitalGroup.Delete("/:id/picture/:filename", hospitalHandler.DeleteHospitalImage)
 
 	// Additional protected API routes from the middleware file
 	a.Fiber.Use("/api/protected/*", authMiddleware.Handler())
 	a.Fiber.Use("/api/user/*", authMiddleware.Handler())
 	a.Fiber.Use("/api/data/*", authMiddleware.Handler())
+	a.Fiber.Use("/api/hospital/*", authMiddleware.Handler())
 
 	return nil
 }

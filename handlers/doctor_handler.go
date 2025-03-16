@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"regexp"
 	"time"
 
@@ -678,7 +677,8 @@ func (h *DoctorHandler) DeleteDoctorFees(c *fiber.Ctx) error {
 }
 
 // GetOrganizationDoctors retrieves all doctors in the same organization
-func (h *DoctorHandler) GetOrganizationDoctors(c *fiber.Ctx) error {
+// GetDoctorsByOrganization retrieves all doctors in the same organization
+func (h *DoctorHandler) GetDoctorsByOrganization(c *fiber.Ctx) error {
 	// Get organization ID from context
 	orgID := c.Get("X-Organization-ID")
 	if orgID == "" {
@@ -689,36 +689,45 @@ func (h *DoctorHandler) GetOrganizationDoctors(c *fiber.Ctx) error {
 	// Verify user is authenticated
 	authID, err := h.getAuthID(c)
 	if err != nil {
-		h.logger.Error("authID not found in context")
+		h.logger.Error("failed to get authentication ID", zap.Error(err))
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
 	}
-	fmt.Println(authID)
-	// Query to get all doctors in the same organization
-	rows, err := h.pgPool.Query(c.Context(), `
-		SELECT 
+
+	h.logger.Info("fetching doctors for organization",
+		zap.String("orgID", orgID),
+		zap.String("authID", authID))
+
+	// Based on the schema provided, we know that hospital_id in users table links to hospitals,
+	// and hospitals have an org_id column, so we can use a straightforward join
+	query := `
+		SELECT
 			d.doctor_id,
 			u.auth_id,
 			COALESCE(u.username, '') as username,
 			COALESCE(u.profile_pic, '') as profile_pic,
-			COALESCE(u.name, '') as name,
+			COALESCE(d.name, '') as name,
 			d.specialization,
-			d.is_active,
-		FROM 
+			d.is_active
+		FROM
 			doctors d
-		JOIN 
+		JOIN
 			users u ON d.doctor_id = u.user_id
-		WHERE 
-			u.organization_id = $1
-	`, orgID)
+		JOIN
+			hospitals h ON u.hospital_id = h.hospital_id
+		WHERE
+			h.org_id = $1
+	`
 
+	rows, err := h.pgPool.Query(c.Context(), query, orgID)
 	if err != nil {
-		h.logger.Error("failed to fetch organization doctors", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch doctors"})
+		h.logger.Error("failed to fetch doctors", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to fetch doctors",
+		})
 	}
 	defer rows.Close()
 
-	var doctors []map[string]interface{}
-
+	doctors := make([]map[string]interface{}, 0)
 	for rows.Next() {
 		var (
 			doctorID           uuid.UUID
@@ -754,7 +763,7 @@ func (h *DoctorHandler) GetOrganizationDoctors(c *fiber.Ctx) error {
 			specialization = Specialization{Primary: ""}
 		}
 
-		doctor := map[string]interface{}{
+		doctors = append(doctors, map[string]interface{}{
 			"doctor_id":           doctorID,
 			"auth_id":             authID,
 			"username":            username,
@@ -762,9 +771,7 @@ func (h *DoctorHandler) GetOrganizationDoctors(c *fiber.Ctx) error {
 			"name":                name,
 			"specialization":      specialization,
 			"is_active":           isActive,
-		}
-
-		doctors = append(doctors, doctor)
+		})
 	}
 
 	if err := rows.Err(); err != nil {
@@ -772,5 +779,6 @@ func (h *DoctorHandler) GetOrganizationDoctors(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process doctors data"})
 	}
 
+	h.logger.Info("successfully fetched doctors", zap.Int("count", len(doctors)))
 	return c.JSON(doctors)
 }

@@ -1003,22 +1003,6 @@ func (h *UserHandler) UploadProfilePic(c *fiber.Ctx) error {
 	// Generate full URL for the image
 	imageURL := fmt.Sprintf("%s/%s/%s", h.config.MinioEndpoint, bucketName, filename)
 
-	// Update profile picture URL in WorkOS
-	//	_, err = usermanagement.UpdateUser(
-	//		c.Context(),
-	//		usermanagement.UpdateUserOpts{
-	//			User:              authID,
-	//			ProfilePictureURL: imageURL,
-
-	//		},
-	//	)
-	//	if err != nil {
-	//		h.logger.Error("failed to update profile picture in WorkOS",
-	//			zap.Error(err),
-	//		zap.String("auth_id", authID))
-	// Continue anyway - we'll still update our database
-	//	}
-
 	// Update user profile in database
 	if err := h.updateProfilePicURL(c.Context(), authID, imageURL); err != nil {
 		h.logger.Error("failed to update profile pic URL", zap.Error(err))
