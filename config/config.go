@@ -25,6 +25,7 @@ type Config struct {
 	MinioEndpoint          string
 	MeiliSearch            string
 	MongoDBURL             string
+	MongoDBName            string
 	WorkOSApiKey           string
 	WorkOSClientId         string
 	WorkOSCookiePassword   string
@@ -96,6 +97,7 @@ func LoadConfig() (*Config, error) {
 		MinioSecretKey:         os.Getenv("MINIO_SECRET_KEY"),
 		MinioEndpoint:          os.Getenv("MINIO_ENDPOINT"),
 		MongoDBURL:             os.Getenv("MONGODB_URL"),
+		MongoDBName:            os.Getenv("MONGODB_NAME"),
 		WorkOSApiKey:           os.Getenv("WORKOS_API_KEY"),
 		WorkOSClientId:         os.Getenv("WORKOS_CLIENT_ID"),
 		WorkOSCookiePassword:   os.Getenv("WORKOS_COOKIE_PASSOWRD"),

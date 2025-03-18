@@ -366,12 +366,21 @@ func (a *App) setupRoutes() error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize doctor handler: %v", err)
 	}
+
+	// Hospital handler
 	hospitalHandler, err := handlers.NewHospitalHandler(a.Config, a.Redis, a.Logger, a.MongoDB, a.Postgres)
 	if err != nil {
 		return fmt.Errorf("failed to initialize hospital handler: %v", err)
 	}
+
 	// Initialize Doctor Auth Handler
 	doctorAuthHandler := handlers.NewDoctorAuthHandler(a.Config, a.Redis, a.Logger, a.Postgres, authMiddleware)
+
+	// Initialize Appointment Handler
+	appointmentHandler, err := handlers.NewAppointmentHandler(a.Config, a.Redis, a.Logger, a.Postgres, a.MongoDB)
+	if err != nil {
+		return fmt.Errorf("failed to initialize appointment handler: %v", err)
+	}
 
 	// Health check route - publicly accessible
 	a.Fiber.Get("/health", func(c *fiber.Ctx) error {
@@ -428,7 +437,6 @@ func (a *App) setupRoutes() error {
 	hospitalGroup := a.Fiber.Group("/api/hospital", authMiddleware.Handler())
 	hospitalGroup.Post("/create", hospitalHandler.CreateHospital)
 	hospitalGroup.Get("/:id", hospitalHandler.GetHospital)
-	hospitalGroup.Get("/:id", hospitalHandler.GetHospital)
 	hospitalGroup.Put("/:id", hospitalHandler.UpdateHospital)
 	hospitalGroup.Delete("/:id", hospitalHandler.DeleteHospital)
 	hospitalGroup.Get("/:id/picture", hospitalHandler.GetHospitalImages)
@@ -449,6 +457,15 @@ func (a *App) setupRoutes() error {
 		})
 	})
 	hospitalGroup.Delete("/:id/picture/:filename", hospitalHandler.DeleteHospitalImage)
+
+	// Appointments routes - protected
+	appointmentsGroup := a.Fiber.Group("/api/appointments", authMiddleware.Handler())
+	appointmentsGroup.Post("/create", appointmentHandler.CreateAppointment)
+	appointmentsGroup.Get("/:id", appointmentHandler.GetAppointment)
+	appointmentsGroup.Get("/doctor/:id", appointmentHandler.GetDoctorAppointments)
+	appointmentsGroup.Get("/organization/:orgID", appointmentHandler.GetAppointmentsByOrgID)
+	appointmentsGroup.Put("/:id", appointmentHandler.UpdateAppointment)
+	appointmentsGroup.Delete("/:id", appointmentHandler.DeleteAppointment)
 
 	// Additional protected API routes from the middleware file
 	a.Fiber.Use("/api/protected/*", authMiddleware.Handler())
