@@ -31,7 +31,7 @@ docker-build:
 # Run Docker container
 docker-run: docker-build
     docker run -p 8080:8080 -e PUBLIC_KEY_PATH=/app/public_key.pem --env-file .env $(DOCKER_IMAGE)
-
+	
 # Run tests
 test:
 	go test ./...
