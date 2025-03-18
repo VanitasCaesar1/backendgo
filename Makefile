@@ -30,8 +30,8 @@ docker-build:
 
 # Run Docker container
 docker-run: docker-build
-	docker run -p 8080:8080 --env-file .env -e JWT_SECRET=your_jwt_secret_here $(DOCKER_IMAGE)
-
+    docker run -p 8080:8080 -e PUBLIC_KEY_PATH=/public_key.pem --env-file .env $(DOCKER_IMAGE)
+	
 # Run tests
 test:
 	go test ./...
@@ -61,5 +61,5 @@ coolify-prep:
 # Create coolify.yaml file
 coolify-yaml:
 	@echo "Creating coolify.yaml file..."
-	@printf "version: \"3.0\"\nservices:\n  fiber-backend:\n    build:\n      context: .\n      dockerfile: Dockerfile\n    ports:\n      - \"8080:8080\"\n    environment:\n      - JWT_SECRET=your_jwt_secret_here\n    restart: unless-stopped\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"--no-verbose\", \"--tries=1\", \"--spider\", \"http://localhost:8080/health\"]\n      interval: 30s\n      timeout: 10s\n      retries: 5\n" > coolify.yaml
+	@printf "version: \"3.0\"\nservices:\n  fiber-backend:\n    build:\n      context: .\n      dockerfile: Dockerfile\n    ports:\n      - \"8080:8080\"\n    restart: unless-stopped\n    healthcheck:\n      test: [\"CMD\", \"wget\", \"--no-verbose\", \"--tries=1\", \"--spider\", \"http://localhost:8080/health\"]\n      interval: 30s\n      timeout: 10s\n      retries: 5\n" > coolify.yaml
 	@echo "coolify.yaml created successfully"
