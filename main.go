@@ -467,6 +467,8 @@ func (a *App) setupRoutes() error {
 	appointmentsGroup.Put("/:id", appointmentHandler.UpdateAppointment)
 	appointmentsGroup.Delete("/:id", appointmentHandler.DeleteAppointment)
 
+	patientsGroup := a.Fiber.Group("/api/patients", authMiddleware.Handler())
+	patientsGroup.Get("/search", appointmentHandler.SearchPatients)
 	// Additional protected API routes from the middleware file
 	a.Fiber.Use("/api/protected/*", authMiddleware.Handler())
 	a.Fiber.Use("/api/user/*", authMiddleware.Handler())

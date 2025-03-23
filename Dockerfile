@@ -33,9 +33,9 @@ RUN apk --no-cache add ca-certificates
 # Copy the binary from builder
 COPY --from=builder /app/main .
 # Copy the public key for JWT authentication
-COPY --from=builder /app/public_key.pem .
+COPY --from=builder /public_key.pem .
 # Create config directory and copy config files
-COPY --from=builder /app/config ./config
+COPY --from=builder /config ./config
 # Create public directory if you have static files
 RUN mkdir -p ./public
 

@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/VanitasCaesar1/backend/config"
@@ -41,6 +42,78 @@ type Hospitals struct {
 	HospitalID    uuid.UUID `json:"hospital_id"`
 }
 
+type MedicalRecord struct {
+	Diagnosis    string    `json:"diagnosis" bson:"diagnosis"`
+	Treatment    string    `json:"treatment" bson:"treatment"`
+	Date         time.Time `json:"date" bson:"date"`
+	DoctorID     string    `json:"doctor_id" bson:"doctor_id"`
+	HospitalID   string    `json:"hospital_id" bson:"hospital_id"`
+	Prescription string    `json:"prescription" bson:"prescription"`
+}
+
+type EmergencyContact struct {
+	Name     string `json:"name" bson:"name"`
+	Mobile   string `json:"mobile" bson:"mobile"`
+	Address  string `json:"address" bson:"address"`
+	Relation string `json:"relation" bson:"relation"`
+}
+
+type HospitalVisit struct {
+	HospitalID string    `json:"hospital_id" bson:"hospital_id"`
+	VisitDate  time.Time `json:"visit_date" bson:"visit_date"`
+	DoctorID   string    `json:"doctor_id" bson:"doctor_id"`
+	Purpose    string    `json:"purpose" bson:"purpose"`
+	Diagnosis  string    `json:"diagnosis" bson:"diagnosis"`
+}
+
+type Insurance struct {
+	Provider     string    `json:"provider" bson:"provider"`
+	PolicyNumber string    `json:"policy_number" bson:"policy_number"`
+	ValidUntil   time.Time `json:"valid_until" bson:"valid_until"`
+	Coverage     float64   `json:"coverage" bson:"coverage"`
+}
+
+// Patient represents the MongoDB patient document structure
+type Patient struct {
+	PatientID        string            `json:"patient_id" bson:"patient_id"`
+	Name             string            `json:"name" bson:"name"`
+	Email            string            `json:"email" bson:"email"`
+	Mobile           string            `json:"mobile" bson:"mobile"`
+	Age              int               `json:"age,omitempty" bson:"age,omitempty"`
+	BloodGroup       string            `json:"blood_group,omitempty" bson:"blood_group,omitempty"`
+	Address          string            `json:"address,omitempty" bson:"address,omitempty"`
+	AadhaarID        string            `json:"aadhaar_id,omitempty" bson:"aadhaar_id,omitempty"`
+	MedicalHistory   []MedicalRecord   `json:"medical_history,omitempty" bson:"medical_history,omitempty"`
+	Allergies        []string          `json:"allergies,omitempty" bson:"allergies,omitempty"`
+	EmergencyContact *EmergencyContact `json:"emergency_contact,omitempty" bson:"emergency_contact,omitempty"`
+	AuthID           string            `json:"auth_id,omitempty" bson:"auth_id,omitempty"`
+	HospitalVisits   []HospitalVisit   `json:"hospital_visits,omitempty" bson:"hospital_visits,omitempty"`
+	Insurance        *Insurance        `json:"insurance,omitempty" bson:"insurance,omitempty"`
+	CreatedAt        time.Time         `json:"created_at" bson:"created_at"`
+	UpdatedAt        time.Time         `json:"updated_at,omitempty" bson:"updated_at,omitempty"`
+}
+
+// PatientSearchResult represents a limited view of patient data for search results
+type PatientSearchResult struct {
+	PatientID  string `json:"patient_id"`
+	Name       string `json:"name"`
+	Email      string `json:"email"`
+	Mobile     string `json:"mobile"`
+	Age        int    `json:"age,omitempty"`
+	BloodGroup string `json:"blood_group,omitempty"`
+	Address    string `json:"address,omitempty"`
+}
+
+// AppointmentRequest represents the appointment creation request
+type AppointmentRequest struct {
+	PatientID       string    `json:"patient_id"`
+	DoctorID        string    `json:"doctor_id"`
+	HospitalID      string    `json:"hospital_id"`
+	AppointmentDate time.Time `json:"appointment_date"`
+	PaymentMethod   string    `json:"payment_method"`
+	FeeType         string    `json:"fee_type"`
+	AppointmentFee  int       `json:"appointment_fee"`
+}
 type Appointment struct {
 	PatientID         string    `json:"patient_id" bson:"patient_id"`
 	DoctorID          string    `json:"doctor_id" bson:"doctor_id"`
@@ -659,5 +732,204 @@ func (h *AppointmentHandler) DeleteAppointment(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"message":       "Appointment deleted successfully",
 		"deleted_count": result.DeletedCount,
+	})
+}
+
+// GetPatientByID retrieves a single patient by ID
+func (h *AppointmentHandler) GetPatientByID(c *fiber.Ctx) error {
+	// Get auth ID from context
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// Get patient ID from params
+	patientID := c.Params("patientID")
+	if patientID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Patient ID is required"})
+	}
+
+	// Validate patient ID format
+	_, err = uuid.Parse(patientID)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid patient ID format"})
+	}
+
+	// Get user ID
+	userID, err := h.getUserID(c.Context(), authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err), zap.String("authID", authID))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve user information"})
+	}
+
+	// Check user role to ensure they have permission
+	role, err := h.getUserRole(c.Context(), userID)
+	if err != nil {
+		h.logger.Error("failed to get user role", zap.Error(err), zap.String("userID", userID.String()))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve user role"})
+	}
+
+	// Only certain roles can view patient details
+	if role != "admin" && role != "hospital_admin" && role != "doctor" && role != "receptionist" {
+		h.logger.Error("unauthorized access attempt", zap.String("userID", userID.String()), zap.String("role", role))
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Not authorized to view patient details"})
+	}
+
+	// Query MongoDB for the patient
+	patientsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("patients")
+	var patient Patient
+	err = patientsCollection.FindOne(c.Context(), bson.M{"patient_id": patientID}).Decode(&patient)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Patient not found"})
+		}
+		h.logger.Error("failed to fetch patient", zap.Error(err), zap.String("patientID", patientID))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch patient"})
+	}
+
+	// Return patient data
+	return c.JSON(patient)
+}
+
+// SearchPatients searches for patients based on various criteria
+func (h *AppointmentHandler) SearchPatients(c *fiber.Ctx) error {
+	// Get auth ID from context
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// Get user ID
+	userID, err := h.getUserID(c.Context(), authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err), zap.String("authID", authID))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve user information"})
+	}
+
+	// Check user role to ensure they have permission
+	role, err := h.getUserRole(c.Context(), userID)
+	if err != nil {
+		h.logger.Error("failed to get user role", zap.Error(err), zap.String("userID", userID.String()))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve user role"})
+	}
+
+	// Only certain roles can search for patients
+	if role != "admin" && role != "hospital_admin" && role != "doctor" && role != "frontdesk" {
+		h.logger.Error("unauthorized access attempt", zap.String("userID", userID.String()), zap.String("role", role))
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Not authorized to search patients"})
+	}
+
+	// Get search parameters
+	searchQuery := c.Query("q", "")
+	searchBy := c.Query("by", "name") // default search by name
+	hospitalID := c.Query("hospital_id", "")
+
+	// Validate hospital ID if provided
+	if hospitalID != "" {
+		_, err := uuid.Parse(hospitalID)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid hospital ID format"})
+		}
+	}
+
+	// Parse pagination parameters
+	limit, err := strconv.Atoi(c.Query("limit", "20"))
+	if err != nil || limit <= 0 {
+		limit = 20 // Default limit
+	}
+	if limit > 100 {
+		limit = 100 // Maximum limit
+	}
+
+	offset, err := strconv.Atoi(c.Query("offset", "0"))
+	if err != nil || offset < 0 {
+		offset = 0 // Default offset
+	}
+
+	// Build MongoDB query
+	query := bson.M{}
+
+	// Add search criteria based on searchBy parameter
+	if searchQuery != "" {
+		switch searchBy {
+		case "name":
+			query["name"] = bson.M{"$regex": primitive.Regex{Pattern: searchQuery, Options: "i"}}
+		case "email":
+			query["email"] = bson.M{"$regex": primitive.Regex{Pattern: searchQuery, Options: "i"}}
+		case "mobile":
+			query["mobile"] = bson.M{"$regex": primitive.Regex{Pattern: searchQuery, Options: "i"}}
+		case "patient_id":
+			query["patient_id"] = searchQuery
+		case "aadhaar_id":
+			query["aadhaar_id"] = searchQuery
+		default:
+			// Invalid search parameter, use text search as fallback
+			query["$text"] = bson.M{"$search": searchQuery}
+		}
+	}
+
+	// Add hospital filter if provided
+	if hospitalID != "" {
+		query["hospital_visits.hospital_id"] = hospitalID
+	}
+
+	// Configure find options
+	findOptions := options.Find()
+	findOptions.SetLimit(int64(limit))
+	findOptions.SetSkip(int64(offset))
+	findOptions.SetSort(bson.D{{Key: "name", Value: 1}}) // Sort by name ascending
+
+	// Query MongoDB
+	patientsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("patients")
+	cursor, err := patientsCollection.Find(c.Context(), query, findOptions)
+	if err != nil {
+		h.logger.Error("failed to query patients", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to search patients"})
+	}
+	defer cursor.Close(c.Context())
+
+	// Process patients
+	var patients []PatientSearchResult
+	for cursor.Next(c.Context()) {
+		var patient Patient
+		if err := cursor.Decode(&patient); err != nil {
+			h.logger.Error("failed to decode patient", zap.Error(err))
+			continue
+		}
+
+		// Convert to search result format (with limited fields for security/privacy)
+		patients = append(patients, PatientSearchResult{
+			PatientID:  patient.PatientID,
+			Name:       patient.Name,
+			Email:      patient.Email,
+			Mobile:     patient.Mobile,
+			Age:        patient.Age,
+			BloodGroup: patient.BloodGroup,
+			Address:    patient.Address,
+		})
+	}
+
+	if err := cursor.Err(); err != nil {
+		h.logger.Error("cursor error", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Error processing patients"})
+	}
+
+	// Get total count for pagination
+	total, err := patientsCollection.CountDocuments(c.Context(), query)
+	if err != nil {
+		h.logger.Error("failed to count patients", zap.Error(err))
+		// Continue with the results but without total count
+		total = 0
+	}
+
+	return c.JSON(fiber.Map{
+		"patients": patients,
+		"pagination": fiber.Map{
+			"total":  total,
+			"limit":  limit,
+			"offset": offset,
+		},
 	})
 }
