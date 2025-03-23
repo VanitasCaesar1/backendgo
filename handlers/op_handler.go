@@ -2,8 +2,11 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/VanitasCaesar1/backend/config"
@@ -71,6 +74,19 @@ type Insurance struct {
 	PolicyNumber string    `json:"policy_number" bson:"policy_number"`
 	ValidUntil   time.Time `json:"valid_until" bson:"valid_until"`
 	Coverage     float64   `json:"coverage" bson:"coverage"`
+}
+
+// You may need to update your DoctorSearchResult struct to match the fields we're now retrieving
+type DoctorSearchResult struct {
+	DoctorID      uuid.UUID `json:"doctor_id"`
+	Name          string    `json:"name"`
+	Speciality    string    `json:"speciality"`
+	Age           int       `json:"age"`
+	Qualification string    `json:"qualification"`
+	IMRNumber     string    `json:"imr_number"` // Using IMRNumber instead of LicenseNumber
+	HospitalName  string    `json:"hospital_name"`
+	HospitalID    uuid.UUID `json:"hospital_id"`
+	IsActive      bool      `json:"is_active"`
 }
 
 // Patient represents the MongoDB patient document structure
@@ -359,8 +375,6 @@ func (h *AppointmentHandler) GetAppointmentsByOrgID(c *fiber.Ctx) error {
 		},
 	})
 }
-
-// CreateAppointment creates a new appointment
 func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	// Get auth ID from context
 	authID, err := h.getAuthID(c)
@@ -370,15 +384,33 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	}
 
 	// Parse appointment data from request body
-	var appointment Appointment
-	if err := c.BodyParser(&appointment); err != nil {
+	var appointmentRequest struct {
+		PatientID       string    `json:"patient_id"`
+		DoctorID        string    `json:"doctor_id"`
+		HospitalID      string    `json:"hospital_id"`
+		PatientName     string    `json:"patient_name"`
+		DoctorName      string    `json:"doctor_name"`
+		AppointmentDate time.Time `json:"appointment_date"`
+		FeeType         string    `json:"fee_type"`
+		PaymentMethod   string    `json:"payment_method"`
+		Reason          string    `json:"reason,omitempty"`
+	}
+
+	if err := c.BodyParser(&appointmentRequest); err != nil {
 		h.logger.Error("failed to parse appointment data", zap.Error(err))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid appointment data"})
 	}
 
 	// Validate required fields
-	if appointment.PatientID == "" || appointment.DoctorID == "" || appointment.HospitalID == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "PatientID, DoctorID, and HospitalID are required"})
+	if appointmentRequest.PatientID == "" || appointmentRequest.DoctorID == "" || appointmentRequest.HospitalID == "" ||
+		appointmentRequest.PatientName == "" || appointmentRequest.DoctorName == "" ||
+		appointmentRequest.AppointmentDate.IsZero() || appointmentRequest.FeeType == "" || appointmentRequest.PaymentMethod == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Missing required fields"})
+	}
+
+	// Validate fee type
+	if appointmentRequest.FeeType != "emergency" && appointmentRequest.FeeType != "default" && appointmentRequest.FeeType != "recurring" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Fee type must be emergency, default, or recurring"})
 	}
 
 	// Get user ID
@@ -395,9 +427,33 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
-	// Set creation timestamps
-	appointment.CreatedAt = time.Now()
-	appointment.UpdatedAt = time.Now()
+	// Verify doctor availability for the selected time slot
+	if !h.isDoctorAvailable(c.Context(), appointmentRequest.DoctorID, appointmentRequest.HospitalID, appointmentRequest.AppointmentDate) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor is not available at selected time"})
+	}
+
+	// Get doctor's fees based on fee type
+	appointmentFee, err := h.getDoctorFee(c.Context(), appointmentRequest.DoctorID, appointmentRequest.HospitalID, appointmentRequest.FeeType)
+	if err != nil {
+		h.logger.Error("failed to get doctor fees", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to get doctor fees"})
+	}
+
+	// Create appointment document
+	appointment := Appointment{
+		PatientID:         appointmentRequest.PatientID,
+		DoctorID:          appointmentRequest.DoctorID,
+		HospitalID:        appointmentRequest.HospitalID,
+		PatientName:       appointmentRequest.PatientName,
+		DoctorName:        appointmentRequest.DoctorName,
+		AppointmentStatus: "not_completed",
+		PaymentMethod:     appointmentRequest.PaymentMethod,
+		FeeType:           appointmentRequest.FeeType,
+		AppointmentFee:    appointmentFee,
+		AppointmentDate:   appointmentRequest.AppointmentDate,
+		CreatedAt:         time.Now(),
+		UpdatedAt:         time.Now(),
+	}
 
 	// Insert appointment into MongoDB
 	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
@@ -411,6 +467,101 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 		"message":     "Appointment created successfully",
 		"appointment": appointment,
 	})
+}
+
+// Helper method to check doctor availability
+func (h *AppointmentHandler) isDoctorAvailable(ctx context.Context, doctorID, hospitalID string, appointmentTime time.Time) bool {
+	// Get the weekday of the appointment
+	weekday := strings.ToLower(appointmentTime.Weekday().String())
+
+	// Check doctor's shift for that day
+	var shift struct {
+		StartTime string `json:"starttime"`
+		EndTime   string `json:"endtime"`
+		IsActive  bool   `json:"isactive"`
+	}
+
+	// Query PostgreSQL for doctor shift info
+	err := h.pgPool.QueryRowContext(ctx,
+		"SELECT starttime, endtime, isactive FROM public.doctorshifts WHERE doctor_id = $1 AND hospital_id = $2 AND weekday = $3",
+		doctorID, hospitalID, weekday).Scan(&shift.StartTime, &shift.EndTime, &shift.IsActive)
+
+	if err != nil {
+		h.logger.Error("failed to get doctor shift", zap.Error(err))
+		return false
+	}
+
+	// Check if the doctor is active for this shift
+	if !shift.IsActive {
+		return false
+	}
+
+	// Parse shift times
+	startTime, err := time.Parse("15:04:05", shift.StartTime)
+	if err != nil {
+		h.logger.Error("failed to parse shift start time", zap.Error(err))
+		return false
+	}
+
+	endTime, err := time.Parse("15:04:05", shift.EndTime)
+	if err != nil {
+		h.logger.Error("failed to parse shift end time", zap.Error(err))
+		return false
+	}
+
+	// Extract appointment hour and minute
+	appointmentTimeOnly := time.Date(2000, 1, 1, appointmentTime.Hour(), appointmentTime.Minute(), 0, 0, time.UTC)
+
+	// Check if appointment time is within shift
+	isWithinShift := !appointmentTimeOnly.Before(startTime) && !appointmentTimeOnly.After(endTime)
+	if !isWithinShift {
+		return false
+	}
+
+	// Check for existing appointments at the same time
+	var count int64
+	filter := bson.M{
+		"doctor_id":   doctorID,
+		"hospital_id": hospitalID,
+		"appointment_date": bson.M{
+			"$gte": appointmentTime,
+			"$lt":  appointmentTime.Add(30 * time.Minute), // Assuming 30-min slots
+		},
+	}
+
+	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
+	count, err = appointmentsCollection.CountDocuments(ctx, filter)
+	if err != nil {
+		h.logger.Error("failed to check existing appointments", zap.Error(err))
+		return false
+	}
+
+	// If count > 0, there's an overlapping appointment
+	return count == 0
+}
+
+// Helper method to get doctor fee based on fee type
+func (h *AppointmentHandler) getDoctorFee(ctx context.Context, doctorID, hospitalID, feeType string) (int, error) {
+	var fee int
+
+	query := "SELECT "
+	switch feeType {
+	case "emergency":
+		query += "emergency_fees"
+	case "recurring":
+		query += "recurring_fees"
+	default:
+		query += "default_fees"
+	}
+
+	query += " FROM public.doctor_fees WHERE doctor_id = $1 AND hospital_id = $2"
+
+	err := h.pgDb.QueryRowContext(ctx, query, doctorID, hospitalID).Scan(&fee)
+	if err != nil {
+		return 0, err
+	}
+
+	return fee, nil
 }
 
 // GetAppointment retrieves a single appointment by ID
@@ -808,16 +959,22 @@ func (h *AppointmentHandler) SearchPatients(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve user information"})
 	}
 
-	// Check user role to ensure they have permission
-	role, err := h.getUserRole(c.Context(), userID)
-	if err != nil {
-		h.logger.Error("failed to get user role", zap.Error(err), zap.String("userID", userID.String()))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve user role"})
+	// Check if user role was provided in header
+	userRole := c.Get("X-User-Role", "")
+
+	// If no role was provided in the header, fall back to database lookup
+	if userRole == "" {
+		var dbErr error
+		userRole, dbErr = h.getUserRole(c.Context(), userID)
+		if dbErr != nil {
+			h.logger.Error("failed to get user role", zap.Error(dbErr), zap.String("userID", userID.String()))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve user role"})
+		}
 	}
 
 	// Only certain roles can search for patients
-	if role != "admin" && role != "hospital_admin" && role != "doctor" && role != "frontdesk" {
-		h.logger.Error("unauthorized access attempt", zap.String("userID", userID.String()), zap.String("role", role))
+	if userRole != "admin" && userRole != "hospital_admin" && userRole != "doctor" && userRole != "frontdesk" {
+		h.logger.Error("unauthorized access attempt", zap.String("userID", userID.String()), zap.String("role", userRole))
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Not authorized to search patients"})
 	}
 
@@ -926,6 +1083,244 @@ func (h *AppointmentHandler) SearchPatients(c *fiber.Ctx) error {
 
 	return c.JSON(fiber.Map{
 		"patients": patients,
+		"pagination": fiber.Map{
+			"total":  total,
+			"limit":  limit,
+			"offset": offset,
+		},
+	})
+}
+
+// SearchDoctors searches for doctors based on various criteria
+func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
+	// Get auth ID from context
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// Get user ID
+	userID, err := h.getUserID(c.Context(), authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err), zap.String("authID", authID))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve user information"})
+	}
+
+	// Check if user role was provided in header
+	userRole := c.Get("X-User-Role", "")
+
+	// If no role was provided in the header, fall back to database lookup
+	if userRole == "" {
+		var dbErr error
+		userRole, dbErr = h.getUserRole(c.Context(), userID)
+		if dbErr != nil {
+			h.logger.Error("failed to get user role", zap.Error(dbErr), zap.String("userID", userID.String()))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve user role"})
+		}
+	}
+
+	// Only certain roles can search for doctors
+	if userRole != "admin" && userRole != "hospital_admin" && userRole != "doctor" && userRole != "frontdesk" {
+		h.logger.Error("unauthorized access attempt", zap.String("userID", userID.String()), zap.String("role", userRole))
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Not authorized to search doctors"})
+	}
+
+	// Get search parameters
+	searchQuery := c.Query("q", "")
+	searchBy := c.Query("by", "name") // default search by name
+	speciality := c.Query("speciality", "")
+	hospitalID := c.Query("hospital_id", "")
+
+	// Validate hospital ID if provided
+	if hospitalID != "" {
+		_, err := uuid.Parse(hospitalID)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid hospital ID format"})
+		}
+	}
+
+	// Parse pagination parameters
+	limit, err := strconv.Atoi(c.Query("limit", "20"))
+	if err != nil || limit <= 0 {
+		limit = 20 // Default limit
+	}
+	if limit > 100 {
+		limit = 100 // Maximum limit
+	}
+
+	offset, err := strconv.Atoi(c.Query("offset", "0"))
+	if err != nil || offset < 0 {
+		offset = 0 // Default offset
+	}
+
+	// Build the base query according to the correct schema relationships
+	baseQuery := `
+		SELECT d.doctor_id, d.name, d.specialization, d.age,
+		       d.qualification, d.imr_number, d.is_active, 
+		       h.name as hospital_name, h.hospital_id
+		FROM doctors d
+		JOIN users u ON d.doctor_id = u.user_id
+		LEFT JOIN hospitals h ON u.hospital_id = h.hospital_id
+		WHERE 1=1`
+
+	// Build the count query
+	countQuery := `
+		SELECT COUNT(*)
+		FROM doctors d
+		JOIN users u ON d.doctor_id = u.user_id
+		LEFT JOIN hospitals h ON u.hospital_id = h.hospital_id
+		WHERE 1=1`
+
+	// Initialize query parameters
+	queryParams := []interface{}{}
+	paramCount := 1
+
+	// Add search conditions based on searchBy parameter
+	if searchQuery != "" {
+		switch searchBy {
+		case "name":
+			baseQuery += fmt.Sprintf(" AND d.name ILIKE $%d", paramCount)
+			countQuery += fmt.Sprintf(" AND d.name ILIKE $%d", paramCount)
+			queryParams = append(queryParams, "%"+searchQuery+"%")
+			paramCount++
+		case "license": // Using imr_number instead of license_number
+			baseQuery += fmt.Sprintf(" AND d.imr_number ILIKE $%d", paramCount)
+			countQuery += fmt.Sprintf(" AND d.imr_number ILIKE $%d", paramCount)
+			queryParams = append(queryParams, "%"+searchQuery+"%")
+			paramCount++
+		case "qualification":
+			baseQuery += fmt.Sprintf(" AND d.qualification ILIKE $%d", paramCount)
+			countQuery += fmt.Sprintf(" AND d.qualification ILIKE $%d", paramCount)
+			queryParams = append(queryParams, "%"+searchQuery+"%")
+			paramCount++
+		case "all":
+			baseQuery += fmt.Sprintf(` AND (
+				d.name ILIKE $%d OR 
+				d.imr_number ILIKE $%d OR 
+				d.qualification ILIKE $%d OR
+				d.specialization::text ILIKE $%d)`,
+				paramCount, paramCount, paramCount, paramCount)
+			countQuery += fmt.Sprintf(` AND (
+				d.name ILIKE $%d OR 
+				d.imr_number ILIKE $%d OR 
+				d.qualification ILIKE $%d OR
+				d.specialization::text ILIKE $%d)`,
+				paramCount, paramCount, paramCount, paramCount)
+			queryParams = append(queryParams, "%"+searchQuery+"%")
+			paramCount++
+		}
+	}
+
+	// Add speciality filter if provided - note that specialization is JSONB
+	if speciality != "" {
+		baseQuery += fmt.Sprintf(" AND d.specialization::text ILIKE $%d", paramCount)
+		countQuery += fmt.Sprintf(" AND d.specialization::text ILIKE $%d", paramCount)
+		queryParams = append(queryParams, "%"+speciality+"%")
+		paramCount++
+	}
+
+	// Add hospital filter if provided
+	if hospitalID != "" {
+		baseQuery += fmt.Sprintf(" AND h.hospital_id = $%d", paramCount)
+		countQuery += fmt.Sprintf(" AND h.hospital_id = $%d", paramCount)
+		queryParams = append(queryParams, hospitalID)
+		paramCount++
+	}
+
+	// Add pagination and ordering
+	baseQuery += " ORDER BY d.name"
+	baseQuery += fmt.Sprintf(" LIMIT $%d OFFSET $%d", paramCount, paramCount+1)
+	queryParams = append(queryParams, limit, offset)
+
+	// Query for total count
+	var total int
+	err = h.pgPool.QueryRow(c.Context(), countQuery, queryParams[:paramCount-1]...).Scan(&total)
+	if err != nil {
+		h.logger.Error("failed to count doctors", zap.Error(err))
+		// Continue with the results but without total count
+		total = 0
+	}
+
+	// Execute the main query
+	rows, err := h.pgPool.Query(c.Context(), baseQuery, queryParams...)
+	if err != nil {
+		h.logger.Error("failed to query doctors", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to search doctors"})
+	}
+	defer rows.Close()
+
+	// Process doctors
+	var doctors []DoctorSearchResult
+	for rows.Next() {
+		var doctor DoctorSearchResult
+		var specializationJSON []byte
+		var hospitalName, hospitalID sql.NullString
+		var isActive bool
+
+		if err := rows.Scan(
+			&doctor.DoctorID,
+			&doctor.Name,
+			&specializationJSON,
+			&doctor.Age,
+			&doctor.Qualification,
+			&doctor.IMRNumber,
+			&isActive,
+			&hospitalName,
+			&hospitalID,
+		); err != nil {
+			h.logger.Error("failed to scan doctor row", zap.Error(err))
+			continue
+		}
+
+		// Handle nullable hospital fields
+		if hospitalName.Valid {
+			doctor.HospitalName = hospitalName.String
+		}
+		if hospitalID.Valid {
+			if id, err := uuid.Parse(hospitalID.String); err == nil {
+				doctor.HospitalID = id
+			}
+		}
+
+		// Set active status
+		doctor.IsActive = isActive
+
+		// Parse specialization from JSON
+		if len(specializationJSON) > 0 {
+			// Depending on your JSON structure, adjust the parsing
+			var specializations map[string]interface{}
+			if err := json.Unmarshal(specializationJSON, &specializations); err != nil {
+				// Try as array if map fails
+				var specializationArray []string
+				if err := json.Unmarshal(specializationJSON, &specializationArray); err != nil {
+					h.logger.Error("failed to parse specialization JSON", zap.Error(err))
+				} else if len(specializationArray) > 0 {
+					doctor.Speciality = strings.Join(specializationArray, ", ")
+				}
+			} else {
+				// Extract primary specialization if it exists
+				if primary, ok := specializations["primary"].(string); ok {
+					doctor.Speciality = primary
+					// Add secondary if it exists
+					if secondary, ok := specializations["secondary"].(string); ok {
+						doctor.Speciality += ", " + secondary
+					}
+				}
+			}
+		}
+
+		// Add to results
+		doctors = append(doctors, doctor)
+	}
+
+	if err := rows.Err(); err != nil {
+		h.logger.Error("cursor error", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Error processing doctors"})
+	}
+
+	return c.JSON(fiber.Map{
+		"doctors": doctors,
 		"pagination": fiber.Map{
 			"total":  total,
 			"limit":  limit,

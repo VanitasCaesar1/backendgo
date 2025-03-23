@@ -432,6 +432,7 @@ func (a *App) setupRoutes() error {
 	doctorGroup.Get("/fees", doctorHandler.GetDoctorFees) // Add query param support for doctorId
 	doctorGroup.Put("/fees", doctorHandler.UpdateDoctorFees)
 	doctorGroup.Delete("/fees/:id", doctorHandler.DeleteDoctorFees)
+	doctorGroup.Get("/search", appointmentHandler.SearchDoctors)
 
 	// Hospital routes - protected
 	hospitalGroup := a.Fiber.Group("/api/hospital", authMiddleware.Handler())
