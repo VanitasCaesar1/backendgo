@@ -92,6 +92,7 @@ type DoctorSearchResult struct {
 // Patient represents the MongoDB patient document structure
 type Patient struct {
 	PatientID        string            `json:"patient_id" bson:"patient_id"`
+	UserID           string            `bson:"user_id"`
 	Name             string            `json:"name" bson:"name"`
 	Email            string            `json:"email" bson:"email"`
 	Mobile           string            `json:"mobile" bson:"mobile"`
@@ -375,6 +376,7 @@ func (h *AppointmentHandler) GetAppointmentsByOrgID(c *fiber.Ctx) error {
 		},
 	})
 }
+
 func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	// Get auth ID from context
 	authID, err := h.getAuthID(c)
@@ -482,7 +484,7 @@ func (h *AppointmentHandler) isDoctorAvailable(ctx context.Context, doctorID, ho
 	}
 
 	// Query PostgreSQL for doctor shift info
-	err := h.pgPool.QueryRowContext(ctx,
+	err := h.pgPool.QueryRow(ctx,
 		"SELECT starttime, endtime, isactive FROM public.doctorshifts WHERE doctor_id = $1 AND hospital_id = $2 AND weekday = $3",
 		doctorID, hospitalID, weekday).Scan(&shift.StartTime, &shift.EndTime, &shift.IsActive)
 
@@ -556,7 +558,7 @@ func (h *AppointmentHandler) getDoctorFee(ctx context.Context, doctorID, hospita
 
 	query += " FROM public.doctor_fees WHERE doctor_id = $1 AND hospital_id = $2"
 
-	err := h.pgDb.QueryRowContext(ctx, query, doctorID, hospitalID).Scan(&fee)
+	err := h.pgPool.QueryRow(ctx, query, doctorID, hospitalID).Scan(&fee)
 	if err != nil {
 		return 0, err
 	}
@@ -1328,3 +1330,105 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 		},
 	})
 }
+
+/* func (h *AppointmentHandler) CreatePatient(c *fiber.Ctx) error {
+	// Get auth ID from context
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// Get user ID
+	userID, err := h.getUserID(c.Context(), authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	// Parse patient data from request body
+	var patientRequest struct {
+		PatientName string `json:"patient_name"`
+		DateOfBirth string `json:"date_of_birth"`
+		Gender      string `json:"gender"`
+		Phone       string `json:"phone"`
+		Address     string `json:"address,omitempty"`
+		BloodType   string `json:"blood_type,omitempty"`
+		Allergies   string `json:"allergies,omitempty"`
+	}
+
+	if err := c.BodyParser(&patientRequest); err != nil {
+		h.logger.Error("failed to parse patient data", zap.Error(err))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid patient data"})
+	}
+
+	// Validate required fields
+	if patientRequest.PatientName == "" || patientRequest.DateOfBirth == "" ||
+		patientRequest.Gender == "" || patientRequest.Phone == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Missing required fields"})
+	}
+
+	// Generate unique 8-digit patient ID (capital letters and numbers)
+	patientID, err := h.generateUniquePatientID(c.Context())
+	if err != nil {
+		h.logger.Error("failed to generate patient ID", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to generate patient ID"})
+	}
+
+	// Create patient document
+	patient := Patient{
+		UserID:      userID,
+		PatientID:   patientID,
+		PatientName: patientRequest.PatientName,
+		DateOfBirth: patientRequest.DateOfBirth,
+		Gender:      patientRequest.Gender,
+		Phone:       patientRequest.Phone,
+		Address:     patientRequest.Address,
+		BloodType:   patientRequest.BloodType,
+		Allergies:   patientRequest.Allergies,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+
+	// Insert patient into MongoDB
+	patientsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("patients")
+	_, err = patientsCollection.InsertOne(c.Context(), patient)
+	if err != nil {
+		h.logger.Error("failed to insert patient", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create patient"})
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+		"message": "Patient created successfully",
+		"patient": patient,
+	})
+}
+
+// Helper function to generate a unique 8-digit alphanumeric patient ID
+func (h *PatientHandler) generateUniquePatientID(ctx context.Context) (string, error) {
+	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	const idLength = 8
+
+	for attempts := 0; attempts < 10; attempts++ {
+		// Generate random ID
+		b := make([]byte, idLength)
+		for i := range b {
+			b[i] = charset[rand.Intn(len(charset))]
+		}
+		patientID := string(b)
+
+		// Check if ID already exists
+		patientsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("patients")
+		count, err := patientsCollection.CountDocuments(ctx, bson.M{"patient_id": patientID})
+		if err != nil {
+			return "", err
+		}
+
+		if count == 0 {
+			return patientID, nil
+		}
+	}
+
+	return "", errors.New("failed to generate unique patient ID after multiple attempts")
+}
+*/
