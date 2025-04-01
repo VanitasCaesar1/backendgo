@@ -246,7 +246,7 @@ func NewApp() (*App, error) {
 
 	// Updated CORS middleware configuration
 	fiberApp.Use(cors.New(cors.Config{
-		AllowOrigins:     "http://localhost:3000", // Or specify domains like "http://localhost:3000, https://yourdomain.com"
+		AllowOrigins:     "https://treato.org", // Or specify domains like "http://localhost:3000, https://yourdomain.com"
 		AllowMethods:     "GET,POST,PUT,DELETE,OPTIONS",
 		AllowHeaders:     "Origin, Content-Type, Accept, Authorization, X-Organization-ID, X-Role, X-Permissions, X-Session-ID",
 		AllowCredentials: true,
@@ -266,7 +266,7 @@ func NewApp() (*App, error) {
 	fiberApp.Use(func(c *fiber.Ctx) error {
 		c.Set("Content-Security-Policy",
 			"default-src 'self'; "+
-				"connect-src 'self' http://localhost:3000 http://localhost:8080; "+
+				"connect-src 'self' http://localhost:3000 https://treato.org https://backendgo-staging.up.railway.app http://localhost:8080; "+
 				"script-src 'self' 'unsafe-inline'; "+
 				"style-src 'self' 'unsafe-inline'")
 		return c.Next()
