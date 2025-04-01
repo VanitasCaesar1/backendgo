@@ -246,9 +246,9 @@ func NewApp() (*App, error) {
 
 	// Updated CORS middleware configuration
 	fiberApp.Use(cors.New(cors.Config{
-		AllowOrigins:     "http://localhost:3000, https://treato.org", // Add your production domain
+		AllowOrigins:     "*", // Allow all origins
 		AllowMethods:     "GET,POST,PUT,DELETE,OPTIONS",
-		AllowHeaders:     "Origin,Access-Control-Allow-Origin, Content-Type, Accept, Authorization, X-Organization-ID, X-Role, X-Permissions, X-Session-ID",
+		AllowHeaders:     "Origin, Content-Type, Accept, Authorization, X-Organization-ID, X-Role, X-Permissions, X-Session-ID",
 		AllowCredentials: true,
 		ExposeHeaders:    "Content-Length, Content-Type",
 		MaxAge:           86400, // 24 hours
