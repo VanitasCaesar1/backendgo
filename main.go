@@ -391,7 +391,7 @@ func (a *App) setupRoutes() error {
 	})
 
 	// Auth routes (no authentication required)
-	authGroup := a.Fiber.Group("/auth")
+	authGroup := a.Fiber.Group("/api/auth")
 	authGroup.Post("/user/register", userHandler.RegisterUser)
 	authGroup.Post("/request-reset", userHandler.ResetPassword)
 	authGroup.Post("/reset-password", userHandler.ResetPassword)
@@ -470,6 +470,10 @@ func (a *App) setupRoutes() error {
 
 	patientsGroup := a.Fiber.Group("/api/patients", authMiddleware.Handler())
 	patientsGroup.Get("/search", appointmentHandler.SearchPatients)
+	patientsGroup.Post("/create", appointmentHandler.CreatePatient)
+	patientsGroup.Get("/:id", appointmentHandler.GetPatient)
+	patientsGroup.Put("/:id", appointmentHandler.UpdatePatient)
+	patientsGroup.Delete("/:id", appointmentHandler.DeletePatient)
 	// Additional protected API routes from the middleware file
 	a.Fiber.Use("/api/protected/*", authMiddleware.Handler())
 	a.Fiber.Use("/api/user/*", authMiddleware.Handler())

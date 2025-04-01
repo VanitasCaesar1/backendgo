@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math/rand"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -1331,7 +1334,7 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 	})
 }
 
-/* func (h *AppointmentHandler) CreatePatient(c *fiber.Ctx) error {
+func (h *AppointmentHandler) CreatePatient(c *fiber.Ctx) error {
 	// Get auth ID from context
 	authID, err := h.getAuthID(c)
 	if err != nil {
@@ -1377,17 +1380,14 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 
 	// Create patient document
 	patient := Patient{
-		UserID:      userID,
-		PatientID:   patientID,
-		PatientName: patientRequest.PatientName,
-		DateOfBirth: patientRequest.DateOfBirth,
-		Gender:      patientRequest.Gender,
-		Phone:       patientRequest.Phone,
-		Address:     patientRequest.Address,
-		BloodType:   patientRequest.BloodType,
-		Allergies:   patientRequest.Allergies,
-		CreatedAt:   time.Now(),
-		UpdatedAt:   time.Now(),
+		UserID:    userID.String(),
+		PatientID: patientID,
+		Name:      patientRequest.PatientName,
+		Mobile:    patientRequest.Phone,
+		Address:   patientRequest.Address,
+		Allergies: []string{patientRequest.Allergies},
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
 	}
 
 	// Insert patient into MongoDB
@@ -1405,7 +1405,7 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 }
 
 // Helper function to generate a unique 8-digit alphanumeric patient ID
-func (h *PatientHandler) generateUniquePatientID(ctx context.Context) (string, error) {
+func (h *AppointmentHandler) generateUniquePatientID(ctx context.Context) (string, error) {
 	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	const idLength = 8
 
@@ -1431,4 +1431,209 @@ func (h *PatientHandler) generateUniquePatientID(ctx context.Context) (string, e
 
 	return "", errors.New("failed to generate unique patient ID after multiple attempts")
 }
-*/
+
+// GetPatient retrieves a patient record by ID
+func (h *AppointmentHandler) GetPatient(c *fiber.Ctx) error {
+	// Get patient ID from URL parameter
+	patientID := c.Params("id")
+	if patientID == "" {
+		h.logger.Error("patient ID is required")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Patient ID is required"})
+	}
+
+	// Get auth ID from context
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// Get user ID
+	userID, err := h.getUserID(c.Context(), authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	// Access patients collection
+	patientsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("patients")
+
+	// Find patient document
+	var patient Patient
+	filter := bson.M{"patient_id": patientID, "user_id": userID.String()}
+	err = patientsCollection.FindOne(c.Context(), filter).Decode(&patient)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			h.logger.Error("patient not found", zap.String("patientID", patientID))
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Patient not found"})
+		}
+		h.logger.Error("failed to fetch patient", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch patient"})
+	}
+
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"message": "Patient retrieved successfully",
+		"patient": patient,
+	})
+}
+
+// UpdatePatient updates a patient record by ID
+func (h *AppointmentHandler) UpdatePatient(c *fiber.Ctx) error {
+	// Get patient ID from URL parameter
+	patientID := c.Params("id")
+	if patientID == "" {
+		h.logger.Error("patient ID is required")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Patient ID is required"})
+	}
+
+	// Get auth ID from context
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// Get user ID
+	userID, err := h.getUserID(c.Context(), authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	// Parse update data from request body
+	var updateRequest struct {
+		Name       string   `json:"name,omitempty"`
+		Email      string   `json:"email,omitempty"`
+		Mobile     string   `json:"mobile,omitempty"`
+		Age        int      `json:"age,omitempty"`
+		BloodGroup string   `json:"blood_group,omitempty"`
+		Address    string   `json:"address,omitempty"`
+		AadhaarID  string   `json:"aadhaar_id,omitempty"`
+		Allergies  []string `json:"allergies,omitempty"`
+	}
+
+	if err := c.BodyParser(&updateRequest); err != nil {
+		h.logger.Error("failed to parse update data", zap.Error(err))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid update data"})
+	}
+
+	// Validate email format if provided
+	if updateRequest.Email != "" {
+		emailRegex := regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
+		if !emailRegex.MatchString(updateRequest.Email) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid email format"})
+		}
+	}
+
+	// Validate blood group format if provided
+	if updateRequest.BloodGroup != "" {
+		bloodGroupRegex := regexp.MustCompile(`^(A|B|AB|O)[+-]$`)
+		if !bloodGroupRegex.MatchString(updateRequest.BloodGroup) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid blood group format"})
+		}
+	}
+
+	// Validate Aadhaar ID format if provided
+	if updateRequest.AadhaarID != "" {
+		aadhaarRegex := regexp.MustCompile(`^\d{12}$`)
+		if !aadhaarRegex.MatchString(updateRequest.AadhaarID) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid Aadhaar ID format"})
+		}
+	}
+
+	// Access patients collection
+	patientsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("patients")
+
+	// Create update document
+	update := bson.M{"updated_at": time.Now()}
+
+	if updateRequest.Name != "" {
+		update["name"] = updateRequest.Name
+	}
+	if updateRequest.Email != "" {
+		update["email"] = updateRequest.Email
+	}
+	if updateRequest.Mobile != "" {
+		update["mobile"] = updateRequest.Mobile
+	}
+	if updateRequest.Age != 0 {
+		update["age"] = updateRequest.Age
+	}
+	if updateRequest.BloodGroup != "" {
+		update["blood_group"] = updateRequest.BloodGroup
+	}
+	if updateRequest.Address != "" {
+		update["address"] = updateRequest.Address
+	}
+	if updateRequest.AadhaarID != "" {
+		update["aadhaar_id"] = updateRequest.AadhaarID
+	}
+	if len(updateRequest.Allergies) > 0 {
+		update["allergies"] = updateRequest.Allergies
+	}
+
+	// Update patient document
+	filter := bson.M{"patient_id": patientID, "user_id": userID.String()}
+	result, err := patientsCollection.UpdateOne(
+		c.Context(),
+		filter,
+		bson.M{"$set": update},
+	)
+
+	if err != nil {
+		h.logger.Error("failed to update patient", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update patient"})
+	}
+
+	if result.MatchedCount == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Patient not found"})
+	}
+
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"message": "Patient updated successfully",
+	})
+}
+
+// DeletePatient deletes a patient record by ID
+func (h *AppointmentHandler) DeletePatient(c *fiber.Ctx) error {
+	// Get patient ID from URL parameter
+	patientID := c.Params("id")
+	if patientID == "" {
+		h.logger.Error("patient ID is required")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Patient ID is required"})
+	}
+
+	// Get auth ID from context
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// Get user ID
+	userID, err := h.getUserID(c.Context(), authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	// Access patients collection
+	patientsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("patients")
+
+	// Delete the patient document
+	filter := bson.M{"patient_id": patientID, "user_id": userID.String()}
+	result, err := patientsCollection.DeleteOne(c.Context(), filter)
+
+	if err != nil {
+		h.logger.Error("failed to delete patient", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to delete patient"})
+	}
+
+	if result.DeletedCount == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Patient not found"})
+	}
+
+	return c.Status(fiber.StatusOK).JSON(fiber.Map{
+		"message": "Patient deleted successfully",
+	})
+}
