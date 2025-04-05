@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -88,7 +89,14 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 			"error": "Invalid request format",
 		})
 	}
-
+	if req.AadhaarID != "" {
+		aadhaarRegex := regexp.MustCompile(`^\d{12}$`)
+		if !aadhaarRegex.MatchString(req.AadhaarID) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Invalid Aadhaar ID format. Must be exactly 12 digits.",
+			})
+		}
+	}
 	// Check if user already exists with this email, username, or Aadhaar ID
 	var emailExists, usernameExists, aadhaarExists bool
 	err := h.pgPool.QueryRow(c.Context(),
@@ -215,7 +223,7 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 		req.Address,
 		req.Username,
 		nil, // hospital_id - using nil for NULL
-		nil, // aadhaar_id - using nil for NULL
+		req.AadhaarID,
 		workosUser.ID,
 	).Scan(&insertedUserID)
 
