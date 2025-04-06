@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"regexp"
 	"strconv"
@@ -93,24 +94,43 @@ type DoctorSearchResult struct {
 }
 
 // Patient represents the MongoDB patient document structure
+
+type Medical struct {
+	Condition     string    `json:"condition" bson:"condition"`
+	DiagnosedDate time.Time `json:"diagnosed_date" bson:"diagnosed_date"`
+	Notes         string    `json:"notes,omitempty" bson:"notes,omitempty"`
+}
+
+type Contact struct {
+	Name         string `json:"name" bson:"name"`
+	Relationship string `json:"relationship,omitempty" bson:"relationship,omitempty"`
+	Phone        string `json:"phone,omitempty" bson:"phone,omitempty"`
+}
+
+type Visit struct {
+	HospitalID   string    `json:"hospital_id" bson:"hospital_id"`
+	HospitalName string    `json:"hospital_name,omitempty" bson:"hospital_name,omitempty"`
+	VisitDate    time.Time `json:"visit_date" bson:"visit_date"`
+	Reason       string    `json:"reason,omitempty" bson:"reason,omitempty"`
+}
+
 type Patient struct {
-	PatientID        string            `json:"patient_id" bson:"patient_id"`
-	UserID           string            `bson:"user_id"`
-	Name             string            `json:"name" bson:"name"`
-	Email            string            `json:"email" bson:"email"`
-	Mobile           string            `json:"mobile" bson:"mobile"`
-	Age              int               `json:"age,omitempty" bson:"age,omitempty"`
-	BloodGroup       string            `json:"blood_group,omitempty" bson:"blood_group,omitempty"`
-	Address          string            `json:"address,omitempty" bson:"address,omitempty"`
-	AadhaarID        string            `json:"aadhaar_id,omitempty" bson:"aadhaar_id,omitempty"`
-	MedicalHistory   []MedicalRecord   `json:"medical_history,omitempty" bson:"medical_history,omitempty"`
-	Allergies        []string          `json:"allergies,omitempty" bson:"allergies,omitempty"`
-	EmergencyContact *EmergencyContact `json:"emergency_contact,omitempty" bson:"emergency_contact,omitempty"`
-	AuthID           string            `json:"auth_id,omitempty" bson:"auth_id,omitempty"`
-	HospitalVisits   []HospitalVisit   `json:"hospital_visits,omitempty" bson:"hospital_visits,omitempty"`
-	Insurance        *Insurance        `json:"insurance,omitempty" bson:"insurance,omitempty"`
-	CreatedAt        time.Time         `json:"created_at" bson:"created_at"`
-	UpdatedAt        time.Time         `json:"updated_at,omitempty" bson:"updated_at,omitempty"`
+	PatientID        string     `json:"patient_id" bson:"patient_id"`
+	Name             string     `json:"name" bson:"name"`
+	Email            string     `json:"email" bson:"email"`
+	Mobile           string     `json:"mobile" bson:"mobile"`
+	Age              int        `json:"age,omitempty" bson:"age,omitempty"`
+	BloodGroup       string     `json:"blood_group,omitempty" bson:"blood_group,omitempty"`
+	Address          string     `json:"address,omitempty" bson:"address,omitempty"`
+	AadhaarID        string     `json:"aadhaar_id,omitempty" bson:"aadhaar_id,omitempty"`
+	MedicalHistory   []Medical  `json:"medical_history,omitempty" bson:"medical_history,omitempty"`
+	Allergies        []string   `json:"allergies,omitempty" bson:"allergies,omitempty"`
+	EmergencyContact *Contact   `json:"emergency_contact,omitempty" bson:"emergency_contact,omitempty"`
+	AuthID           string     `json:"auth_id" bson:"auth_id"`
+	HospitalVisits   []Visit    `json:"hospital_visits,omitempty" bson:"hospital_visits,omitempty"`
+	Insurance        *Insurance `json:"insurance,omitempty" bson:"insurance,omitempty"`
+	CreatedAt        time.Time  `json:"created_at" bson:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at" bson:"updated_at"`
 }
 
 // PatientSearchResult represents a limited view of patient data for search results
@@ -948,154 +968,6 @@ func (h *AppointmentHandler) GetPatientByID(c *fiber.Ctx) error {
 	return c.JSON(patient)
 }
 
-// SearchPatients searches for patients based on various criteria
-func (h *AppointmentHandler) SearchPatients(c *fiber.Ctx) error {
-	// Get auth ID from context
-	authID, err := h.getAuthID(c)
-	if err != nil {
-		h.logger.Error("authID not found in context")
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
-	}
-
-	// Get user ID
-	userID, err := h.getUserID(c.Context(), authID)
-	if err != nil {
-		h.logger.Error("failed to get user ID", zap.Error(err), zap.String("authID", authID))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve user information"})
-	}
-
-	// Check if user role was provided in header
-	userRole := c.Get("X-User-Role", "")
-
-	// If no role was provided in the header, fall back to database lookup
-	if userRole == "" {
-		var dbErr error
-		userRole, dbErr = h.getUserRole(c.Context(), userID)
-		if dbErr != nil {
-			h.logger.Error("failed to get user role", zap.Error(dbErr), zap.String("userID", userID.String()))
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve user role"})
-		}
-	}
-
-	// Only certain roles can search for patients
-	if userRole != "admin" && userRole != "hospital_admin" && userRole != "doctor" && userRole != "frontdesk" {
-		h.logger.Error("unauthorized access attempt", zap.String("userID", userID.String()), zap.String("role", userRole))
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Not authorized to search patients"})
-	}
-
-	// Get search parameters
-	searchQuery := c.Query("q", "")
-	searchBy := c.Query("by", "name") // default search by name
-	hospitalID := c.Query("hospital_id", "")
-
-	// Validate hospital ID if provided
-	if hospitalID != "" {
-		_, err := uuid.Parse(hospitalID)
-		if err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid hospital ID format"})
-		}
-	}
-
-	// Parse pagination parameters
-	limit, err := strconv.Atoi(c.Query("limit", "20"))
-	if err != nil || limit <= 0 {
-		limit = 20 // Default limit
-	}
-	if limit > 100 {
-		limit = 100 // Maximum limit
-	}
-
-	offset, err := strconv.Atoi(c.Query("offset", "0"))
-	if err != nil || offset < 0 {
-		offset = 0 // Default offset
-	}
-
-	// Build MongoDB query
-	query := bson.M{}
-
-	// Add search criteria based on searchBy parameter
-	if searchQuery != "" {
-		switch searchBy {
-		case "name":
-			query["name"] = bson.M{"$regex": primitive.Regex{Pattern: searchQuery, Options: "i"}}
-		case "email":
-			query["email"] = bson.M{"$regex": primitive.Regex{Pattern: searchQuery, Options: "i"}}
-		case "mobile":
-			query["mobile"] = bson.M{"$regex": primitive.Regex{Pattern: searchQuery, Options: "i"}}
-		case "patient_id":
-			query["patient_id"] = searchQuery
-		case "aadhaar_id":
-			query["aadhaar_id"] = searchQuery
-		default:
-			// Invalid search parameter, use text search as fallback
-			query["$text"] = bson.M{"$search": searchQuery}
-		}
-	}
-
-	// Add hospital filter if provided
-	if hospitalID != "" {
-		query["hospital_visits.hospital_id"] = hospitalID
-	}
-
-	// Configure find options
-	findOptions := options.Find()
-	findOptions.SetLimit(int64(limit))
-	findOptions.SetSkip(int64(offset))
-	findOptions.SetSort(bson.D{{Key: "name", Value: 1}}) // Sort by name ascending
-
-	// Query MongoDB
-	patientsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("patients")
-	cursor, err := patientsCollection.Find(c.Context(), query, findOptions)
-	if err != nil {
-		h.logger.Error("failed to query patients", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to search patients"})
-	}
-	defer cursor.Close(c.Context())
-
-	// Process patients
-	var patients []PatientSearchResult
-	for cursor.Next(c.Context()) {
-		var patient Patient
-		if err := cursor.Decode(&patient); err != nil {
-			h.logger.Error("failed to decode patient", zap.Error(err))
-			continue
-		}
-
-		// Convert to search result format (with limited fields for security/privacy)
-		patients = append(patients, PatientSearchResult{
-			PatientID:  patient.PatientID,
-			Name:       patient.Name,
-			Email:      patient.Email,
-			Mobile:     patient.Mobile,
-			Age:        patient.Age,
-			BloodGroup: patient.BloodGroup,
-			Address:    patient.Address,
-		})
-	}
-
-	if err := cursor.Err(); err != nil {
-		h.logger.Error("cursor error", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Error processing patients"})
-	}
-
-	// Get total count for pagination
-	total, err := patientsCollection.CountDocuments(c.Context(), query)
-	if err != nil {
-		h.logger.Error("failed to count patients", zap.Error(err))
-		// Continue with the results but without total count
-		total = 0
-	}
-
-	return c.JSON(fiber.Map{
-		"patients": patients,
-		"pagination": fiber.Map{
-			"total":  total,
-			"limit":  limit,
-			"offset": offset,
-		},
-	})
-}
-
 // SearchDoctors searches for doctors based on various criteria
 func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 	// Get auth ID from context
@@ -1348,16 +1220,21 @@ func (h *AppointmentHandler) CreatePatient(c *fiber.Ctx) error {
 		h.logger.Error("failed to get user ID", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
-
+	fmt.Println(userID)
 	// Parse patient data from request body
 	var patientRequest struct {
-		PatientName string `json:"patient_name"`
-		DateOfBirth string `json:"date_of_birth"`
-		Gender      string `json:"gender"`
-		Phone       string `json:"phone"`
-		Address     string `json:"address,omitempty"`
-		BloodType   string `json:"blood_type,omitempty"`
-		Allergies   string `json:"allergies,omitempty"`
+		Name             string     `json:"name"`
+		Email            string     `json:"email"`
+		Mobile           string     `json:"mobile"`
+		Age              int        `json:"age,omitempty"`
+		BloodGroup       string     `json:"blood_group,omitempty"`
+		Address          string     `json:"address,omitempty"`
+		AadhaarID        string     `json:"aadhaar_id,omitempty"`
+		MedicalHistory   []Medical  `json:"medical_history,omitempty"`
+		Allergies        []string   `json:"allergies,omitempty"`
+		EmergencyContact *Contact   `json:"emergency_contact,omitempty"`
+		Insurance        *Insurance `json:"insurance,omitempty"`
+		HospitalVisits   []Visit    `json:"hospital_visits,omitempty"`
 	}
 
 	if err := c.BodyParser(&patientRequest); err != nil {
@@ -1365,13 +1242,34 @@ func (h *AppointmentHandler) CreatePatient(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid patient data"})
 	}
 
-	// Validate required fields
-	if patientRequest.PatientName == "" || patientRequest.DateOfBirth == "" ||
-		patientRequest.Gender == "" || patientRequest.Phone == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Missing required fields"})
+	// Validate required fields based on schema
+	if patientRequest.Name == "" || patientRequest.Email == "" || patientRequest.Mobile == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Missing required fields: name, email, and mobile are required"})
 	}
 
-	// Generate unique 8-digit patient ID (capital letters and numbers)
+	// Validate email format
+	emailRegex := regexp.MustCompile(`^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`)
+	if !emailRegex.MatchString(patientRequest.Email) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid email format"})
+	}
+
+	// Validate blood group format if provided
+	if patientRequest.BloodGroup != "" {
+		bloodGroupRegex := regexp.MustCompile(`^(A|B|AB|O)[+-]$`)
+		if !bloodGroupRegex.MatchString(patientRequest.BloodGroup) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid blood group format, must be A+, A-, B+, B-, AB+, AB-, O+, or O-"})
+		}
+	}
+
+	// Validate Aadhaar ID if provided
+	if patientRequest.AadhaarID != "" {
+		aadhaarRegex := regexp.MustCompile(`^\d{12}$`)
+		if !aadhaarRegex.MatchString(patientRequest.AadhaarID) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid Aadhaar ID format, must be 12 digits"})
+		}
+	}
+
+	// Generate unique 8-digit patient ID
 	patientID, err := h.generateUniquePatientID(c.Context())
 	if err != nil {
 		h.logger.Error("failed to generate patient ID", zap.Error(err))
@@ -1380,14 +1278,22 @@ func (h *AppointmentHandler) CreatePatient(c *fiber.Ctx) error {
 
 	// Create patient document
 	patient := Patient{
-		UserID:    userID.String(),
-		PatientID: patientID,
-		Name:      patientRequest.PatientName,
-		Mobile:    patientRequest.Phone,
-		Address:   patientRequest.Address,
-		Allergies: []string{patientRequest.Allergies},
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		PatientID:        patientID,
+		Name:             patientRequest.Name,
+		Email:            patientRequest.Email,
+		Mobile:           patientRequest.Mobile,
+		Age:              patientRequest.Age,
+		BloodGroup:       patientRequest.BloodGroup,
+		Address:          patientRequest.Address,
+		AadhaarID:        patientRequest.AadhaarID,
+		MedicalHistory:   patientRequest.MedicalHistory,
+		Allergies:        patientRequest.Allergies,
+		EmergencyContact: patientRequest.EmergencyContact,
+		Insurance:        patientRequest.Insurance,
+		HospitalVisits:   patientRequest.HospitalVisits,
+		AuthID:           authID,
+		CreatedAt:        time.Now(),
+		UpdatedAt:        time.Now(),
 	}
 
 	// Insert patient into MongoDB
@@ -1474,6 +1380,172 @@ func (h *AppointmentHandler) GetPatient(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusOK).JSON(fiber.Map{
 		"message": "Patient retrieved successfully",
 		"patient": patient,
+	})
+}
+
+// GetAllPatients retrieves patients with pagination and filtering
+func (h *AppointmentHandler) GetAllPatients(c *fiber.Ctx) error {
+	// Get auth ID from context
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// Get user ID
+	userID, err := h.getUserID(c.Context(), authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	// Parse pagination parameters
+	page, _ := strconv.Atoi(c.Query("page", "1"))
+	limit, _ := strconv.Atoi(c.Query("limit", "10"))
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 10 // Default limit and also max limit
+	}
+	skip := (page - 1) * limit
+
+	// Set up the filter
+	filter := bson.M{"user_id": userID.String()}
+
+	// Add search capability
+	search := c.Query("search")
+	if search != "" {
+		// Create a text search query
+		filter["$or"] = []bson.M{
+			{"name": bson.M{"$regex": search, "$options": "i"}},
+			{"email": bson.M{"$regex": search, "$options": "i"}},
+			{"mobile": bson.M{"$regex": search, "$options": "i"}},
+		}
+	}
+
+	// Add blood group filter if provided
+	bloodGroup := c.Query("bloodGroup")
+	if bloodGroup != "" {
+		filter["blood_group"] = bloodGroup
+	}
+
+	// Access patients collection
+	patientsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("patients")
+
+	// Count total patients matching the filter
+	total, err := patientsCollection.CountDocuments(c.Context(), filter)
+	if err != nil {
+		h.logger.Error("failed to count patients", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to count patients"})
+	}
+
+	// Create options for sorting and pagination
+	findOptions := options.Find().
+		SetSort(bson.M{"created_at": -1}). // Sort by created_at descending (newest first)
+		SetSkip(int64(skip)).
+		SetLimit(int64(limit))
+
+	// Find patients with pagination
+	cursor, err := patientsCollection.Find(c.Context(), filter, findOptions)
+	if err != nil {
+		h.logger.Error("failed to fetch patients", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch patients"})
+	}
+	defer cursor.Close(c.Context())
+
+	// Decode the patients
+	var patients []Patient
+	if err = cursor.All(c.Context(), &patients); err != nil {
+		h.logger.Error("failed to decode patients", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to decode patients"})
+	}
+
+	// Return paginated result with metadata
+	return c.JSON(fiber.Map{
+		"data":       patients,
+		"page":       page,
+		"limit":      limit,
+		"total":      total,
+		"totalPages": int(math.Ceil(float64(total) / float64(limit))),
+	})
+}
+
+// SearchPatients searches for patients with more advanced filtering
+func (h *AppointmentHandler) SearchPatients(c *fiber.Ctx) error {
+	// Get auth ID from context
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	// Get user ID
+	userID, err := h.getUserID(c.Context(), authID)
+	if err != nil {
+		h.logger.Error("failed to get user ID", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	// Parse query parameters
+	query := c.Query("query", "")
+	limit, _ := strconv.Atoi(c.Query("limit", "10"))
+	if limit < 1 || limit > 50 {
+		limit = 10 // Default and max limit
+	}
+
+	// Prepare filter
+	filter := bson.M{"user_id": userID.String()}
+
+	// Add search query
+	if query != "" {
+		filter["$or"] = []bson.M{
+			{"name": bson.M{"$regex": query, "$options": "i"}},
+			{"email": bson.M{"$regex": query, "$options": "i"}},
+			{"mobile": bson.M{"$regex": query, "$options": "i"}},
+		}
+	}
+
+	// Add blood group filter if provided
+	bloodGroup := c.Query("bloodGroup")
+	if bloodGroup != "" {
+		filter["blood_group"] = bloodGroup
+	}
+
+	// Add age filter if provided
+	age := c.Query("age")
+	if age != "" {
+		ageInt, err := strconv.Atoi(age)
+		if err == nil {
+			filter["age"] = ageInt
+		}
+	}
+
+	// Access patients collection
+	patientsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("patients")
+
+	// Find patients
+	findOptions := options.Find().
+		SetSort(bson.M{"name": 1}). // Sort by name
+		SetLimit(int64(limit))
+
+	cursor, err := patientsCollection.Find(c.Context(), filter, findOptions)
+	if err != nil {
+		h.logger.Error("failed to search patients", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to search patients"})
+	}
+	defer cursor.Close(c.Context())
+
+	// Decode the patients
+	var patients []Patient
+	if err = cursor.All(c.Context(), &patients); err != nil {
+		h.logger.Error("failed to decode patients", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to decode patients"})
+	}
+
+	return c.JSON(fiber.Map{
+		"data":  patients,
+		"count": len(patients),
 	})
 }
 

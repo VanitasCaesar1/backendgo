@@ -468,7 +468,7 @@ func (a *App) setupRoutes() error {
 	appointmentsGroup.Put("/:id", appointmentHandler.UpdateAppointment)
 	appointmentsGroup.Delete("/:id", appointmentHandler.DeleteAppointment)
 
-	patientsGroup := a.Fiber.Group("/api/patients", authMiddleware.Handler())
+	patientsGroup := a.Fiber.Group("/api/patients", authMiddleware.Handler(), appointmentHandler.GetAllPatients)
 	patientsGroup.Get("/search", appointmentHandler.SearchPatients)
 	patientsGroup.Post("/create", appointmentHandler.CreatePatient)
 	patientsGroup.Get("/:id", appointmentHandler.GetPatient)
