@@ -1386,22 +1386,7 @@ func (h *AppointmentHandler) GetPatient(c *fiber.Ctx) error {
 	})
 }
 
-// GetAllPatients retrieves patients with pagination and filtering
 func (h *AppointmentHandler) GetAllPatients(c *fiber.Ctx) error {
-	// Get auth ID from context
-	authID, err := h.getAuthID(c)
-	if err != nil {
-		h.logger.Error("authID not found in context")
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
-	}
-
-	// Get user ID
-	userID, err := h.getUserID(c.Context(), authID)
-	if err != nil {
-		h.logger.Error("failed to get user ID", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
-	}
-
 	// Parse pagination parameters
 	page, _ := strconv.Atoi(c.Query("page", "1"))
 	limit, _ := strconv.Atoi(c.Query("limit", "10"))
@@ -1413,10 +1398,10 @@ func (h *AppointmentHandler) GetAllPatients(c *fiber.Ctx) error {
 	}
 	skip := (page - 1) * limit
 
-	// Set up the filter
-	filter := bson.M{"user_id": userID.String()}
+	// Set up an empty filter to get all patients
+	filter := bson.M{}
 
-	// Add search capability
+	// Add search capability if provided
 	search := c.Query("search")
 	if search != "" {
 		// Create a text search query
