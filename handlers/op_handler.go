@@ -118,6 +118,7 @@ type Patient struct {
 	PatientID        string     `json:"patient_id" bson:"patient_id"`
 	Name             string     `json:"name" bson:"name"`
 	Email            string     `json:"email" bson:"email"`
+	Gender           string     `json:"gender" bson:"gender"`
 	Mobile           string     `json:"mobile" bson:"mobile"`
 	Age              int        `json:"age,omitempty" bson:"age,omitempty"`
 	BloodGroup       string     `json:"blood_group,omitempty" bson:"blood_group,omitempty"`
@@ -1226,6 +1227,7 @@ func (h *AppointmentHandler) CreatePatient(c *fiber.Ctx) error {
 		Name             string     `json:"name"`
 		Email            string     `json:"email"`
 		Mobile           string     `json:"mobile"`
+		Gender           string     `json:"gender,omitempty"`
 		Age              int        `json:"age,omitempty"`
 		BloodGroup       string     `json:"blood_group,omitempty"`
 		Address          string     `json:"address,omitempty"`
@@ -1282,6 +1284,7 @@ func (h *AppointmentHandler) CreatePatient(c *fiber.Ctx) error {
 		Name:             patientRequest.Name,
 		Email:            patientRequest.Email,
 		Mobile:           patientRequest.Mobile,
+		Gender:           patientRequest.Gender,
 		Age:              patientRequest.Age,
 		BloodGroup:       patientRequest.BloodGroup,
 		Address:          patientRequest.Address,
