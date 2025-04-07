@@ -16,10 +16,11 @@ import (
 )
 
 type WorkOSWebhookHandler struct {
-	config      *config.Config
-	redisClient *redis.Client
-	logger      *zap.Logger
-	pgPool      *pgxpool.Pool
+	config        *config.Config
+	redisClient   *redis.Client
+	logger        *zap.Logger
+	pgPool        *pgxpool.Pool
+	webhookClient *webhooks.Client // Add webhook client as field to avoid recreating it
 }
 
 // WebhookEvent represents the structure of a WorkOS webhook event
@@ -68,24 +69,62 @@ func NewWorkOSWebhookHandler(cfg *config.Config, rds *redis.Client, logger *zap.
 		return nil, errors.New("WorkOS webhook secret is not configured")
 	}
 
+	// Initialize webhook client once during handler creation
+	webhookClient := webhooks.NewClient(cfg.WorkOSWebhookSecret)
+
 	return &WorkOSWebhookHandler{
-		config:      cfg,
-		redisClient: rds,
-		logger:      logger,
-		pgPool:      pgPool,
+		config:        cfg,
+		redisClient:   rds,
+		logger:        logger,
+		pgPool:        pgPool,
+		webhookClient: webhookClient,
 	}, nil
 }
 
 // HandleWorkOSWebhook processes incoming WorkOS webhooks
 func (h *WorkOSWebhookHandler) HandleWorkOSWebhook(c *fiber.Ctx) error {
 	// Safety check to ensure handler was properly initialized
-	if h == nil || h.config == nil || h.logger == nil || h.pgPool == nil {
-		// If somehow the handler got called with nil fields, log if possible and return error
-		if h != nil && h.logger != nil {
-			h.logger.Error("webhook handler not properly initialized")
-		}
+	if h == nil {
+		// Log to server logs since handler logger may not be available
+		fmt.Println("ERROR: webhook handler is nil")
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Server configuration error",
+		})
+	}
+
+	// Check each dependency individually for more specific error messages
+	if h.logger == nil {
+		fmt.Println("ERROR: webhook handler logger is nil")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Server logger not configured",
+		})
+	}
+
+	if h.config == nil {
+		h.logger.Error("webhook handler config is nil")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Server config not configured",
+		})
+	}
+
+	if h.pgPool == nil {
+		h.logger.Error("webhook handler database pool is nil")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Database not configured",
+		})
+	}
+
+	if h.redisClient == nil {
+		h.logger.Error("webhook handler redis client is nil")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Redis not configured",
+		})
+	}
+
+	if h.webhookClient == nil {
+		h.logger.Error("webhook client is nil")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Webhook client not configured",
 		})
 	}
 
@@ -115,9 +154,8 @@ func (h *WorkOSWebhookHandler) HandleWorkOSWebhook(c *fiber.Ctx) error {
 		})
 	}
 
-	// Verify the webhook using the WorkOS client
-	webhookClient := webhooks.NewClient(h.config.WorkOSWebhookSecret)
-	_, err = webhookClient.ValidatePayload(signature, string(body))
+	// Verify the webhook using the cached WorkOS client
+	_, err = h.webhookClient.ValidatePayload(signature, string(body))
 	if err != nil {
 		h.logger.Error("failed to verify webhook signature", zap.Error(err))
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
@@ -134,19 +172,30 @@ func (h *WorkOSWebhookHandler) HandleWorkOSWebhook(c *fiber.Ctx) error {
 		})
 	}
 
+	// Validate the event has necessary data
+	if event.ID == "" || event.Event == "" {
+		h.logger.Error("webhook missing required fields",
+			zap.String("event_id", event.ID),
+			zap.String("event_type", event.Event))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Webhook missing required fields",
+		})
+	}
+
 	h.logger.Info("received WorkOS webhook",
 		zap.String("event_id", event.ID),
 		zap.String("event_type", event.Event),
 		zap.String("user_id", event.Data.UserID))
 
 	// Process based on event type
+	var handlerErr error
 	switch event.Event {
 	case "organization_membership.created":
-		err = h.handleOrganizationMembershipCreated(c.Context(), event.Data)
+		handlerErr = h.handleOrganizationMembershipCreated(c.Context(), event.Data)
 	case "organization_membership.updated":
-		err = h.handleOrganizationMembershipUpdated(c.Context(), event.Data)
+		handlerErr = h.handleOrganizationMembershipUpdated(c.Context(), event.Data)
 	case "organization_membership.deleted":
-		err = h.handleOrganizationMembershipDeleted(c.Context(), event.Data)
+		handlerErr = h.handleOrganizationMembershipDeleted(c.Context(), event.Data)
 	default:
 		h.logger.Info("ignoring unhandled event type", zap.String("event_type", event.Event))
 		return c.Status(fiber.StatusOK).JSON(fiber.Map{
@@ -155,10 +204,10 @@ func (h *WorkOSWebhookHandler) HandleWorkOSWebhook(c *fiber.Ctx) error {
 		})
 	}
 
-	if err != nil {
+	if handlerErr != nil {
 		h.logger.Error("failed to process webhook",
 			zap.String("event_type", event.Event),
-			zap.Error(err))
+			zap.Error(handlerErr))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to process webhook",
 		})
@@ -172,6 +221,17 @@ func (h *WorkOSWebhookHandler) HandleWorkOSWebhook(c *fiber.Ctx) error {
 
 // handleOrganizationMembershipCreated processes organization_membership.created events
 func (h *WorkOSWebhookHandler) handleOrganizationMembershipCreated(ctx context.Context, data OrganizationMembership) error {
+	// Validate data
+	if data.UserID == "" {
+		return errors.New("missing user_id in webhook data")
+	}
+	if data.OrganizationID == "" {
+		return errors.New("missing organization_id in webhook data")
+	}
+	if data.ID == "" {
+		return errors.New("missing membership ID in webhook data")
+	}
+
 	// First check if user exists in our system
 	var userID string
 	err := h.pgPool.QueryRow(ctx,
@@ -185,16 +245,18 @@ func (h *WorkOSWebhookHandler) handleOrganizationMembershipCreated(ctx context.C
 
 	// If the role is 'doctor', update the doctor's active status
 	if data.Role.Slug == "doctor" && data.Status == "active" {
-		_, err := h.pgPool.Exec(ctx,
+		result, err := h.pgPool.Exec(ctx,
 			"UPDATE doctors SET is_active = true WHERE doctor_id = $1",
 			userID)
 		if err != nil {
 			return fmt.Errorf("failed to update doctor status: %w", err)
 		}
 
-		h.logger.Info("activated doctor account via organization membership",
+		rowsAffected := result.RowsAffected()
+		h.logger.Info("updated doctor active status",
 			zap.String("user_id", userID),
-			zap.String("auth_id", data.UserID))
+			zap.String("auth_id", data.UserID),
+			zap.Int64("rows_affected", rowsAffected))
 	}
 
 	// Store the organization membership ID in your database if needed
@@ -215,6 +277,17 @@ func (h *WorkOSWebhookHandler) handleOrganizationMembershipCreated(ctx context.C
 
 // handleOrganizationMembershipUpdated processes organization_membership.updated events
 func (h *WorkOSWebhookHandler) handleOrganizationMembershipUpdated(ctx context.Context, data OrganizationMembership) error {
+	// Validate data
+	if data.UserID == "" {
+		return errors.New("missing user_id in webhook data")
+	}
+	if data.OrganizationID == "" {
+		return errors.New("missing organization_id in webhook data")
+	}
+	if data.ID == "" {
+		return errors.New("missing membership ID in webhook data")
+	}
+
 	// First check if user exists in our system
 	var userID string
 	err := h.pgPool.QueryRow(ctx,
@@ -229,21 +302,23 @@ func (h *WorkOSWebhookHandler) handleOrganizationMembershipUpdated(ctx context.C
 	// If the role is 'doctor', update doctor status based on membership status
 	if data.Role.Slug == "doctor" {
 		isActive := data.Status == "active"
-		_, err := h.pgPool.Exec(ctx,
+		result, err := h.pgPool.Exec(ctx,
 			"UPDATE doctors SET is_active = $1 WHERE doctor_id = $2",
 			isActive, userID)
 		if err != nil {
 			return fmt.Errorf("failed to update doctor status: %w", err)
 		}
 
+		rowsAffected := result.RowsAffected()
 		h.logger.Info("updated doctor active status via organization membership",
 			zap.String("user_id", userID),
 			zap.String("auth_id", data.UserID),
-			zap.Bool("is_active", isActive))
+			zap.Bool("is_active", isActive),
+			zap.Int64("rows_affected", rowsAffected))
 	}
 
 	// Update the membership information in your database
-	_, err = h.pgPool.Exec(ctx,
+	result, err := h.pgPool.Exec(ctx,
 		`UPDATE user_organization_memberships 
 		SET role = $1, status = $2, membership_id = $3
 		WHERE user_id = $4 AND organization_id = $5`,
@@ -252,11 +327,25 @@ func (h *WorkOSWebhookHandler) handleOrganizationMembershipUpdated(ctx context.C
 		return fmt.Errorf("failed to update organization membership: %w", err)
 	}
 
+	rowsAffected := result.RowsAffected()
+	h.logger.Info("updated organization membership",
+		zap.String("user_id", userID),
+		zap.String("org_id", data.OrganizationID),
+		zap.Int64("rows_affected", rowsAffected))
+
 	return nil
 }
 
 // handleOrganizationMembershipDeleted processes organization_membership.deleted events
 func (h *WorkOSWebhookHandler) handleOrganizationMembershipDeleted(ctx context.Context, data OrganizationMembership) error {
+	// Validate data
+	if data.UserID == "" {
+		return errors.New("missing user_id in webhook data")
+	}
+	if data.OrganizationID == "" {
+		return errors.New("missing organization_id in webhook data")
+	}
+
 	// First check if user exists in our system
 	var userID string
 	err := h.pgPool.QueryRow(ctx,
@@ -270,26 +359,34 @@ func (h *WorkOSWebhookHandler) handleOrganizationMembershipDeleted(ctx context.C
 
 	// If the role was 'doctor', set their active status to false
 	if data.Role.Slug == "doctor" {
-		_, err := h.pgPool.Exec(ctx,
+		result, err := h.pgPool.Exec(ctx,
 			"UPDATE doctors SET is_active = false WHERE doctor_id = $1",
 			userID)
 		if err != nil {
 			return fmt.Errorf("failed to deactivate doctor: %w", err)
 		}
 
+		rowsAffected := result.RowsAffected()
 		h.logger.Info("deactivated doctor account via organization membership deletion",
 			zap.String("user_id", userID),
-			zap.String("auth_id", data.UserID))
+			zap.String("auth_id", data.UserID),
+			zap.Int64("rows_affected", rowsAffected))
 	}
 
 	// Remove the membership from your database
-	_, err = h.pgPool.Exec(ctx,
+	result, err := h.pgPool.Exec(ctx,
 		`DELETE FROM user_organization_memberships 
 		WHERE user_id = $1 AND organization_id = $2`,
 		userID, data.OrganizationID)
 	if err != nil {
 		return fmt.Errorf("failed to delete organization membership: %w", err)
 	}
+
+	rowsAffected := result.RowsAffected()
+	h.logger.Info("deleted organization membership",
+		zap.String("user_id", userID),
+		zap.String("org_id", data.OrganizationID),
+		zap.Int64("rows_affected", rowsAffected))
 
 	return nil
 }
