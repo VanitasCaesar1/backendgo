@@ -468,8 +468,8 @@ func (a *App) setupRoutes() error {
 	appointmentsGroup.Put("/:id", appointmentHandler.UpdateAppointment)
 	appointmentsGroup.Delete("/:id", appointmentHandler.DeleteAppointment)
 
-	patientsGroup := a.Fiber.Group("/api/patients", authMiddleware.Handler(), appointmentHandler.GetAllPatients)
-	patientsGroup.Get("/search", appointmentHandler.SearchPatients)
+	patientsGroup := a.Fiber.Group("/api/patients", authMiddleware.Handler())
+	patientsGroup.Get("/", appointmentHandler.GetAllPatients) // Add this line for listing all patients
 	patientsGroup.Post("/create", appointmentHandler.CreatePatient)
 	patientsGroup.Get("/:id", appointmentHandler.GetPatient)
 	patientsGroup.Put("/:id", appointmentHandler.UpdatePatient)

@@ -73,13 +73,6 @@ type HospitalVisit struct {
 	Diagnosis  string    `json:"diagnosis" bson:"diagnosis"`
 }
 
-type Insurance struct {
-	Provider     string    `json:"provider" bson:"provider"`
-	PolicyNumber string    `json:"policy_number" bson:"policy_number"`
-	ValidUntil   time.Time `json:"valid_until" bson:"valid_until"`
-	Coverage     float64   `json:"coverage" bson:"coverage"`
-}
-
 // You may need to update your DoctorSearchResult struct to match the fields we're now retrieving
 type DoctorSearchResult struct {
 	DoctorID      uuid.UUID `json:"doctor_id"`
@@ -93,8 +86,6 @@ type DoctorSearchResult struct {
 	IsActive      bool      `json:"is_active"`
 }
 
-// Patient represents the MongoDB patient document structure
-
 type Medical struct {
 	Condition     string    `json:"condition" bson:"condition"`
 	DiagnosedDate time.Time `json:"diagnosed_date" bson:"diagnosed_date"`
@@ -104,7 +95,14 @@ type Medical struct {
 type Contact struct {
 	Name         string `json:"name" bson:"name"`
 	Relationship string `json:"relationship,omitempty" bson:"relationship,omitempty"`
-	Phone        string `json:"phone,omitempty" bson:"phone,omitempty"`
+	Phone        string `json:"phone" bson:"phone"`
+}
+
+type Insurance struct {
+	Provider        string    `json:"provider" bson:"provider"`
+	PolicyNumber    string    `json:"policy_number,omitempty" bson:"policy_number,omitempty"`
+	ExpiryDate      time.Time `json:"expiry_date,omitempty" bson:"expiry_date,omitempty"`
+	CoverageDetails string    `json:"coverage_details,omitempty" bson:"coverage_details,omitempty"`
 }
 
 type Visit struct {
@@ -118,8 +116,8 @@ type Patient struct {
 	PatientID        string     `json:"patient_id" bson:"patient_id"`
 	Name             string     `json:"name" bson:"name"`
 	Email            string     `json:"email" bson:"email"`
-	Gender           string     `json:"gender" bson:"gender"`
 	Mobile           string     `json:"mobile" bson:"mobile"`
+	Gender           string     `json:"gender,omitempty" bson:"gender,omitempty"`
 	Age              int        `json:"age,omitempty" bson:"age,omitempty"`
 	BloodGroup       string     `json:"blood_group,omitempty" bson:"blood_group,omitempty"`
 	Address          string     `json:"address,omitempty" bson:"address,omitempty"`
@@ -127,9 +125,9 @@ type Patient struct {
 	MedicalHistory   []Medical  `json:"medical_history,omitempty" bson:"medical_history,omitempty"`
 	Allergies        []string   `json:"allergies,omitempty" bson:"allergies,omitempty"`
 	EmergencyContact *Contact   `json:"emergency_contact,omitempty" bson:"emergency_contact,omitempty"`
-	AuthID           string     `json:"auth_id" bson:"auth_id"`
-	HospitalVisits   []Visit    `json:"hospital_visits,omitempty" bson:"hospital_visits,omitempty"`
 	Insurance        *Insurance `json:"insurance,omitempty" bson:"insurance,omitempty"`
+	HospitalVisits   []Visit    `json:"hospital_visits,omitempty" bson:"hospital_visits,omitempty"`
+	AuthID           string     `json:"auth_id" bson:"auth_id"`
 	CreatedAt        time.Time  `json:"created_at" bson:"created_at"`
 	UpdatedAt        time.Time  `json:"updated_at" bson:"updated_at"`
 }
@@ -1221,6 +1219,7 @@ func (h *AppointmentHandler) CreatePatient(c *fiber.Ctx) error {
 		h.logger.Error("failed to get user ID", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
+
 	fmt.Println(userID)
 	// Parse patient data from request body
 	var patientRequest struct {
@@ -1241,8 +1240,14 @@ func (h *AppointmentHandler) CreatePatient(c *fiber.Ctx) error {
 
 	if err := c.BodyParser(&patientRequest); err != nil {
 		h.logger.Error("failed to parse patient data", zap.Error(err))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid patient data"})
+		// Log the request body for debugging
+		h.logger.Debug("request body", zap.String("body", string(c.Body())))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid patient data: " + err.Error()})
 	}
+
+	// Log the parsed request for debugging
+	requestJSON, _ := json.Marshal(patientRequest)
+	h.logger.Debug("parsed patient request", zap.String("request", string(requestJSON)))
 
 	// Validate required fields based on schema
 	if patientRequest.Name == "" || patientRequest.Email == "" || patientRequest.Mobile == "" {
@@ -1278,7 +1283,7 @@ func (h *AppointmentHandler) CreatePatient(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to generate patient ID"})
 	}
 
-	// Create patient document
+	// Create patient document with proper bson field names
 	patient := Patient{
 		PatientID:        patientID,
 		Name:             patientRequest.Name,
@@ -1299,13 +1304,49 @@ func (h *AppointmentHandler) CreatePatient(c *fiber.Ctx) error {
 		UpdatedAt:        time.Now(),
 	}
 
+	// Convert to BSON document to ensure proper field names
+	patientBSON, err := bson.Marshal(patient)
+	if err != nil {
+		h.logger.Error("failed to convert patient to BSON", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process patient data"})
+	}
+
+	var patientDoc bson.D
+	if err := bson.Unmarshal(patientBSON, &patientDoc); err != nil {
+		h.logger.Error("failed to unmarshal patient BSON", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process patient data"})
+	}
+
 	// Insert patient into MongoDB
 	patientsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("patients")
-	_, err = patientsCollection.InsertOne(c.Context(), patient)
+
+	// First, do the insertion
+	result, err := patientsCollection.InsertOne(c.Context(), patientDoc)
 	if err != nil {
+		// Log detailed error
 		h.logger.Error("failed to insert patient", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create patient"})
+
+		// Convert patient to JSON for debugging
+		patientJSON, _ := json.Marshal(patient)
+		h.logger.Debug("patient data being inserted", zap.String("patient_json", string(patientJSON)))
+
+		// Get validation errors if available
+		if cmdErr, ok := err.(mongo.CommandError); ok {
+			h.logger.Error("MongoDB command error", zap.String("error_name", cmdErr.Name), zap.String("error_message", cmdErr.Message))
+		}
+
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create patient: " + err.Error()})
 	}
+
+	// Then, optionally verify the insertion if needed
+	var insertedPatient Patient
+	findErr := patientsCollection.FindOne(c.Context(), bson.M{"patient_id": patientID}).Decode(&insertedPatient)
+	if findErr != nil {
+		h.logger.Error("verification failed - patient not found after insertion", zap.Error(findErr), zap.String("patient_id", patientID))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Patient creation verification failed"})
+	}
+
+	h.logger.Info("patient created successfully", zap.String("patient_id", patientID), zap.Any("mongo_id", result.InsertedID))
 
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"message": "Patient created successfully",
