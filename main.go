@@ -226,13 +226,30 @@ func NewApp() (*App, error) {
 	fiberApp := fiber.New(fiber.Config{
 		ErrorHandler: func(c *fiber.Ctx, err error) error {
 			code := fiber.StatusInternalServerError
+
+			// Make sure to handle nil errors gracefully
+			if err == nil {
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+					"error": "Unknown server error",
+				})
+			}
+
+			// Extract status code if it's a Fiber error
 			if e, ok := err.(*fiber.Error); ok {
 				code = e.Code
 			}
-			logger.Error("request error",
-				zap.Error(err),
-				zap.String("path", c.Path()),
-				zap.Int("status", code))
+
+			// Safe logging that handles potential nil values
+			if logger != nil {
+				logger.Error("request error",
+					zap.Error(err),
+					zap.String("path", c.Path()),
+					zap.Int("status", code))
+			} else {
+				// Fallback logging if logger is not available
+				log.Printf("ERROR: %v, Path: %s, Status: %d", err, c.Path(), code)
+			}
+
 			return c.Status(code).JSON(fiber.Map{
 				"error": err.Error(),
 			})
@@ -384,8 +401,14 @@ func (a *App) setupRoutes() error {
 
 	workosWebhookHandler, err := handlers.NewWorkOSWebhookHandler(a.Config, a.Redis, a.Logger, a.Postgres)
 	if err != nil {
-		return fmt.Errorf("failed to initialize WorkOS webhook handler: %v", err)
+		a.Logger.Error("failed to initialize WorkOS webhook handler", zap.Error(err))
+		return fmt.Errorf("failed to initialize WorkOS webhook handler: %w", err)
 	}
+
+	// Only register the webhook route if the handler was successfully initialized
+	webhooksGroup := a.Fiber.Group("/api/webhooks")
+	webhooksGroup.Post("/workos", workosWebhookHandler.HandleWorkOSWebhook)
+
 	// Health check route - publicly accessible
 	a.Fiber.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
@@ -478,9 +501,6 @@ func (a *App) setupRoutes() error {
 	patientsGroup.Get("/:id", appointmentHandler.GetPatient)
 	patientsGroup.Put("/:id", appointmentHandler.UpdatePatient)
 	patientsGroup.Delete("/:id", appointmentHandler.DeletePatient)
-
-	webhooksGroup := a.Fiber.Group("/api/webhooks")
-	webhooksGroup.Post("/workos", workosWebhookHandler.HandleWorkOSWebhook)
 
 	// Additional protected API routes from the middleware file
 	a.Fiber.Use("/api/protected/*", authMiddleware.Handler())
