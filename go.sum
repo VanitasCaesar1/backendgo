@@ -118,6 +118,8 @@ github.com/workos/workos-go/v3 v3.2.0 h1:U+PfTR/cHmJo4BbkGI7rISU7xU5DgUSAi/+/2oq
 github.com/workos/workos-go/v3 v3.2.0/go.mod h1:SUdYqICB2LG2G2UMMNI2EcBYX9OdpzgpNYlW6k0JML4=
 github.com/workos/workos-go/v4 v4.30.0 h1:QNVCohqzKcDy/Q/aDrmwu0fZDn1gTFdH74HWzzsvERc=
 github.com/workos/workos-go/v4 v4.30.0/go.mod h1:CwpXdAWhIE3SxV49qBVeYqWV8ojv0A0L9nM1xnho4/c=
+github.com/workos/workos-go/v4 v4.33.0 h1:6dQvjd4WUYBSAUvCP7QLC7VYDX+ehAzSMg/TgjxRrQA=
+github.com/workos/workos-go/v4 v4.33.0/go.mod h1:CwpXdAWhIE3SxV49qBVeYqWV8ojv0A0L9nM1xnho4/c=
 github.com/xdg-go/pbkdf2 v1.0.0 h1:Su7DPu48wXMwC3bs7MCNG+z4FhcyEuz5dlvchbq0B0c=
 github.com/xdg-go/pbkdf2 v1.0.0/go.mod h1:jrpuAogTd400dnrH08LKmI/xc1MbPOebTwRqcT5RDeI=
 github.com/xdg-go/scram v1.1.2 h1:FHX5I5B4i4hKRVRBCFRxq1iQRej7WO3hhBuJf+UUySY=

@@ -38,6 +38,7 @@ type Config struct {
 	WorkOSPortal           string
 	WorkOSUserManagement   string
 	WorkOSJWKSURL          string
+	WorkOSWebhookSecret    string
 	SessionDuration        string
 	CookieEncryptionKey    string
 	JwtSecret              string
@@ -109,6 +110,7 @@ func LoadConfig() (*Config, error) {
 		WorkOSPortal:           os.Getenv("WORKOS_PORTAL"),
 		WorkOSUserManagement:   os.Getenv("WORKOS_USER_M_KEY"),
 		WorkOSJWKSURL:          os.Getenv("WORKOS_JWKS_URL"),
+		WorkOSWebhookSecret:    os.Getenv("WORKOS_WEBHOOKS_KEY"),
 		SessionDuration:        getEnvWithDefault("SESSION_DURATION", "12"),
 		CookieEncryptionKey:    os.Getenv("COOKIE_ENCRYPTION_KEY"),
 		JwtSecret:              os.Getenv("JWT_SECRET"),

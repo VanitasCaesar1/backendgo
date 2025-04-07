@@ -13,7 +13,7 @@ require (
 	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646
 	github.com/pkg/errors v0.9.1
 	github.com/redis/go-redis/v9 v9.7.0
-	github.com/workos/workos-go/v4 v4.30.0
+	github.com/workos/workos-go/v4 v4.33.0
 	go.uber.org/zap v1.27.0
 )
 

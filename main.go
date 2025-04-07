@@ -382,6 +382,8 @@ func (a *App) setupRoutes() error {
 		return fmt.Errorf("failed to initialize appointment handler: %v", err)
 	}
 
+	workosWebhookHandler := handlers.NewWorkOSWebhookHandler(a.Config, a.Redis, a.Logger, a.Postgres)
+
 	// Health check route - publicly accessible
 	a.Fiber.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
@@ -474,6 +476,10 @@ func (a *App) setupRoutes() error {
 	patientsGroup.Get("/:id", appointmentHandler.GetPatient)
 	patientsGroup.Put("/:id", appointmentHandler.UpdatePatient)
 	patientsGroup.Delete("/:id", appointmentHandler.DeletePatient)
+
+	webhooksGroup := a.Fiber.Group("/api/webhooks")
+	webhooksGroup.Post("/workos", workosWebhookHandler.HandleWorkOSWebhook)
+
 	// Additional protected API routes from the middleware file
 	a.Fiber.Use("/api/protected/*", authMiddleware.Handler())
 	a.Fiber.Use("/api/user/*", authMiddleware.Handler())
