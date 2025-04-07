@@ -399,16 +399,18 @@ func (a *App) setupRoutes() error {
 		return fmt.Errorf("failed to initialize appointment handler: %v", err)
 	}
 
+	// In main.go, replace lines ~241-248 with this:
 	workosWebhookHandler, err := handlers.NewWorkOSWebhookHandler(a.Config, a.Redis, a.Logger, a.Postgres)
 	if err != nil {
 		a.Logger.Error("failed to initialize WorkOS webhook handler", zap.Error(err))
-		return fmt.Errorf("failed to initialize WorkOS webhook handler: %w", err)
+		// Don't return error - instead, proceed without registering this route
+		a.Logger.Warn("WorkOS webhook handler will not be available", zap.Error(err))
+	} else {
+		// Only register the webhook route if the handler was successfully initialized
+		webhooksGroup := a.Fiber.Group("/api/webhooks")
+		webhooksGroup.Post("/workos", workosWebhookHandler.HandleWorkOSWebhook)
+		a.Logger.Info("registered WorkOS webhook handler")
 	}
-
-	// Only register the webhook route if the handler was successfully initialized
-	webhooksGroup := a.Fiber.Group("/api/webhooks")
-	webhooksGroup.Post("/workos", workosWebhookHandler.HandleWorkOSWebhook)
-
 	// Health check route - publicly accessible
 	a.Fiber.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
