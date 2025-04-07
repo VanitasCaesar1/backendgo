@@ -382,8 +382,10 @@ func (a *App) setupRoutes() error {
 		return fmt.Errorf("failed to initialize appointment handler: %v", err)
 	}
 
-	workosWebhookHandler := handlers.NewWorkOSWebhookHandler(a.Config, a.Redis, a.Logger, a.Postgres)
-
+	workosWebhookHandler, err := handlers.NewWorkOSWebhookHandler(a.Config, a.Redis, a.Logger, a.Postgres)
+	if err != nil {
+		return fmt.Errorf("failed to initialize WorkOS webhook handler: %v", err)
+	}
 	// Health check route - publicly accessible
 	a.Fiber.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{

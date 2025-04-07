@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 
@@ -46,17 +47,48 @@ type Role struct {
 	Slug string `json:"slug"`
 }
 
-func NewWorkOSWebhookHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, pgPool *pgxpool.Pool) *WorkOSWebhookHandler {
+// NewWorkOSWebhookHandler initializes a new WorkOS webhook handler with validation
+func NewWorkOSWebhookHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, pgPool *pgxpool.Pool) (*WorkOSWebhookHandler, error) {
+	// Validate that none of the dependencies are nil
+	if cfg == nil {
+		return nil, errors.New("config cannot be nil")
+	}
+	if rds == nil {
+		return nil, errors.New("redis client cannot be nil")
+	}
+	if logger == nil {
+		return nil, errors.New("logger cannot be nil")
+	}
+	if pgPool == nil {
+		return nil, errors.New("postgres pool cannot be nil")
+	}
+
+	// Validate that WorkOS webhook secret is set
+	if cfg.WorkOSWebhookSecret == "" {
+		return nil, errors.New("WorkOS webhook secret is not configured")
+	}
+
 	return &WorkOSWebhookHandler{
 		config:      cfg,
 		redisClient: rds,
 		logger:      logger,
 		pgPool:      pgPool,
-	}
+	}, nil
 }
 
 // HandleWorkOSWebhook processes incoming WorkOS webhooks
 func (h *WorkOSWebhookHandler) HandleWorkOSWebhook(c *fiber.Ctx) error {
+	// Safety check to ensure handler was properly initialized
+	if h == nil || h.config == nil || h.logger == nil || h.pgPool == nil {
+		// If somehow the handler got called with nil fields, log if possible and return error
+		if h != nil && h.logger != nil {
+			h.logger.Error("webhook handler not properly initialized")
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Server configuration error",
+		})
+	}
+
 	// Get the signature from the header
 	signature := c.Get("WorkOS-Signature")
 	if signature == "" {
@@ -75,7 +107,15 @@ func (h *WorkOSWebhookHandler) HandleWorkOSWebhook(c *fiber.Ctx) error {
 		})
 	}
 
-	// Verify the webhook using the new method
+	// Validate webhook secret
+	if h.config.WorkOSWebhookSecret == "" {
+		h.logger.Error("WorkOS webhook secret not configured")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Server misconfiguration",
+		})
+	}
+
+	// Verify the webhook using the WorkOS client
 	webhookClient := webhooks.NewClient(h.config.WorkOSWebhookSecret)
 	_, err = webhookClient.ValidatePayload(signature, string(body))
 	if err != nil {
