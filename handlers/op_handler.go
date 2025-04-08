@@ -1351,7 +1351,7 @@ func (h *AppointmentHandler) CreatePatient(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"message": "Patient created successfully",
 		"patient": patient,
-	})
+	})	
 }
 
 // Helper function to generate a unique 8-digit alphanumeric patient ID

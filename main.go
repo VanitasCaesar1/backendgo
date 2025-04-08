@@ -259,9 +259,9 @@ func NewApp() (*App, error) {
 			}
 
 			// Return response safely
-			message := err.Error()
-			if message == "" {
-				message = "Internal server error"
+			message := "Internal server error"
+			if err != nil {
+				message = err.Error()
 			}
 
 			return c.Status(code).JSON(fiber.Map{
@@ -412,31 +412,16 @@ func (a *App) setupRoutes() error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize appointment handler: %v", err)
 	}
-	// Replace the webhook handler registration with this:
+
 	workosWebhookHandler, err := handlers.NewWorkOSWebhookHandler(a.Config, a.Redis, a.Logger, a.Postgres)
 	if err != nil {
 		a.Logger.Error("failed to initialize WorkOS webhook handler", zap.Error(err))
-		// Create a safe default handler that returns an error when called
-		webhooksGroup := a.Fiber.Group("/api/webhooks")
-		webhooksGroup.Post("/workos", func(c *fiber.Ctx) error {
-			a.Logger.Error("webhook endpoint called but handler not initialized")
-			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-				"error": "Webhook service unavailable",
-			})
-		})
+		// Don't return error - instead, proceed without registering this route
+		a.Logger.Warn("WorkOS webhook handler will not be available", zap.Error(err))
 	} else {
 		// Only register the webhook route if the handler was successfully initialized
 		webhooksGroup := a.Fiber.Group("/api/webhooks")
-		webhooksGroup.Post("/workos", func(c *fiber.Ctx) error {
-			// Extra safety check
-			if workosWebhookHandler == nil {
-				a.Logger.Error("webhook handler is nil when endpoint was called")
-				return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{
-					"error": "Webhook service unavailable",
-				})
-			}
-			return workosWebhookHandler.HandleWorkOSWebhook(c)
-		})
+		webhooksGroup.Post("/workos", workosWebhookHandler.HandleWorkOSWebhook)
 		a.Logger.Info("registered WorkOS webhook handler")
 	}
 	// Health check route - publicly accessible
