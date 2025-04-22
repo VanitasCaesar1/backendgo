@@ -212,10 +212,12 @@ func NewApp() (*App, error) {
 
 		// Create bucket if it doesn't exist
 		err = minioClient.MakeBucket(ctx, bucket, minio.MakeBucketOptions{})
-		if err != nil && !strings.Contains(err.Error(), "already exists") {
-			logger.Error("failed to create bucket",
-				zap.String("bucket", bucket),
-				zap.Error(err))
+		if err != nil {
+			if !strings.Contains(err.Error(), "already exists") {
+				logger.Error("failed to create bucket",
+					zap.String("bucket", bucket),
+					zap.Error(err))
+			}
 		} else {
 			logger.Info("bucket created",
 				zap.String("bucket", bucket))
@@ -260,9 +262,6 @@ func NewApp() (*App, error) {
 
 			// Return response safely
 			message := "Internal server error"
-			if err != nil {
-				message = err.Error()
-			}
 
 			return c.Status(code).JSON(fiber.Map{
 				"error": message,
@@ -513,9 +512,9 @@ func (a *App) setupRoutes() error {
 	patientsGroup := a.Fiber.Group("/api/patients", authMiddleware.Handler())
 	patientsGroup.Get("/", appointmentHandler.GetAllPatients) // Add this line for listing all patients
 	patientsGroup.Post("/create", appointmentHandler.CreatePatient)
-	patientsGroup.Get("/:id", appointmentHandler.GetPatient)
-	patientsGroup.Put("/:id", appointmentHandler.UpdatePatient)
-	patientsGroup.Delete("/:id", appointmentHandler.DeletePatient)
+	patientsGroup.Get("/:id", appointmentHandler.PatientHandler)
+	patientsGroup.Put("/:id", appointmentHandler.PatientHandler)
+	patientsGroup.Post("/:id", appointmentHandler.PatientHandler)
 
 	// Additional protected API routes from the middleware file
 	a.Fiber.Use("/api/protected/*", authMiddleware.Handler())

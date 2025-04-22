@@ -1351,7 +1351,7 @@ func (h *AppointmentHandler) CreatePatient(c *fiber.Ctx) error {
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"message": "Patient created successfully",
 		"patient": patient,
-	})	
+	})
 }
 
 // Helper function to generate a unique 8-digit alphanumeric patient ID
@@ -1382,7 +1382,6 @@ func (h *AppointmentHandler) generateUniquePatientID(ctx context.Context) (strin
 	return "", errors.New("failed to generate unique patient ID after multiple attempts")
 }
 
-// GetPatient retrieves a patient record by ID
 func (h *AppointmentHandler) GetPatient(c *fiber.Ctx) error {
 	// Get patient ID from URL parameter
 	patientID := c.Params("id")
@@ -1391,40 +1390,223 @@ func (h *AppointmentHandler) GetPatient(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Patient ID is required"})
 	}
 
-	// Get auth ID from context
-	authID, err := h.getAuthID(c)
-	if err != nil {
-		h.logger.Error("authID not found in context")
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
-	}
-
-	// Get user ID
-	userID, err := h.getUserID(c.Context(), authID)
-	if err != nil {
-		h.logger.Error("failed to get user ID", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
-	}
+	h.logger.Info("fetching patient", zap.String("patientID", patientID))
 
 	// Access patients collection
-	patientsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("patients")
+	dbName := h.config.MongoDBName
+	collectionName := "patients"
+	patientsCollection := h.mongoClient.Database(dbName).Collection(collectionName)
 
-	// Find patient document
+	// Log the database and collection being queried
+	h.logger.Debug("accessing database collection",
+		zap.String("database", dbName),
+		zap.String("collection", collectionName))
+
+	// Create filter
+	filter := bson.M{"patient_id": patientID}
+	h.logger.Debug("query filter", zap.Any("filter", filter))
+
+	// Try to find the patient
 	var patient Patient
-	filter := bson.M{"patient_id": patientID, "user_id": userID.String()}
-	err = patientsCollection.FindOne(c.Context(), filter).Decode(&patient)
+	h.logger.Debug("executing database query")
+
+	// Execute the query with a timeout context
+	ctx, cancel := context.WithTimeout(c.Context(), 5*time.Second)
+	defer cancel()
+
+	err := patientsCollection.FindOne(ctx, filter).Decode(&patient)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
-			h.logger.Error("patient not found", zap.String("patientID", patientID))
-			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Patient not found"})
+			h.logger.Error("patient not found",
+				zap.String("patientID", patientID),
+				zap.String("errorType", "document_not_found"))
+
+			// Check if any patients exist in the collection
+			count, countErr := patientsCollection.CountDocuments(ctx, bson.M{})
+			if countErr == nil {
+				h.logger.Info("total patients in collection", zap.Int64("count", count))
+			} else {
+				h.logger.Error("failed to count documents", zap.Error(countErr))
+			}
+
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"error": "Patient not found",
+				"id":    patientID,
+			})
 		}
-		h.logger.Error("failed to fetch patient", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch patient"})
+
+		h.logger.Error("failed to fetch patient",
+			zap.String("patientID", patientID),
+			zap.Error(err),
+			zap.String("errorType", "database_error"))
+
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to fetch patient",
+		})
 	}
+
+	h.logger.Info("patient retrieved successfully",
+		zap.String("patientID", patientID),
+		zap.String("name", patient.Name))
 
 	return c.Status(fiber.StatusOK).JSON(fiber.Map{
 		"message": "Patient retrieved successfully",
 		"patient": patient,
 	})
+}
+
+func (h *AppointmentHandler) PatientHandler(c *fiber.Ctx) error {
+	// Get patient ID from URL parameter
+	patientID := c.Params("id")
+	if patientID == "" {
+		h.logger.Error("patient ID is required")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Patient ID is required"})
+	}
+
+	// Access patients collection
+	patientsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("patients")
+
+	// Handle different HTTP methods
+	switch c.Method() {
+	case "GET":
+		// Find patient document using only patient_id for retrieval
+		var patient Patient
+		filter := bson.M{"patient_id": patientID}
+		err := patientsCollection.FindOne(c.Context(), filter).Decode(&patient)
+		if err != nil {
+			if err == mongo.ErrNoDocuments {
+				h.logger.Error("patient not found", zap.String("patientID", patientID))
+				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Patient not found"})
+			}
+			h.logger.Error("failed to fetch patient", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch patient"})
+		}
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"message": "Patient retrieved successfully",
+			"patient": patient,
+		})
+
+	case "PUT":
+		// Parse the update data
+		var updateData map[string]interface{}
+		if err := c.BodyParser(&updateData); err != nil {
+			h.logger.Error("failed to parse request body", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
+		}
+
+		// Add updated_at timestamp
+		updateData["updated_at"] = time.Now()
+
+		// Remove any user_id if it exists in updateData
+		delete(updateData, "user_id")
+
+		// Create update document
+		update := bson.M{"$set": updateData}
+
+		// Update the patient using only the patient_id
+		filter := bson.M{"patient_id": patientID}
+		result, err := patientsCollection.UpdateOne(c.Context(), filter, update)
+		if err != nil {
+			h.logger.Error("failed to update patient", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update patient"})
+		}
+		if result.MatchedCount == 0 {
+			// If no document was found, try to insert a new one with this ID
+			updateData["patient_id"] = patientID
+			updateData["created_at"] = time.Now()
+
+			_, err := patientsCollection.InsertOne(c.Context(), updateData)
+			if err != nil {
+				h.logger.Error("failed to create patient on update", zap.Error(err))
+				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Patient not found and failed to create"})
+			}
+
+			return c.Status(fiber.StatusOK).JSON(fiber.Map{
+				"message":    "Patient created successfully",
+				"patient_id": patientID,
+			})
+		}
+
+		// Get updated patient data
+		var updatedPatient Patient
+		err = patientsCollection.FindOne(c.Context(), filter).Decode(&updatedPatient)
+		if err != nil {
+			h.logger.Error("failed to fetch updated patient", zap.Error(err))
+			// Still return success since update was successful
+			return c.Status(fiber.StatusOK).JSON(fiber.Map{
+				"message": "Patient updated successfully",
+			})
+		}
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"message": "Patient updated successfully",
+			"patient": updatedPatient,
+		})
+
+	case "POST":
+		// Parse the patient data
+		var patientData map[string]interface{}
+		if err := c.BodyParser(&patientData); err != nil {
+			h.logger.Error("failed to parse request body", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request body"})
+		}
+
+		// Remove any user_id if it exists in patientData
+		delete(patientData, "user_id")
+
+		// Ensure the patient_id in the body matches the URL parameter
+		patientData["patient_id"] = patientID
+		patientData["created_at"] = time.Now()
+		patientData["updated_at"] = time.Now()
+
+		// Check if patient already exists
+		var existingPatient Patient
+		filter := bson.M{"patient_id": patientID}
+		err := patientsCollection.FindOne(c.Context(), filter).Decode(&existingPatient)
+		if err == nil {
+			// Patient already exists, update instead
+			update := bson.M{"$set": patientData}
+			_, err = patientsCollection.UpdateOne(c.Context(), filter, update)
+			if err != nil {
+				h.logger.Error("failed to update existing patient", zap.Error(err))
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update existing patient"})
+			}
+			return c.Status(fiber.StatusOK).JSON(fiber.Map{
+				"message":    "Patient updated successfully",
+				"patient_id": patientID,
+			})
+		}
+
+		// Insert new patient
+		_, err = patientsCollection.InsertOne(c.Context(), patientData)
+		if err != nil {
+			h.logger.Error("failed to create patient", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create patient"})
+		}
+
+		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+			"message":    "Patient created successfully",
+			"patient_id": patientID,
+		})
+
+	case "DELETE":
+		// Delete patient using only patient_id
+		filter := bson.M{"patient_id": patientID}
+		result, err := patientsCollection.DeleteOne(c.Context(), filter)
+		if err != nil {
+			h.logger.Error("failed to delete patient", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to delete patient"})
+		}
+		if result.DeletedCount == 0 {
+			h.logger.Error("patient not found for deletion", zap.String("patientID", patientID))
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Patient not found"})
+		}
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"message": "Patient deleted successfully",
+		})
+
+	default:
+		return c.Status(fiber.StatusMethodNotAllowed).JSON(fiber.Map{"error": "Method not allowed"})
+	}
 }
 
 func (h *AppointmentHandler) GetAllPatients(c *fiber.Ctx) error {
