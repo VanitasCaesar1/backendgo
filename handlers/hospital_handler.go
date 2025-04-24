@@ -398,6 +398,7 @@ func (h *HospitalHandler) GetHospitalImages(c *fiber.Ctx) error {
 }
 
 // CreateHospital function to handle hospital creation with MongoDB for images
+// CreateHospital function to handle hospital creation with MongoDB for images
 func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 	// Check for Admin role in X-Role header
 	roleHeader := c.Get("X-Role")
@@ -459,7 +460,17 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
-	// Create a WorkOS organization for the hospital
+	// Pre-generate hospital ID
+	hospitalID := uuid.New()
+
+	// Start a transaction for PostgreSQL operations
+	tx, err := h.pgPool.Begin(c.Context())
+	if err != nil {
+		h.logger.Error("failed to begin transaction", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+	defer tx.Rollback(c.Context())
+
 	// Create a WorkOS organization for the hospital
 	org, err := organizations.CreateOrganization(
 		c.Context(),
@@ -474,41 +485,34 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 			},
 			IdempotencyKey:                   uuid.New().String(), // Add idempotency key
 			AllowProfilesOutsideOrganization: false,
-			ExternalID:                       uuid.New().String(), // Use a unique external ID
+			ExternalID:                       hospitalID.String(),
 			Metadata: map[string]string{
-				"hospital_id": hospitalData.ID.String(),
 				"admin_id":    userID.String(),
+				"hospital_id": hospitalID.String(),
+				"location":    hospitalData.Location,
+				"name":        hospitalData.Name,
+				"email":       hospitalData.Email,
+				"speciality":  hospitalData.Speciality,
 			},
 		},
 	)
 	if err != nil {
 		h.logger.Error("failed to create WorkOS organization", zap.Error(err))
-
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to create organization for hospital",
 		})
 	}
 
-	// Start a transaction for PostgreSQL operations
-	tx, err := h.pgPool.Begin(c.Context())
-	if err != nil {
-		h.logger.Error("failed to begin transaction", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
-	}
-	defer tx.Rollback(c.Context())
-
-	// Insert hospital data into PostgreSQL (without hospital_pics field)
-	var hospitalID string
-	err = tx.QueryRow(c.Context(),
+	// Insert hospital data into PostgreSQL with the pre-generated ID
+	_, err = tx.Exec(c.Context(),
 		`INSERT INTO hospitals (
-			admin_id, org_id, name, email, number, address, license_number,
+			hospital_id, admin_id, org_id, name, email, number, address, license_number,
 			start_time, end_time, location, speciality
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-		RETURNING hospital_id`,
-		userID, org.ID, hospitalData.Name, hospitalData.Email, hospitalData.Number, hospitalData.Address,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+		hospitalID, userID, org.ID, hospitalData.Name, hospitalData.Email, hospitalData.Number, hospitalData.Address,
 		hospitalData.LicenseNumber, hospitalData.StartTime, hospitalData.EndTime, hospitalData.Location,
 		hospitalData.Speciality,
-	).Scan(&hospitalID)
+	)
 
 	if err != nil {
 		h.logger.Error("failed to insert hospital data", zap.Error(err))
@@ -522,7 +526,7 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 	}
 
 	// Now upload hospital images and store references in MongoDB
-	filenames, err := h.UploadHospitalImages(c, hospitalID, org.ID)
+	filenames, err := h.UploadHospitalImages(c, hospitalID.String(), org.ID)
 	if err != nil {
 		h.logger.Error("failed to upload hospital images", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
@@ -536,7 +540,7 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 
 	// Add the image URLs to the response
 	hospitalData.HospitalPics = imageURLs
-	hospitalData.ID = uuid.MustParse(hospitalID)
+	hospitalData.ID = hospitalID
 
 	// Return the created hospital with its ID
 	return c.Status(fiber.StatusCreated).JSON(hospitalData)
