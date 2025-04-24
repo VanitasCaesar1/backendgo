@@ -460,14 +460,30 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 	}
 
 	// Create a WorkOS organization for the hospital
+	// Create a WorkOS organization for the hospital
 	org, err := organizations.CreateOrganization(
 		c.Context(),
 		organizations.CreateOrganizationOpts{
 			Name: hospitalData.Name,
+			// Add a domain based on the hospital name
+			DomainData: []organizations.OrganizationDomainData{
+				{
+					Domain: strings.ToLower(strings.ReplaceAll(hospitalData.Name, " ", "-")) + ".example.com",
+					State:  organizations.Pending,
+				},
+			},
+			IdempotencyKey:                   uuid.New().String(), // Add idempotency key
+			AllowProfilesOutsideOrganization: false,
+			ExternalID:                       uuid.New().String(), // Use a unique external ID
+			Metadata: map[string]string{
+				"hospital_id": hospitalData.ID.String(),
+				"admin_id":    userID.String(),
+			},
 		},
 	)
 	if err != nil {
 		h.logger.Error("failed to create WorkOS organization", zap.Error(err))
+
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to create organization for hospital",
 		})
