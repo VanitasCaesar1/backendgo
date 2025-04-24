@@ -22,6 +22,7 @@ import (
 	"github.com/nfnt/resize"
 	"github.com/redis/go-redis/v9"
 	"github.com/workos/workos-go/v4/pkg/organizations"
+	"github.com/workos/workos-go/v4/pkg/usermanagement"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.uber.org/zap"
@@ -398,7 +399,6 @@ func (h *HospitalHandler) GetHospitalImages(c *fiber.Ctx) error {
 }
 
 // CreateHospital function to handle hospital creation with MongoDB for images
-// CreateHospital function to handle hospital creation with MongoDB for images
 func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 	// Check for Admin role in X-Role header
 	roleHeader := c.Get("X-Role")
@@ -407,11 +407,12 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 	}
 	h.logger.Info("Role header", zap.String("role", roleHeader))
 
-	// Check if "Admin" is one of the roles (allows for multiple roles like "Admin,Doctor")
+	// Check if "admin" is one of the roles (allows for multiple roles like "Admin,Doctor")
+	// Fixed to make role check case-insensitive
 	roles := strings.Split(roleHeader, ",")
 	hasAdminRole := false
 	for _, role := range roles {
-		if strings.TrimSpace(role) == "admin" {
+		if strings.EqualFold(strings.TrimSpace(role), "admin") {
 			hasAdminRole = true
 			break
 		}
@@ -423,7 +424,7 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 	// Get the auth ID from context
 	authID, err := h.getAuthID(c)
 	if err != nil {
-		h.logger.Error("authID not found in context")
+		h.logger.Error("authID not found in context", zap.Error(err))
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
 	}
 
@@ -460,16 +461,37 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
-	// Pre-generate hospital ID
-	hospitalID := uuid.New()
-
 	// Start a transaction for PostgreSQL operations
 	tx, err := h.pgPool.Begin(c.Context())
 	if err != nil {
 		h.logger.Error("failed to begin transaction", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
-	defer tx.Rollback(c.Context())
+	defer func() {
+		if err != nil {
+			if rbErr := tx.Rollback(c.Context()); rbErr != nil {
+				h.logger.Error("failed to rollback transaction", zap.Error(rbErr))
+			}
+		}
+	}()
+
+	// Let PostgreSQL generate the UUID for us
+	var hospitalID uuid.UUID
+	err = tx.QueryRow(c.Context(),
+		`INSERT INTO hospitals (
+			admin_id, org_id, name, email, number, address, license_number,
+			start_time, end_time, location, speciality
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		RETURNING hospital_id`,
+		userID, "", hospitalData.Name, hospitalData.Email, hospitalData.Number, hospitalData.Address,
+		hospitalData.LicenseNumber, hospitalData.StartTime, hospitalData.EndTime, hospitalData.Location,
+		hospitalData.Speciality,
+	).Scan(&hospitalID)
+
+	if err != nil {
+		h.logger.Error("failed to insert hospital data", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create hospital"})
+	}
 
 	// Create a WorkOS organization for the hospital
 	org, err := organizations.CreateOrganization(
@@ -503,20 +525,35 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 		})
 	}
 
-	// Insert hospital data into PostgreSQL with the pre-generated ID
-	_, err = tx.Exec(c.Context(),
-		`INSERT INTO hospitals (
-			hospital_id, admin_id, org_id, name, email, number, address, license_number,
-			start_time, end_time, location, speciality
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-		hospitalID, userID, org.ID, hospitalData.Name, hospitalData.Email, hospitalData.Number, hospitalData.Address,
-		hospitalData.LicenseNumber, hospitalData.StartTime, hospitalData.EndTime, hospitalData.Location,
-		hospitalData.Speciality,
+	// Create the user in the WorkOS organization
+	userResponse, err := usermanagement.CreateOrganizationMembership(
+		c.Context(),
+		usermanagement.CreateOrganizationMembershipOpts{
+			OrganizationID: org.ID,
+			UserID:         authID, // Use the authID from context which is the WorkOS user ID
+			RoleSlug:       "admin",
+		},
 	)
-
 	if err != nil {
-		h.logger.Error("failed to insert hospital data", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create hospital"})
+		h.logger.Error("failed to create WorkOS organization membership", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to add user to organization",
+		})
+	}
+
+	// Log the success
+	h.logger.Info("created WorkOS organization membership",
+		zap.String("user_id", authID),
+		zap.String("org_id", org.ID),
+		zap.String("membership_id", userResponse.ID))
+
+	// Update the hospital with the WorkOS org ID
+	_, err = tx.Exec(c.Context(),
+		`UPDATE hospitals SET org_id = $1 WHERE hospital_id = $2`,
+		org.ID, hospitalID)
+	if err != nil {
+		h.logger.Error("failed to update hospital with org ID", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update hospital"})
 	}
 
 	// Commit the PostgreSQL transaction
@@ -525,11 +562,28 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
+	// Test MinIO connection before upload
+	if err := h.testMinioConnection(c.Context()); err != nil {
+		h.logger.Error("MinIO connection failed", zap.Error(err))
+		// Continue with the hospital creation but log the error
+		// Return the created hospital without images
+		hospitalData.ID = hospitalID
+		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+			"hospital": hospitalData,
+			"warning":  "Hospital created but image upload failed due to storage service issues",
+		})
+	}
+
 	// Now upload hospital images and store references in MongoDB
 	filenames, err := h.UploadHospitalImages(c, hospitalID.String(), org.ID)
 	if err != nil {
 		h.logger.Error("failed to upload hospital images", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		// If image upload fails, we should log it but not fail the entire operation
+		// since the hospital record is already created
+		hospitalData.ID = hospitalID
+		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+			"hospital": hospitalData,
+			"warning":  "Hospital created but image upload failed"})
 	}
 
 	// For the response, construct full URLs from the filenames
