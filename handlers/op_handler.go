@@ -153,19 +153,21 @@ type AppointmentRequest struct {
 	FeeType         string    `json:"fee_type"`
 	AppointmentFee  int       `json:"appointment_fee"`
 }
+
 type Appointment struct {
 	PatientID         string    `json:"patient_id" bson:"patient_id"`
 	DoctorID          string    `json:"doctor_id" bson:"doctor_id"`
-	HospitalID        string    `json:"hospital_id" bson:"hospital_id"`
+	OrgID             string    `json:"org_id" bson:"org_id"`
 	PatientName       string    `json:"patient_name" bson:"patient_name"`
 	DoctorName        string    `json:"doctor_name" bson:"doctor_name"`
 	AppointmentStatus string    `json:"appointment_status" bson:"appointment_status"`
 	PaymentMethod     string    `json:"payment_method" bson:"payment_method"`
 	FeeType           string    `json:"fee_type" bson:"fee_type"`
-	AppointmentFee    int       `json:"appointment_fee" bson:"appointment_fee"` // Changed from string to int
-	AppointmentDate   time.Time `json:"appointment_date,omitempty" bson:"appointment_date,omitempty"`
+	AppointmentFee    int       `json:"appointment_fee" bson:"appointment_fee"` // Changed to int to match schema
+	AppointmentDate   time.Time `json:"appointment_date" bson:"appointment_date"`
 	CreatedAt         time.Time `json:"created_at" bson:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at,omitempty" bson:"updated_at,omitempty"`
+	UpdatedAt         time.Time `json:"updated_at" bson:"updated_at"`
+	Reason            string    `json:"reason,omitempty" bson:"reason,omitempty"` // Optional field
 }
 
 type AppointmentResponse struct {
@@ -363,7 +365,7 @@ func (h *AppointmentHandler) GetAppointmentsByOrgID(c *fiber.Ctx) error {
 		appointments = append(appointments, AppointmentResponse{
 			PatientID:         appointment.PatientID,
 			DoctorID:          appointment.DoctorID,
-			HospitalID:        appointment.HospitalID,
+			HospitalID:        appointment.OrgID,
 			PatientName:       appointment.PatientName,
 			DoctorName:        appointment.DoctorName,
 			AppointmentStatus: appointment.AppointmentStatus,
@@ -411,13 +413,13 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	var appointmentRequest struct {
 		PatientID       string    `json:"patient_id"`
 		DoctorID        string    `json:"doctor_id"`
-		HospitalID      string    `json:"hospital_id"`
-		PatientName     string    `json:"patient_name"`
-		DoctorName      string    `json:"doctor_name"`
+		OrgID           string    `json:"org_id"`       // Changed from HospitalID to OrgID
+		PatientName     string    `json:"patient_name"` // Changed to snake_case to match schema
+		DoctorName      string    `json:"doctor_name"`  // Changed to snake_case to match schema
 		AppointmentDate time.Time `json:"appointment_date"`
-		FeeType         string    `json:"fee_type"`
-		PaymentMethod   string    `json:"payment_method"`
-		Reason          string    `json:"reason,omitempty"`
+		FeeType         string    `json:"fee_type"`         // Changed to snake_case
+		PaymentMethod   string    `json:"payment_method"`   // Changed to snake_case
+		Reason          string    `json:"reason,omitempty"` // Optional field
 	}
 
 	if err := c.BodyParser(&appointmentRequest); err != nil {
@@ -426,10 +428,23 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	}
 
 	// Validate required fields
-	if appointmentRequest.PatientID == "" || appointmentRequest.DoctorID == "" || appointmentRequest.HospitalID == "" ||
+	if appointmentRequest.PatientID == "" || appointmentRequest.DoctorID == "" || appointmentRequest.OrgID == "" ||
 		appointmentRequest.PatientName == "" || appointmentRequest.DoctorName == "" ||
 		appointmentRequest.AppointmentDate.IsZero() || appointmentRequest.FeeType == "" || appointmentRequest.PaymentMethod == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Missing required fields"})
+	}
+
+	// Validate ID formats based on schema requirements
+	if !validatePatientID(appointmentRequest.PatientID) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Patient ID must be 8-digit alphanumeric format"})
+	}
+
+	if !validateDoctorID(appointmentRequest.DoctorID) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor ID must be in UUID format"})
+	}
+
+	if !validateOrgID(appointmentRequest.OrgID) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID must be in ULID format (org_[A-Z0-9]{26})"})
 	}
 
 	// Validate fee type
@@ -452,31 +467,32 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	}
 
 	// Verify doctor availability for the selected time slot
-	if !h.isDoctorAvailable(c.Context(), appointmentRequest.DoctorID, appointmentRequest.HospitalID, appointmentRequest.AppointmentDate) {
+	if !h.isDoctorAvailable(c.Context(), appointmentRequest.DoctorID, appointmentRequest.OrgID, appointmentRequest.AppointmentDate) {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor is not available at selected time"})
 	}
 
 	// Get doctor's fees based on fee type
-	appointmentFee, err := h.getDoctorFee(c.Context(), appointmentRequest.DoctorID, appointmentRequest.HospitalID, appointmentRequest.FeeType)
+	appointmentFee, err := h.getDoctorFee(c.Context(), appointmentRequest.DoctorID, appointmentRequest.OrgID, appointmentRequest.FeeType)
 	if err != nil {
 		h.logger.Error("failed to get doctor fees", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to get doctor fees"})
 	}
 
-	// Create appointment document
+	// Create appointment document (using field names that match the schema)
+	now := time.Now()
 	appointment := Appointment{
 		PatientID:         appointmentRequest.PatientID,
 		DoctorID:          appointmentRequest.DoctorID,
-		HospitalID:        appointmentRequest.HospitalID,
+		OrgID:             appointmentRequest.OrgID, // Changed from HospitalID
 		PatientName:       appointmentRequest.PatientName,
 		DoctorName:        appointmentRequest.DoctorName,
-		AppointmentStatus: "not_completed",
+		AppointmentStatus: "not_completed", // Default value that matches schema enum
 		PaymentMethod:     appointmentRequest.PaymentMethod,
 		FeeType:           appointmentRequest.FeeType,
 		AppointmentFee:    appointmentFee,
 		AppointmentDate:   appointmentRequest.AppointmentDate,
-		CreatedAt:         time.Now(),
-		UpdatedAt:         time.Now(),
+		CreatedAt:         now,
+		UpdatedAt:         now,
 	}
 
 	// Insert appointment into MongoDB
@@ -491,6 +507,25 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 		"message":     "Appointment created successfully",
 		"appointment": appointment,
 	})
+}
+
+// Helper functions to validate ID formats
+func validatePatientID(id string) bool {
+	// 8-digit alphanumeric format validation
+	match, _ := regexp.MatchString("^[A-Z0-9]{8}$", id)
+	return match
+}
+
+func validateDoctorID(id string) bool {
+	// UUID format validation
+	match, _ := regexp.MatchString("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", id)
+	return match
+}
+
+func validateOrgID(id string) bool {
+	// ULID format with org_ prefix validation
+	match, _ := regexp.MatchString("^org_[A-Z0-9]{26}$", id)
+	return match
 }
 
 // Helper method to check doctor availability
@@ -629,7 +664,7 @@ func (h *AppointmentHandler) GetAppointment(c *fiber.Ctx) error {
 	response := AppointmentResponse{
 		PatientID:         appointment.PatientID,
 		DoctorID:          appointment.DoctorID,
-		HospitalID:        appointment.HospitalID,
+		HospitalID:        appointment.OrgID,
 		PatientName:       appointment.PatientName,
 		DoctorName:        appointment.DoctorName,
 		AppointmentStatus: appointment.AppointmentStatus,
@@ -752,7 +787,7 @@ func (h *AppointmentHandler) GetDoctorAppointments(c *fiber.Ctx) error {
 		appointments = append(appointments, AppointmentResponse{
 			PatientID:         appointment.PatientID,
 			DoctorID:          appointment.DoctorID,
-			HospitalID:        appointment.HospitalID,
+			HospitalID:        appointment.OrgID,
 			PatientName:       appointment.PatientName,
 			DoctorName:        appointment.DoctorName,
 			AppointmentStatus: appointment.AppointmentStatus,
