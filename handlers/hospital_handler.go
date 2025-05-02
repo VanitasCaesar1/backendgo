@@ -401,7 +401,7 @@ func (h *HospitalHandler) GetHospitalImages(c *fiber.Ctx) error {
 // CreateHospital function to handle hospital creation with MongoDB for images
 func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 	// Check for Admin role in X-Role header
-	roleHeader := c.Get("X-Role")
+	/*roleHeader := c.Get("X-Role")
 	if roleHeader == "" {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Role information missing"})
 	}
@@ -420,7 +420,7 @@ func (h *HospitalHandler) CreateHospital(c *fiber.Ctx) error {
 	if !hasAdminRole {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "You don't have permission to create a hospital"})
 	}
-
+	*/
 	// Get the auth ID from context
 	authID, err := h.getAuthID(c)
 	if err != nil {
