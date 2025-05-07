@@ -1067,21 +1067,21 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 
 	// Build the base query according to the correct schema relationships
 	baseQuery := `
-		SELECT d.doctor_id, d.name, d.specialization, d.age,
-		       d.qualification, d.imr_number, d.is_active, 
-		       h.name as hospital_name, h.hospital_id
-		FROM doctors d
-		JOIN users u ON d.doctor_id = u.user_id
-		LEFT JOIN hospitals h ON u.hospital_id = h.hospital_id
-		WHERE 1=1`
+    SELECT d.doctor_id, d.name, d.specialization, d.age,
+           d.qualification, d.imr_number, d.is_active, 
+           h.name as hospital_name, h.hospital_id
+    FROM doctors d
+    LEFT JOIN users u ON d.doctor_id = u.user_id
+    LEFT JOIN hospitals h ON u.hospital_id = h.hospital_id
+    WHERE d.is_active = true`
 
 	// Build the count query
 	countQuery := `
-		SELECT COUNT(*)
-		FROM doctors d
-		JOIN users u ON d.doctor_id = u.user_id
-		LEFT JOIN hospitals h ON u.hospital_id = h.hospital_id
-		WHERE 1=1`
+    SELECT COUNT(*)
+    FROM doctors d
+    LEFT JOIN users u ON d.doctor_id = u.user_id
+    LEFT JOIN hospitals h ON u.hospital_id = h.hospital_id
+    WHERE d.is_active = true`
 
 	// Initialize query parameters
 	queryParams := []interface{}{}

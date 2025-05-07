@@ -32,28 +32,25 @@ type Specialization struct {
 }
 
 type DoctorProfile struct {
-	UserID            uuid.UUID `json:"user_id"`
-	AuthID            string    `json:"auth_id,omitempty"`
-	Username          string    `json:"username"`
-	ProfilePictureURL string    `json:"profile_picture_url,omitempty"`
-	Name              string    `json:"name"`
-	Mobile            string    `json:"mobile"`
-	Email             string    `json:"email"`
-	BloodGroup        string    `json:"blood_group,omitempty"`
-	Location          string    `json:"location"`
-	Address           string    `json:"address,omitempty"`
-
-	IMRNumber      string         `json:"imr_number,omitempty"`
-	Age            int            `json:"age,omitempty"`
-	Specialization Specialization `json:"specialization,omitempty"`
-	IsActive       bool           `json:"is_active,omitempty"`
-	Qualification  string         `json:"qualification,omitempty"`
-	SlotDuration   int            `json:"slot_duration,omitempty"`
-
-	HospitalID uuid.UUID `json:"hospital_id,omitempty"`
-
-	CreatedAt string `json:"created_at,omitempty"`
-	UpdatedAt string `json:"updated_at,omitempty"`
+	UserID            uuid.UUID      `json:"user_id"`
+	AuthID            string         `json:"auth_id,omitempty"`
+	Username          string         `json:"username"`
+	ProfilePictureURL string         `json:"profile_picture_url,omitempty"`
+	Name              string         `json:"name"`
+	Mobile            string         `json:"mobile"`
+	Email             string         `json:"email"`
+	BloodGroup        string         `json:"blood_group,omitempty"`
+	Location          string         `json:"location"`
+	Address           string         `json:"address,omitempty"`
+	IMRNumber         string         `json:"imr_number,omitempty"`
+	Age               int            `json:"age,omitempty"`
+	Specialization    Specialization `json:"specialization,omitempty"`
+	IsActive          bool           `json:"is_active,omitempty"`
+	Qualification     string         `json:"qualification,omitempty"`
+	SlotDuration      int            `json:"slot_duration,omitempty"`
+	HospitalID        uuid.UUID      `json:"hospital_id,omitempty"`
+	CreatedAt         string         `json:"created_at,omitempty"`
+	UpdatedAt         string         `json:"updated_at,omitempty"`
 }
 
 type DoctorSchedule struct {
@@ -166,6 +163,7 @@ func (h *DoctorHandler) GetDoctorProfile(c *fiber.Ctx) error {
             FROM doctors
             WHERE doctor_id = $1
         )
+
         SELECT 
             u.user_id,
             u.auth_id,

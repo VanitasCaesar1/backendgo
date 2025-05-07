@@ -83,6 +83,18 @@ func NewWorkOSWebhookHandler(cfg *config.Config, rds *redis.Client, logger *zap.
 
 // HandleWorkOSWebhook processes incoming WorkOS webhooks
 func (h *WorkOSWebhookHandler) HandleWorkOSWebhook(c *fiber.Ctx) error {
+	// Wrap the entire handler in a recover function to prevent panic crashes
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("PANIC in WorkOS webhook handler: %v\n", r)
+			if h != nil && h.logger != nil {
+				h.logger.Error("panic in webhook handler", zap.Any("recover", r))
+			}
+			// Don't return here as defer doesn't affect return values
+			// Just ensure we don't crash the server
+		}
+	}()
+
 	// Safety check to ensure handler was properly initialized
 	if h == nil {
 		// Log to server logs since handler logger may not be available
@@ -99,6 +111,13 @@ func (h *WorkOSWebhookHandler) HandleWorkOSWebhook(c *fiber.Ctx) error {
 			"error": "Server logger not configured",
 		})
 	}
+
+	// Enhanced debug logging
+	h.logger.Debug("WorkOS webhook request received",
+		zap.String("path", c.Path()),
+		zap.String("method", c.Method()),
+		zap.String("content_type", c.Get("Content-Type")),
+		zap.Bool("has_signature", c.Get("WorkOS-Signature") != ""))
 
 	if h.config == nil {
 		h.logger.Error("webhook handler config is nil")
@@ -137,14 +156,40 @@ func (h *WorkOSWebhookHandler) HandleWorkOSWebhook(c *fiber.Ctx) error {
 		})
 	}
 
+	// Read the request body with error handling
+	var bodyBytes []byte
+	var err error
+
+	if c.Request().BodyStream() == nil {
+		h.logger.Error("request body stream is nil")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Empty request body",
+		})
+	}
+
 	// Read the request body
-	body, err := io.ReadAll(c.Request().BodyStream())
+	bodyBytes, err = io.ReadAll(c.Request().BodyStream())
 	if err != nil {
 		h.logger.Error("failed to read webhook body", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to read request body",
 		})
 	}
+
+	// Check if body is empty
+	if len(bodyBytes) == 0 {
+		h.logger.Error("empty webhook body")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Empty request body",
+		})
+	}
+
+	// Log a portion of the body for debugging (avoid logging sensitive data)
+	bodyPreview := string(bodyBytes)
+	if len(bodyPreview) > 100 {
+		bodyPreview = bodyPreview[:100] + "..."
+	}
+	h.logger.Debug("webhook body preview", zap.String("body_preview", bodyPreview))
 
 	// Validate webhook secret
 	if h.config.WorkOSWebhookSecret == "" {
@@ -155,9 +200,11 @@ func (h *WorkOSWebhookHandler) HandleWorkOSWebhook(c *fiber.Ctx) error {
 	}
 
 	// Verify the webhook using the cached WorkOS client
-	_, err = h.webhookClient.ValidatePayload(signature, string(body))
+	_, err = h.webhookClient.ValidatePayload(signature, string(bodyBytes))
 	if err != nil {
-		h.logger.Error("failed to verify webhook signature", zap.Error(err))
+		h.logger.Error("failed to verify webhook signature",
+			zap.Error(err),
+			zap.String("signature", signature[:10]+"...")) // Log partial signature for debugging
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
 			"error": "Invalid signature",
 		})
@@ -165,8 +212,10 @@ func (h *WorkOSWebhookHandler) HandleWorkOSWebhook(c *fiber.Ctx) error {
 
 	// Parse the webhook event
 	var event WebhookEvent
-	if err := json.Unmarshal(body, &event); err != nil {
-		h.logger.Error("failed to parse webhook event", zap.Error(err))
+	if err := json.Unmarshal(bodyBytes, &event); err != nil {
+		h.logger.Error("failed to parse webhook event",
+			zap.Error(err),
+			zap.String("body", string(bodyBytes)))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Invalid webhook format",
 		})
@@ -239,7 +288,8 @@ func (h *WorkOSWebhookHandler) handleOrganizationMembershipCreated(ctx context.C
 		data.UserID).Scan(&userID)
 	if err != nil {
 		h.logger.Warn("user not found for organization membership",
-			zap.String("auth_id", data.UserID))
+			zap.String("auth_id", data.UserID),
+			zap.Error(err))
 		return nil // Not an error, just no action taken
 	}
 
@@ -259,17 +309,38 @@ func (h *WorkOSWebhookHandler) handleOrganizationMembershipCreated(ctx context.C
 			zap.Int64("rows_affected", rowsAffected))
 	}
 
-	// Store the organization membership ID in your database if needed
-	// This example assumes you have a column for tracking org memberships
-	_, err = h.pgPool.Exec(ctx,
-		`INSERT INTO user_organization_memberships 
-		(user_id, organization_id, membership_id, role, status) 
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (user_id, organization_id) 
-		DO UPDATE SET membership_id = $3, role = $4, status = $5`,
-		userID, data.OrganizationID, data.ID, data.Role.Slug, data.Status)
-	if err != nil {
-		return fmt.Errorf("failed to store organization membership: %w", err)
+	// Check if membership already exists
+	var existingID string
+	err = h.pgPool.QueryRow(ctx,
+		"SELECT membership_id FROM user_organization_memberships WHERE user_id = $1 AND organization_id = $2",
+		userID, data.OrganizationID).Scan(&existingID)
+
+	if err == nil {
+		// Existing membership found, update it
+		_, err = h.pgPool.Exec(ctx,
+			`UPDATE user_organization_memberships 
+			SET membership_id = $3, role = $4, status = $5
+			WHERE user_id = $1 AND organization_id = $2`,
+			userID, data.OrganizationID, data.ID, data.Role.Slug, data.Status)
+		if err != nil {
+			return fmt.Errorf("failed to update organization membership: %w", err)
+		}
+		h.logger.Info("updated existing organization membership",
+			zap.String("user_id", userID),
+			zap.String("org_id", data.OrganizationID))
+	} else {
+		// No existing membership, create new one
+		_, err = h.pgPool.Exec(ctx,
+			`INSERT INTO user_organization_memberships 
+			(user_id, organization_id, membership_id, role, status) 
+			VALUES ($1, $2, $3, $4, $5)`,
+			userID, data.OrganizationID, data.ID, data.Role.Slug, data.Status)
+		if err != nil {
+			return fmt.Errorf("failed to store organization membership: %w", err)
+		}
+		h.logger.Info("created new organization membership",
+			zap.String("user_id", userID),
+			zap.String("org_id", data.OrganizationID))
 	}
 
 	return nil
@@ -295,7 +366,8 @@ func (h *WorkOSWebhookHandler) handleOrganizationMembershipUpdated(ctx context.C
 		data.UserID).Scan(&userID)
 	if err != nil {
 		h.logger.Warn("user not found for organization membership update",
-			zap.String("auth_id", data.UserID))
+			zap.String("auth_id", data.UserID),
+			zap.Error(err))
 		return nil // Not an error, just no action taken
 	}
 
@@ -328,10 +400,25 @@ func (h *WorkOSWebhookHandler) handleOrganizationMembershipUpdated(ctx context.C
 	}
 
 	rowsAffected := result.RowsAffected()
-	h.logger.Info("updated organization membership",
-		zap.String("user_id", userID),
-		zap.String("org_id", data.OrganizationID),
-		zap.Int64("rows_affected", rowsAffected))
+	if rowsAffected == 0 {
+		// No rows affected means the membership doesn't exist yet - create it
+		_, err = h.pgPool.Exec(ctx,
+			`INSERT INTO user_organization_memberships 
+			(user_id, organization_id, membership_id, role, status) 
+			VALUES ($1, $2, $3, $4, $5)`,
+			userID, data.OrganizationID, data.ID, data.Role.Slug, data.Status)
+		if err != nil {
+			return fmt.Errorf("failed to create missing organization membership: %w", err)
+		}
+		h.logger.Info("created missing organization membership during update",
+			zap.String("user_id", userID),
+			zap.String("org_id", data.OrganizationID))
+	} else {
+		h.logger.Info("updated organization membership",
+			zap.String("user_id", userID),
+			zap.String("org_id", data.OrganizationID),
+			zap.Int64("rows_affected", rowsAffected))
+	}
 
 	return nil
 }
@@ -353,7 +440,8 @@ func (h *WorkOSWebhookHandler) handleOrganizationMembershipDeleted(ctx context.C
 		data.UserID).Scan(&userID)
 	if err != nil {
 		h.logger.Warn("user not found for organization membership deletion",
-			zap.String("auth_id", data.UserID))
+			zap.String("auth_id", data.UserID),
+			zap.Error(err))
 		return nil // Not an error, just no action taken
 	}
 

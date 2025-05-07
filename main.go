@@ -404,7 +404,7 @@ func (a *App) setupRoutes() error {
 	}
 
 	// Initialize Doctor Auth Handler
-	doctorAuthHandler := handlers.NewDoctorAuthHandler(a.Config, a.Redis, a.Logger, a.Postgres, authMiddleware)
+	doctorAuthHandler := handlers.NewDoctorAuthHandler(a.Config, a.Redis, a.Logger, a.Postgres, a.MongoDB, authMiddleware)
 
 	// Initialize Appointment Handler
 	appointmentHandler, err := handlers.NewAppointmentHandler(a.Config, a.Redis, a.Logger, a.Postgres, a.MongoDB)
@@ -412,17 +412,39 @@ func (a *App) setupRoutes() error {
 		return fmt.Errorf("failed to initialize appointment handler: %v", err)
 	}
 
+	// Initialize the WorkOS webhook handler with better error handling
 	workosWebhookHandler, err := handlers.NewWorkOSWebhookHandler(a.Config, a.Redis, a.Logger, a.Postgres)
 	if err != nil {
 		a.Logger.Error("failed to initialize WorkOS webhook handler", zap.Error(err))
 		// Don't return error - instead, proceed without registering this route
-		a.Logger.Warn("WorkOS webhook handler will not be available", zap.Error(err))
+		a.Logger.Warn("WorkOS webhook handler will not be available")
 	} else {
 		// Only register the webhook route if the handler was successfully initialized
 		webhooksGroup := a.Fiber.Group("/api/webhooks")
-		webhooksGroup.Post("/workos", workosWebhookHandler.HandleWorkOSWebhook)
+
+		// Register the WorkOS webhook handler
+		webhooksGroup.Post("/workos", func(c *fiber.Ctx) error {
+			// Extra safety - ensure handler exists
+			if workosWebhookHandler == nil {
+				a.Logger.Error("WorkOS webhook handler is nil when handling request")
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+					"error": "Server misconfiguration",
+				})
+			}
+
+			// Log incoming request
+			a.Logger.Debug("received WorkOS webhook request",
+				zap.String("path", c.Path()),
+				zap.String("method", c.Method()),
+				zap.Bool("has_signature", c.Get("WorkOS-Signature") != ""))
+
+			// Call the actual handler
+			return workosWebhookHandler.HandleWorkOSWebhook(c)
+		})
+
 		a.Logger.Info("registered WorkOS webhook handler")
 	}
+
 	// Health check route - publicly accessible
 	a.Fiber.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{

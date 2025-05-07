@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/workos/workos-go/v4/pkg/usermanagement"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.uber.org/zap"
 )
 
@@ -22,6 +23,7 @@ type DoctorAuthHandler struct {
 	config         *config.Config
 	redisClient    *redis.Client
 	logger         *zap.Logger
+	mongoClient    *mongo.Client
 	pgPool         *pgxpool.Pool
 	authMiddleware *middleware.AuthMiddleware
 }
@@ -53,13 +55,14 @@ type DoctorLoginRequest struct {
 	Password string `json:"password"`
 }
 
-func NewDoctorAuthHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, pgPool *pgxpool.Pool, authMiddleware *middleware.AuthMiddleware) *DoctorAuthHandler {
+func NewDoctorAuthHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, pgPool *pgxpool.Pool, mongoClient *mongo.Client, authMiddleware *middleware.AuthMiddleware) *DoctorAuthHandler {
 	// Initialize WorkOS SDK
 	usermanagement.SetAPIKey(cfg.WorkOSApiKey)
 
 	return &DoctorAuthHandler{
 		config:         cfg,
 		redisClient:    rds,
+		mongoClient:    mongoClient,
 		logger:         logger,
 		pgPool:         pgPool,
 		authMiddleware: authMiddleware,
@@ -400,30 +403,39 @@ func (h *DoctorAuthHandler) GetDoctorProfile(c *fiber.Ctx) error {
 	if doctorProfile.BloodGroup.Valid {
 		response["blood_group"] = doctorProfile.BloodGroup.String
 	}
+
 	if doctorProfile.Location.Valid {
 		response["location"] = doctorProfile.Location.String
 	}
+
 	if doctorProfile.Address.Valid {
 		response["address"] = doctorProfile.Address.String
 	}
+
 	if doctorProfile.ProfilePic.Valid {
 		response["profile_pic"] = doctorProfile.ProfilePic.String
 	}
+
 	if doctorProfile.HospitalID.Valid {
 		response["hospital_id"] = doctorProfile.HospitalID.UUID
 	}
+
 	if doctorProfile.IMRNumber.Valid {
 		response["imr_number"] = doctorProfile.IMRNumber.String
 	}
+
 	if doctorProfile.Age.Valid {
 		response["age"] = doctorProfile.Age.Int32
 	}
+
 	if doctorProfile.Specialization.Valid {
 		response["specialization"] = doctorProfile.Specialization.String
 	}
+
 	if doctorProfile.Qualification.Valid {
 		response["qualification"] = doctorProfile.Qualification.String
 	}
+
 	if doctorProfile.SlotDuration.Valid {
 		response["slot_duration"] = doctorProfile.SlotDuration.Int32
 	}
