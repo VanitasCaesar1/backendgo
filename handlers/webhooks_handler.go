@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 
 	"github.com/VanitasCaesar1/backend/config"
 	"github.com/gofiber/fiber/v2"
@@ -160,21 +159,8 @@ func (h *WorkOSWebhookHandler) HandleWorkOSWebhook(c *fiber.Ctx) error {
 	var bodyBytes []byte
 	var err error
 
-	if c.Request().BodyStream() == nil {
-		h.logger.Error("request body stream is nil")
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Empty request body",
-		})
-	}
-
-	// Read the request body
-	bodyBytes, err = io.ReadAll(c.Request().BodyStream())
-	if err != nil {
-		h.logger.Error("failed to read webhook body", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to read request body",
-		})
-	}
+	// IMPORTANT CHANGE: Use c.Body() instead of BodyStream()
+	bodyBytes = c.Body()
 
 	// Check if body is empty
 	if len(bodyBytes) == 0 {
