@@ -436,7 +436,21 @@ func (a *App) setupRoutes() error {
 			a.Logger.Debug("received WorkOS webhook request",
 				zap.String("path", c.Path()),
 				zap.String("method", c.Method()),
-				zap.Bool("has_signature", c.Get("WorkOS-Signature") != ""))
+				zap.Bool("has_signature", c.Get("WorkOS-Signature") != ""),
+				zap.Int("body_size", len(c.Body())))
+
+			// Store body on context in case the original is consumed
+			bodyBytes := c.Body()
+			if len(bodyBytes) > 0 {
+				// For debugging: log a small preview of the body
+				bodyPreview := string(bodyBytes)
+				if len(bodyPreview) > 50 {
+					bodyPreview = bodyPreview[:50] + "..."
+				}
+				a.Logger.Debug("webhook body preview", zap.String("preview", bodyPreview))
+			} else {
+				a.Logger.Warn("webhook body is empty")
+			}
 
 			// Call the actual handler
 			return workosWebhookHandler.HandleWorkOSWebhook(c)
@@ -445,6 +459,13 @@ func (a *App) setupRoutes() error {
 		a.Logger.Info("registered WorkOS webhook handler")
 	}
 
+	// Health check route - publicly accessible
+	a.Fiber.Get("/health", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"status": "ok",
+			"time":   time.Now().Format(time.RFC3339),
+		})
+	})
 	// Health check route - publicly accessible
 	a.Fiber.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
