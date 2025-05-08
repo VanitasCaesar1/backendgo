@@ -75,15 +75,17 @@ type HospitalVisit struct {
 
 // You may need to update your DoctorSearchResult struct to match the fields we're now retrieving
 type DoctorSearchResult struct {
-	DoctorID      uuid.UUID `json:"doctor_id"`
-	Name          string    `json:"name"`
-	Speciality    string    `json:"speciality"`
-	Age           int       `json:"age"`
-	Qualification string    `json:"qualification"`
-	IMRNumber     string    `json:"imr_number"` // Using IMRNumber instead of LicenseNumber
-	HospitalName  string    `json:"hospital_name"`
-	HospitalID    uuid.UUID `json:"hospital_id"`
-	IsActive      bool      `json:"is_active"`
+	DoctorID       uuid.UUID `json:"doctor_id"`
+	Name           string    `json:"name"`
+	Speciality     string    `json:"speciality"`
+	Age            int       `json:"age"`
+	Qualification  string    `json:"qualification"`
+	IMRNumber      string    `json:"imr_number"` // Using IMRNumber instead of LicenseNumber
+	HospitalName   string    `json:"hospital_name"`
+	HospitalID     uuid.UUID `json:"hospital_id"`
+	IsActive       bool      `json:"is_active"`
+	OrganizationID string    `json:"organization_id"`
+	SlotDuration   int       `json:"slot_duration"`
 }
 
 type Medical struct {
@@ -1002,7 +1004,7 @@ func (h *AppointmentHandler) GetPatientByID(c *fiber.Ctx) error {
 	return c.JSON(patient)
 }
 
-// SearchDoctors searches for doctors based on various criteria
+// SearchDoctors searches for doctors based on various criteria - only returning doctors from the same organizations as the user
 func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 	// Get auth ID from context
 	authID, err := h.getAuthID(c)
@@ -1041,13 +1043,35 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 	searchQuery := c.Query("q", "")
 	searchBy := c.Query("by", "name") // default search by name
 	speciality := c.Query("speciality", "")
-	hospitalID := c.Query("hospital_id", "")
+	organizationID := c.Query("organization_id", "")
 
-	// Validate hospital ID if provided
-	if hospitalID != "" {
-		_, err := uuid.Parse(hospitalID)
-		if err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid hospital ID format"})
+	// If organization ID is not specified, we need to get the user's organizations
+	// but if it is specified, we will still check if the user belongs to that organization
+	userOrgs, err := h.getUserOrganizations(c.Context(), userID)
+	if err != nil {
+		h.logger.Error("failed to get user organizations", zap.Error(err), zap.String("userID", userID.String()))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve user organizations"})
+	}
+
+	if len(userOrgs) == 0 {
+		h.logger.Error("user has no organizations", zap.String("userID", userID.String()))
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "User is not part of any organization"})
+	}
+
+	// Check if the requested organization ID is in the user's organizations
+	if organizationID != "" {
+		validOrg := false
+		for _, org := range userOrgs {
+			if org == organizationID {
+				validOrg = true
+				break
+			}
+		}
+		if !validOrg {
+			h.logger.Error("user attempted to access unauthorized organization",
+				zap.String("userID", userID.String()),
+				zap.String("requestedOrgID", organizationID))
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Not authorized to access this organization"})
 		}
 	}
 
@@ -1065,27 +1089,47 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 		offset = 0 // Default offset
 	}
 
-	// Build the base query according to the correct schema relationships
+	// Build the base query to get doctors from the same organizations as the user
 	baseQuery := `
     SELECT d.doctor_id, d.name, d.specialization, d.age,
            d.qualification, d.imr_number, d.is_active, 
-           h.name as hospital_name, h.hospital_id
+           d.slot_duration, uom.organization_id
     FROM doctors d
-    LEFT JOIN users u ON d.doctor_id = u.user_id
-    LEFT JOIN hospitals h ON u.hospital_id = h.hospital_id
-    WHERE d.is_active = true`
+    INNER JOIN users u ON d.doctor_id = u.user_id
+    INNER JOIN user_organization_memberships uom ON u.user_id = uom.user_id
+    WHERE d.is_active = true
+    AND uom.organization_id IN (`
 
 	// Build the count query
 	countQuery := `
-    SELECT COUNT(*)
+    SELECT COUNT(DISTINCT d.doctor_id)
     FROM doctors d
-    LEFT JOIN users u ON d.doctor_id = u.user_id
-    LEFT JOIN hospitals h ON u.hospital_id = h.hospital_id
-    WHERE d.is_active = true`
+    INNER JOIN users u ON d.doctor_id = u.user_id
+    INNER JOIN user_organization_memberships uom ON u.user_id = uom.user_id
+    WHERE d.is_active = true
+    AND uom.organization_id IN (`
 
 	// Initialize query parameters
 	queryParams := []interface{}{}
 	paramCount := 1
+
+	// Add organization parameters
+	orgPlaceholders := []string{}
+	if organizationID != "" {
+		orgPlaceholders = append(orgPlaceholders, fmt.Sprintf("$%d", paramCount))
+		queryParams = append(queryParams, organizationID)
+		paramCount++
+	} else {
+		// Add all user organizations to the query
+		for _, org := range userOrgs {
+			orgPlaceholders = append(orgPlaceholders, fmt.Sprintf("$%d", paramCount))
+			queryParams = append(queryParams, org)
+			paramCount++
+		}
+	}
+
+	baseQuery += strings.Join(orgPlaceholders, ", ") + ")"
+	countQuery += strings.Join(orgPlaceholders, ", ") + ")"
 
 	// Add search conditions based on searchBy parameter
 	if searchQuery != "" {
@@ -1131,13 +1175,8 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 		paramCount++
 	}
 
-	// Add hospital filter if provided
-	if hospitalID != "" {
-		baseQuery += fmt.Sprintf(" AND h.hospital_id = $%d", paramCount)
-		countQuery += fmt.Sprintf(" AND h.hospital_id = $%d", paramCount)
-		queryParams = append(queryParams, hospitalID)
-		paramCount++
-	}
+	// Use GROUP BY to avoid duplicates if a doctor belongs to multiple organizations
+	baseQuery += " GROUP BY d.doctor_id, d.name, d.specialization, d.age, d.qualification, d.imr_number, d.is_active, d.slot_duration, uom.organization_id"
 
 	// Add pagination and ordering
 	baseQuery += " ORDER BY d.name"
@@ -1166,7 +1205,8 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 	for rows.Next() {
 		var doctor DoctorSearchResult
 		var specializationJSON []byte
-		var hospitalName, hospitalID sql.NullString
+		var organizationID sql.NullString
+		var slotDuration sql.NullInt32
 		var isActive bool
 
 		if err := rows.Scan(
@@ -1177,21 +1217,21 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 			&doctor.Qualification,
 			&doctor.IMRNumber,
 			&isActive,
-			&hospitalName,
-			&hospitalID,
+			&slotDuration,
+			&organizationID,
 		); err != nil {
 			h.logger.Error("failed to scan doctor row", zap.Error(err))
 			continue
 		}
 
-		// Handle nullable hospital fields
-		if hospitalName.Valid {
-			doctor.HospitalName = hospitalName.String
+		// Handle nullable organization fields
+		if organizationID.Valid {
+			doctor.OrganizationID = organizationID.String
 		}
-		if hospitalID.Valid {
-			if id, err := uuid.Parse(hospitalID.String); err == nil {
-				doctor.HospitalID = id
-			}
+
+		// Handle nullable slot duration
+		if slotDuration.Valid {
+			doctor.SlotDuration = int(slotDuration.Int32)
 		}
 
 		// Set active status
@@ -1238,6 +1278,37 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 			"offset": offset,
 		},
 	})
+}
+
+// Helper function to get the organizations a user belongs to
+func (h *AppointmentHandler) getUserOrganizations(ctx context.Context, userID uuid.UUID) ([]string, error) {
+	query := `
+		SELECT organization_id
+		FROM user_organization_memberships
+		WHERE user_id = $1
+		AND status = 'active'
+	`
+
+	rows, err := h.pgPool.Query(ctx, query, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	organizations := []string{}
+	for rows.Next() {
+		var orgID string
+		if err := rows.Scan(&orgID); err != nil {
+			return nil, err
+		}
+		organizations = append(organizations, orgID)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return organizations, nil
 }
 
 func (h *AppointmentHandler) CreatePatient(c *fiber.Ctx) error {
