@@ -159,7 +159,6 @@ func (h *WorkOSWebhookHandler) HandleWorkOSWebhook(c *fiber.Ctx) error {
 	var bodyBytes []byte
 	var err error
 
-	// IMPORTANT CHANGE: Use c.Body() instead of BodyStream()
 	bodyBytes = c.Body()
 
 	// Check if body is empty
@@ -280,7 +279,7 @@ func (h *WorkOSWebhookHandler) handleOrganizationMembershipCreated(ctx context.C
 	}
 
 	// If the role is 'doctor', update the doctor's active status
-	if data.Role.Slug == "doctor" && data.Status == "active" {
+	if data.Role.Slug == "practitioner" && data.Status == "active" {
 		result, err := h.pgPool.Exec(ctx,
 			"UPDATE doctors SET is_active = true WHERE doctor_id = $1",
 			userID)
@@ -358,7 +357,7 @@ func (h *WorkOSWebhookHandler) handleOrganizationMembershipUpdated(ctx context.C
 	}
 
 	// If the role is 'doctor', update doctor status based on membership status
-	if data.Role.Slug == "doctor" {
+	if data.Role.Slug == "practitioner" {
 		isActive := data.Status == "active"
 		result, err := h.pgPool.Exec(ctx,
 			"UPDATE doctors SET is_active = $1 WHERE doctor_id = $2",
@@ -432,7 +431,7 @@ func (h *WorkOSWebhookHandler) handleOrganizationMembershipDeleted(ctx context.C
 	}
 
 	// If the role was 'doctor', set their active status to false
-	if data.Role.Slug == "doctor" {
+	if data.Role.Slug == "practitioner" {
 		result, err := h.pgPool.Exec(ctx,
 			"UPDATE doctors SET is_active = false WHERE doctor_id = $1",
 			userID)
