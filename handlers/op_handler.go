@@ -1004,6 +1004,64 @@ func (h *AppointmentHandler) GetPatientByID(c *fiber.Ctx) error {
 	return c.JSON(patient)
 }
 
+// getUserOrganizations gets the user's organizations, prioritizing the X-Organization-ID header
+func (h *AppointmentHandler) getUserOrganizations(ctx context.Context, userID uuid.UUID, c *fiber.Ctx) ([]string, error) {
+	// First check if the organization ID was provided in the header
+	if orgID := c.Get("X-Organization-ID", ""); orgID != "" {
+		h.logger.Info("using organization ID from header",
+			zap.String("orgID", orgID),
+			zap.String("userID", userID.String()))
+
+		// Return the organization ID from the header
+		return []string{orgID}, nil
+	}
+
+	// Fall back to database lookup if no header was provided
+	h.logger.Info("no organization ID in header, falling back to database",
+		zap.String("userID", userID.String()))
+
+	query := `
+		SELECT organization_id 
+		FROM user_organization_memberships 
+		WHERE user_id = $1 AND status = 'active'
+	`
+
+	rows, err := h.pgPool.Query(ctx, query, userID)
+	if err != nil {
+		h.logger.Error("failed to query user organizations",
+			zap.Error(err),
+			zap.String("userID", userID.String()))
+		return nil, fmt.Errorf("failed to query user organizations: %w", err)
+	}
+	defer rows.Close()
+
+	var orgs []string
+	for rows.Next() {
+		var orgID string
+		if err := rows.Scan(&orgID); err != nil {
+			h.logger.Error("failed to scan organization ID",
+				zap.Error(err),
+				zap.String("userID", userID.String()))
+			continue
+		}
+		orgs = append(orgs, orgID)
+	}
+
+	if err := rows.Err(); err != nil {
+		h.logger.Error("error iterating organization rows",
+			zap.Error(err),
+			zap.String("userID", userID.String()))
+		return nil, fmt.Errorf("error iterating organization rows: %w", err)
+	}
+
+	h.logger.Info("found organizations in database",
+		zap.Int("count", len(orgs)),
+		zap.Strings("orgIDs", orgs),
+		zap.String("userID", userID.String()))
+
+	return orgs, nil
+}
+
 // SearchDoctors searches for doctors based on various criteria - only returning doctors from the same organizations as the user
 func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 	// Get auth ID from context
@@ -1019,6 +1077,12 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 		h.logger.Error("failed to get user ID", zap.Error(err), zap.String("authID", authID))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve user information"})
 	}
+
+	// Log the organization ID from header for debugging
+	headerOrgID := c.Get("X-Organization-ID", "")
+	h.logger.Info("received request with organization header",
+		zap.String("X-Organization-ID", headerOrgID),
+		zap.String("userID", userID.String()))
 
 	// Check if user role was provided in header
 	userRole := c.Get("X-User-Role", "")
@@ -1045,13 +1109,17 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 	speciality := c.Query("speciality", "")
 	organizationID := c.Query("organization_id", "")
 
-	// If organization ID is not specified, we need to get the user's organizations
-	// but if it is specified, we will still check if the user belongs to that organization
-	userOrgs, err := h.getUserOrganizations(c.Context(), userID)
+	// Use the updated function which checks for organization ID in header first
+	userOrgs, err := h.getUserOrganizations(c.Context(), userID, c)
 	if err != nil {
 		h.logger.Error("failed to get user organizations", zap.Error(err), zap.String("userID", userID.String()))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve user organizations"})
 	}
+
+	// Debug log to see what organizations we found
+	h.logger.Info("organizations found for user",
+		zap.Strings("organizations", userOrgs),
+		zap.String("userID", userID.String()))
 
 	if len(userOrgs) == 0 {
 		h.logger.Error("user has no organizations", zap.String("userID", userID.String()))
@@ -1089,25 +1157,22 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 		offset = 0 // Default offset
 	}
 
-	// Build the base query to get doctors from the same organizations as the user
+	// FIXED QUERY: The doctor_id in doctors table is the same as user_id in users table
+	// We need to join to user_organization_memberships using this ID
 	baseQuery := `
-    SELECT d.doctor_id, d.name, d.specialization, d.age,
-           d.qualification, d.imr_number, d.is_active, 
-           d.slot_duration, uom.organization_id
-    FROM doctors d
-    INNER JOIN users u ON d.doctor_id = u.user_id
-    INNER JOIN user_organization_memberships uom ON u.user_id = uom.user_id
-    WHERE d.is_active = true
-    AND uom.organization_id IN (`
+		SELECT DISTINCT d.doctor_id, d.name, d.specialization, d.age,
+			d.qualification, d.imr_number, d.is_active, 
+			d.slot_duration, uom.organization_id
+		FROM doctors d
+		JOIN user_organization_memberships uom ON d.doctor_id = uom.user_id
+		WHERE uom.organization_id IN (`
 
-	// Build the count query
+	// Build the count query with the same fix
 	countQuery := `
-    SELECT COUNT(DISTINCT d.doctor_id)
-    FROM doctors d
-    INNER JOIN users u ON d.doctor_id = u.user_id
-    INNER JOIN user_organization_memberships uom ON u.user_id = uom.user_id
-    WHERE d.is_active = true
-    AND uom.organization_id IN (`
+		SELECT COUNT(DISTINCT d.doctor_id)
+		FROM doctors d
+		JOIN user_organization_memberships uom ON d.doctor_id = uom.user_id
+		WHERE uom.organization_id IN (`
 
 	// Initialize query parameters
 	queryParams := []interface{}{}
@@ -1128,8 +1193,15 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 		}
 	}
 
-	baseQuery += strings.Join(orgPlaceholders, ", ") + ")"
-	countQuery += strings.Join(orgPlaceholders, ", ") + ")"
+	// Complete the base queries with organization placeholders
+	baseQuery += strings.Join(orgPlaceholders, ", ") + ") "
+	countQuery += strings.Join(orgPlaceholders, ", ") + ") "
+
+	// Log what we're searching for (debugging)
+	h.logger.Info("search parameters",
+		zap.String("userID", userID.String()),
+		zap.Strings("organization_placeholders", orgPlaceholders),
+		zap.Any("query_params", queryParams))
 
 	// Add search conditions based on searchBy parameter
 	if searchQuery != "" {
@@ -1151,16 +1223,16 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 			paramCount++
 		case "all":
 			baseQuery += fmt.Sprintf(` AND (
-				d.name ILIKE $%d OR 
-				d.imr_number ILIKE $%d OR 
-				d.qualification ILIKE $%d OR
-				d.specialization::text ILIKE $%d)`,
+					d.name ILIKE $%d OR 
+					d.imr_number ILIKE $%d OR 
+					d.qualification ILIKE $%d OR
+					d.specialization::text ILIKE $%d)`,
 				paramCount, paramCount, paramCount, paramCount)
 			countQuery += fmt.Sprintf(` AND (
-				d.name ILIKE $%d OR 
-				d.imr_number ILIKE $%d OR 
-				d.qualification ILIKE $%d OR
-				d.specialization::text ILIKE $%d)`,
+					d.name ILIKE $%d OR 
+					d.imr_number ILIKE $%d OR 
+					d.qualification ILIKE $%d OR
+					d.specialization::text ILIKE $%d)`,
 				paramCount, paramCount, paramCount, paramCount)
 			queryParams = append(queryParams, "%"+searchQuery+"%")
 			paramCount++
@@ -1175,8 +1247,15 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 		paramCount++
 	}
 
-	// Use GROUP BY to avoid duplicates if a doctor belongs to multiple organizations
-	baseQuery += " GROUP BY d.doctor_id, d.name, d.specialization, d.age, d.qualification, d.imr_number, d.is_active, d.slot_duration, uom.organization_id"
+	// Remove the active status filter since most doctors have is_active = false
+	// If you still want to filter by active status, you can uncomment these lines
+	// baseQuery += " AND d.is_active = true"
+	// countQuery += " AND d.is_active = true"
+
+	// Log final queries for debugging
+	h.logger.Info("executing queries",
+		zap.String("baseQuery", baseQuery),
+		zap.String("countQuery", countQuery))
 
 	// Add pagination and ordering
 	baseQuery += " ORDER BY d.name"
@@ -1191,6 +1270,9 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 		// Continue with the results but without total count
 		total = 0
 	}
+
+	// Log count results
+	h.logger.Info("count query result", zap.Int("total", total))
 
 	// Execute the main query
 	rows, err := h.pgPool.Query(c.Context(), baseQuery, queryParams...)
@@ -1270,6 +1352,11 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Error processing doctors"})
 	}
 
+	// Log success and result count
+	h.logger.Info("search completed successfully",
+		zap.Int("total_doctors", len(doctors)),
+		zap.String("userID", userID.String()))
+
 	return c.JSON(fiber.Map{
 		"doctors": doctors,
 		"pagination": fiber.Map{
@@ -1278,37 +1365,6 @@ func (h *AppointmentHandler) SearchDoctors(c *fiber.Ctx) error {
 			"offset": offset,
 		},
 	})
-}
-
-// Helper function to get the organizations a user belongs to
-func (h *AppointmentHandler) getUserOrganizations(ctx context.Context, userID uuid.UUID) ([]string, error) {
-	query := `
-		SELECT organization_id
-		FROM user_organization_memberships
-		WHERE user_id = $1
-		AND status = 'active'
-	`
-
-	rows, err := h.pgPool.Query(ctx, query, userID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	organizations := []string{}
-	for rows.Next() {
-		var orgID string
-		if err := rows.Scan(&orgID); err != nil {
-			return nil, err
-		}
-		organizations = append(organizations, orgID)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	return organizations, nil
 }
 
 func (h *AppointmentHandler) CreatePatient(c *fiber.Ctx) error {

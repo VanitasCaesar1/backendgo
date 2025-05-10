@@ -83,7 +83,6 @@ func (h *DoctorAuthHandler) tryDeleteWorkOSUser(ctx context.Context, workosUserI
 	}
 }
 
-// RegisterDoctor handles doctor registration
 func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 	var req DoctorRegistrationRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -92,6 +91,7 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 			"error": "Invalid request format",
 		})
 	}
+
 	if req.AadhaarID != "" {
 		aadhaarRegex := regexp.MustCompile(`^\d{12}$`)
 		if !aadhaarRegex.MatchString(req.AadhaarID) {
@@ -100,13 +100,14 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 			})
 		}
 	}
+
 	// Check if user already exists with this email, username, or Aadhaar ID
 	var emailExists, usernameExists, aadhaarExists bool
 	err := h.pgPool.QueryRow(c.Context(),
-		`SELECT 
-			EXISTS(SELECT 1 FROM users WHERE email = $1), 
-			EXISTS(SELECT 1 FROM users WHERE username = $2),
-			EXISTS(SELECT 1 FROM users WHERE aadhaar_id = $3)`,
+		`SELECT
+            EXISTS(SELECT 1 FROM users WHERE email = $1),
+            EXISTS(SELECT 1 FROM users WHERE username = $2),
+            EXISTS(SELECT 1 FROM users WHERE aadhaar_id = $3)`,
 		req.Email, req.Username, req.AadhaarID).Scan(&emailExists, &usernameExists, &aadhaarExists)
 	if err != nil {
 		h.logger.Error("failed to check user existence", zap.Error(err))
@@ -120,50 +121,50 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 			"error": "This email is already registered",
 		})
 	}
-
 	if usernameExists {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 			"error": "This username is already taken",
 		})
 	}
-
 	if aadhaarExists {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 			"error": "This Aadhaar ID is already registered",
 		})
 	}
 
-	// Create user in WorkOS
+	// Create user ID first so we can use it as ExternalID in WorkOS
+	userID := uuid.New()
+
+	// Create user in WorkOS with the userID as ExternalID
 	workosUser, err := usermanagement.CreateUser(
 		c.Context(),
 		usermanagement.CreateUserOpts{
-			Email:     req.Email,
-			Password:  req.Password,
-			FirstName: strings.Split(req.Name, " ")[0],
-			LastName:  strings.Join(strings.Split(req.Name, " ")[1:], " "),
+			Email:      req.Email,
+			Password:   req.Password,
+			FirstName:  strings.Split(req.Name, " ")[0],
+			LastName:   strings.Join(strings.Split(req.Name, " ")[1:], " "),
+			ExternalID: userID.String(),
 		},
 	)
 	if err != nil {
 		h.logger.Error("failed to create user in WorkOS", zap.Error(err))
-
 		// Check for specific WorkOS errors
 		if strings.Contains(err.Error(), "already exists") {
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 				"error": "This email is already registered",
 			})
 		}
-
 		if strings.Contains(err.Error(), "password") {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 				"error":   "Invalid password",
 				"message": "Password must be at least 8 characters",
 			})
 		}
-
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to create user account",
 		})
 	}
+
 	// Assuming req.Specialization is a string or struct that needs to be converted to JSON
 	// Convert string value to JSON object
 	var specializationJSON string
@@ -174,7 +175,6 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 		specializationJSON = "{}"
 	}
 
-	// Then use specializationJSON in your query
 	// Create a transaction
 	tx, err := h.pgPool.Begin(c.Context())
 	if err != nil {
@@ -185,9 +185,6 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 		})
 	}
 	defer tx.Rollback(c.Context()) // Rollback if not committed
-
-	// Create user ID
-	userID := uuid.New()
 
 	// Parse mobile number
 	var mobile int64
@@ -204,19 +201,21 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 	var insertedUserID uuid.UUID
 	err = tx.QueryRow(c.Context(),
 		`INSERT INTO users (
-        profile_pic,
-        name, 
-        mobile, 
-        email, 
-        blood_group,
-        location,
-        address,
-        username,
-        hospital_id,
-        aadhaar_id,
-        auth_id
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-    RETURNING user_id`,
+            user_id,
+            profile_pic,
+            name,
+            mobile,
+            email,
+            blood_group,
+            location,
+            address,
+            username,
+            hospital_id,
+            aadhaar_id,
+            auth_id
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        RETURNING user_id`,
+		userID, // Use the pre-generated UUID
 		req.ProfilePic,
 		req.Name,
 		mobile,
@@ -229,7 +228,6 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 		req.AadhaarID,
 		workosUser.ID,
 	).Scan(&insertedUserID)
-
 	if err != nil {
 		h.logger.Error("failed to create user in database",
 			zap.Error(err),
@@ -243,15 +241,15 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 	// Then use insertedUserID for the doctors table insertion
 	_, err = tx.Exec(c.Context(),
 		`INSERT INTO doctors (
-        doctor_id,
-        name,
-        imr_number,
-        age,
-        specialization,
-        qualification,
-        slot_duration,
-        is_active
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            doctor_id,
+            name,
+            imr_number,
+            age,
+            specialization,
+            qualification,
+            slot_duration,
+            is_active
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 		insertedUserID, // Use the ID generated by the database
 		req.Name,
 		req.IMRNumber,
