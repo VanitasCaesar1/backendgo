@@ -495,14 +495,15 @@ func (a *App) setupRoutes() error {
 	doctorGroup.Put("/profile", doctorHandler.UpdateDoctorProfile)
 	doctorGroup.Delete("/profile", doctorAuthHandler.DeleteDoctor)
 	doctorGroup.Get("/organization", doctorHandler.GetDoctorsByOrganization)
-	doctorGroup.Get("/schedule", doctorHandler.GetDoctorSchedule) // Add query param support for doctorId
-	doctorGroup.Put("/schedule", doctorHandler.UpdateDoctorSchedule)
-	doctorGroup.Delete("/schedule/:id", doctorHandler.DeleteDoctorSchedule)
-	doctorGroup.Get("/fees", doctorHandler.GetDoctorFees) // Add query param support for doctorId
+	doctorGroup.Get("/schedules", doctorHandler.GetDoctorSchedule)
+	doctorGroup.Put("/schedules", doctorHandler.UpdateDoctorSchedule)
+	doctorGroup.Delete("/:id/schedules", doctorHandler.DeleteDoctorSchedule)
+	doctorGroup.Get("/fees", doctorHandler.GetDoctorFees)
 	doctorGroup.Put("/fees", doctorHandler.UpdateDoctorFees)
-	doctorGroup.Delete("/fees/:id", doctorHandler.DeleteDoctorFees)
+	doctorGroup.Delete("/:id/fees", doctorHandler.DeleteDoctorFees)
 	doctorGroup.Get("/search", appointmentHandler.SearchDoctors)
-
+	doctorGroup.Post("/schedules", doctorHandler.CreateDoctorSchedule) // Use POST for creation
+	doctorGroup.Post("/fees", doctorHandler.CreateDoctorFees)          // Use POST for creation
 	// Hospital routes - protected
 	hospitalGroup := a.Fiber.Group("/api/hospital", authMiddleware.Handler())
 	hospitalGroup.Post("/create", hospitalHandler.CreateHospital)
