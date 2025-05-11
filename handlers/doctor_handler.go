@@ -737,72 +737,43 @@ func (h *DoctorHandler) UpdateDoctorSchedule(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"message": "Schedule updated successfully"})
 }
 
-// CreateDoctorFees adds a new doctor's fees structure
+// * CreateDoctorFees adds a new doctor's fees structure*
 func (h *DoctorHandler) CreateDoctorFees(c *fiber.Ctx) error {
-	authID, err := h.getAuthID(c)
-	if err != nil {
-		h.logger.Error("authID not found in context")
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
-	}
-
-	// Get organization ID from context
+	// Get organization ID from headers
 	orgID := c.Get("X-Organization-ID")
 	if orgID == "" {
-		h.logger.Error("organization ID not found in request headers")
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID is required"})
 	}
 
+	// Parse request body
 	var feesData DoctorFees
 	if err := c.BodyParser(&feesData); err != nil {
-		h.logger.Error("failed to parse fees data", zap.Error(err))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request data"})
 	}
 
-	if err := h.validateFeesData(&feesData); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	// Make sure we have the required fields
+	if feesData.DoctorID == uuid.Nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor ID is required"})
 	}
 
-	var userID uuid.UUID
-	var userName string
-	err = h.pgPool.QueryRow(c.Context(),
-		"SELECT u.user_id, d.name FROM users u JOIN doctors d ON u.user_id = d.doctor_id WHERE u.auth_id = $1",
-		authID).Scan(&userID, &userName)
-	if err != nil {
-		h.logger.Error("failed to get user ID and name", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
-	}
-
-	// Check if organization exists
-	var orgExists bool
-	err = h.pgPool.QueryRow(c.Context(),
-		"SELECT EXISTS(SELECT 1 FROM organizations WHERE organization_id = $1)",
-		orgID).Scan(&orgExists)
-	if err != nil {
-		h.logger.Error("failed to check if organization exists", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
-	}
-	if !orgExists {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization not found"})
-	}
-
-	// Check if fees already exist
+	// Just check if the doctor exists first
 	var exists bool
-	err = h.pgPool.QueryRow(c.Context(),
-		`SELECT EXISTS(SELECT 1 FROM doctor_fees WHERE doctor_id = $1 AND organization_id = $2)`,
-		userID, orgID).Scan(&exists)
+	err := h.pgPool.QueryRow(c.Context(),
+		"SELECT EXISTS(SELECT 1 FROM doctors WHERE doctor_id = $1)",
+		feesData.DoctorID).Scan(&exists)
 	if err != nil {
-		h.logger.Error("failed to check if fees exist", zap.Error(err))
+		h.logger.Error("failed to check if doctor exists", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
-	if exists {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "Fees already exist for this organization"})
+	if !exists {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor not found"})
 	}
 
+	// Insert fees
 	_, err = h.pgPool.Exec(c.Context(),
-		`INSERT INTO doctor_fees (doctor_id, organization_id, recurring_fees, default_fees, emergency_fees, created_at) 
-		 VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)`,
-		userID, orgID, feesData.RecurringFees, feesData.DefaultFees, feesData.EmergencyFees)
+		"INSERT INTO doctor_fees (doctor_id, organization_id, recurring_fees, default_fees, emergency_fees, created_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)",
+		feesData.DoctorID, orgID, feesData.RecurringFees, feesData.DefaultFees, feesData.EmergencyFees)
 	if err != nil {
 		h.logger.Error("failed to create doctor fees", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create fees"})
