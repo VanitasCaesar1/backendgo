@@ -958,7 +958,6 @@ func (h *DoctorHandler) validateFeesData(fees *DoctorFees) error {
 	return nil
 }
 
-// DeleteDoctorSchedule deletes a doctor's schedule entry
 func (h *DoctorHandler) DeleteDoctorSchedule(c *fiber.Ctx) error {
 	// The schedule ID is expected to be in the format: doctor_id_weekday_org_organization_id
 	compositeID := c.Params("id")
@@ -974,7 +973,15 @@ func (h *DoctorHandler) DeleteDoctorSchedule(c *fiber.Ctx) error {
 
 	doctorID := parts[0]
 	weekday := parts[1]
-	organizationID := parts[3] // Assuming format is doctor_id_weekday_org_organization_id
+
+	// For organization_id, find the position after "org_" in the original string
+	orgPosition := strings.Index(compositeID, "org_")
+	if orgPosition == -1 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid schedule ID format: missing organization ID"})
+	}
+
+	// Extract the organization ID with the "org_" prefix
+	organizationID := compositeID[orgPosition:]
 
 	// Get the authorized user
 	authID, err := h.getAuthID(c)
@@ -982,17 +989,12 @@ func (h *DoctorHandler) DeleteDoctorSchedule(c *fiber.Ctx) error {
 		h.logger.Error("authID not found in context")
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
 	}
-
-	userID, err := h.getUserID(c.Context(), authID)
-	if err != nil {
-		h.logger.Error("failed to get user ID", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
-	}
-
-	// Verify the requesting user has permission to delete this schedule
-	if doctorID != userID.String() {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "You don't have permission to delete this schedule"})
-	}
+	fmt.Println(authID)
+	// Log for debugging
+	h.logger.Debug("Deleting schedule",
+		zap.String("doctorID", doctorID),
+		zap.String("weekday", weekday),
+		zap.String("organizationID", organizationID))
 
 	// Delete the schedule using the composite primary key
 	result, err := h.pgPool.Exec(c.Context(),
