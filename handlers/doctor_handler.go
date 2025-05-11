@@ -369,16 +369,11 @@ func (h *DoctorHandler) GetDoctorSchedule(c *fiber.Ctx) error {
 
 // GetDoctorFees retrieves the doctor's fees structure
 func (h *DoctorHandler) GetDoctorFees(c *fiber.Ctx) error {
-	authID, err := h.getAuthID(c)
-	if err != nil {
-		h.logger.Error("authID not found in context")
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
-	}
-
-	userID, err := h.getUserID(c.Context(), authID)
-	if err != nil {
-		h.logger.Error("failed to get user ID", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	// Get doctor ID from path parameter instead of using the authenticated user's ID
+	doctorID := c.Params("id")
+	if doctorID == "" {
+		h.logger.Error("doctor ID not found in path parameters")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor ID is required"})
 	}
 
 	// Get organization ID from context
@@ -388,18 +383,19 @@ func (h *DoctorHandler) GetDoctorFees(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID is required"})
 	}
 
+	h.logger.Info("Fetching fees", zap.String("doctor_id", doctorID), zap.String("org_id", orgID))
+
 	// Use JOIN to get doctor name from the doctors table
 	rows, err := h.pgPool.Query(c.Context(),
-		`SELECT df.doctor_id, df.organization_id, d.name AS doctor_name, 
+		`SELECT df.doctor_id, df.organization_id, d.name AS doctor_name,
          df.recurring_fees, df.default_fees, df.emergency_fees, df.created_at
          FROM doctor_fees df
          JOIN doctors d ON df.doctor_id = d.doctor_id
-         WHERE df.doctor_id = $1 AND df.organization_id = $2`, userID, orgID)
+         WHERE df.doctor_id = $1 AND df.organization_id = $2`, doctorID, orgID)
+
 	if err != nil {
 		h.logger.Error("failed to fetch doctor fees", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch doctor fees"})
-	} else {
-		h.logger.Info("the fee is there")
 	}
 	defer rows.Close()
 
@@ -412,7 +408,6 @@ func (h *DoctorHandler) GetDoctorFees(c *fiber.Ctx) error {
 			h.logger.Error("failed to scan doctor fees", zap.Error(err))
 			continue
 		}
-
 		fees.CreatedAt = createdAt.Format(time.RFC3339)
 		feesStructures = append(feesStructures, fees)
 	}
@@ -420,6 +415,14 @@ func (h *DoctorHandler) GetDoctorFees(c *fiber.Ctx) error {
 	if err := rows.Err(); err != nil {
 		h.logger.Error("error during fees rows scan", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process doctor fees"})
+	}
+
+	// Add debug logging to see what's being returned
+	h.logger.Info("Returning fees", zap.Int("count", len(feesStructures)))
+
+	// If no fees found, return an empty array instead of null
+	if len(feesStructures) == 0 {
+		return c.JSON([]DoctorFees{})
 	}
 
 	return c.JSON(feesStructures)
@@ -845,37 +848,79 @@ func (h *DoctorHandler) CreateDoctorFees(c *fiber.Ctx) error {
 
 // UpdateDoctorFees adds or updates the doctor's fees structure
 func (h *DoctorHandler) UpdateDoctorFees(c *fiber.Ctx) error {
+	// Get auth ID from context
 	authID, err := h.getAuthID(c)
 	if err != nil {
 		h.logger.Error("authID not found in context")
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
 	}
-
-	// Get organization ID from context
+	fmt.Println(authID)
+	// Get organization ID from request header
 	orgID := c.Get("X-Organization-ID")
 	if orgID == "" {
 		h.logger.Error("organization ID not found in request headers")
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID is required"})
 	}
 
-	var feesData DoctorFees
+	// Parse request body
+	var feesData struct {
+		DoctorID       string `json:"doctorID"`
+		OrganizationID string `json:"organizationID"`
+		RecurringFees  int    `json:"recurringFees"`
+		DefaultFees    int    `json:"defaultFees"`
+		EmergencyFees  int    `json:"emergencyFees"`
+	}
+
 	if err := c.BodyParser(&feesData); err != nil {
 		h.logger.Error("failed to parse fees data", zap.Error(err))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request data"})
 	}
 
-	if err := h.validateFeesData(&feesData); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	// Basic validation
+	if feesData.RecurringFees < 0 || feesData.DefaultFees < 0 || feesData.EmergencyFees < 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Fees cannot be negative"})
 	}
 
-	var userID uuid.UUID
-	var userName string
-	err = h.pgPool.QueryRow(c.Context(),
-		"SELECT u.user_id, d.name FROM users u JOIN doctors d ON u.user_id = d.doctor_id WHERE u.auth_id = $1",
-		authID).Scan(&userID, &userName)
-	if err != nil {
-		h.logger.Error("failed to get user ID and name", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	// Get the doctor ID from the request body if provided, otherwise use the authenticated user
+	var doctorID uuid.UUID
+	var doctorName string
+
+	if feesData.DoctorID != "" {
+		// If doctor ID is provided in the request, use it (after validation)
+		// This allows admins to set fees for other doctors
+		var err error
+		doctorID, err = uuid.Parse(feesData.DoctorID)
+		if err != nil {
+			h.logger.Error("invalid doctor ID format", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid doctor ID format"})
+		}
+
+		// Check if the doctor exists
+		err = h.pgPool.QueryRow(c.Context(),
+			"SELECT name FROM doctors WHERE doctor_id = $1",
+			doctorID).Scan(&doctorName)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Doctor not found"})
+			}
+			h.logger.Error("failed to check if doctor exists", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+		}
+	} else {
+		// If no doctor ID provided, use the authenticated user
+		err = h.pgPool.QueryRow(c.Context(),
+			"SELECT d.doctor_id, d.name FROM users u JOIN doctors d ON u.user_id = d.doctor_id WHERE u.auth_id = $1",
+			authID).Scan(&doctorID, &doctorName)
+		if err != nil {
+			h.logger.Error("failed to get doctor ID and name", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+		}
+	}
+
+	// Use the organization ID from the header as the primary one
+	// (feesData.OrganizationID is just a backup, prefer the header)
+	if orgID == "" && feesData.OrganizationID != "" {
+		orgID = feesData.OrganizationID
 	}
 
 	// Check if organization exists
@@ -891,18 +936,38 @@ func (h *DoctorHandler) UpdateDoctorFees(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization not found"})
 	}
 
+	h.logger.Info("Updating doctor fees",
+		zap.String("doctor_id", doctorID.String()),
+		zap.String("org_id", orgID),
+		zap.Int("recurring_fees", feesData.RecurringFees),
+		zap.Int("default_fees", feesData.DefaultFees),
+		zap.Int("emergency_fees", feesData.EmergencyFees))
+
+	// Upsert the doctor fees record
 	_, err = h.pgPool.Exec(c.Context(),
-		`INSERT INTO doctor_fees (doctor_id, organization_id, recurring_fees, default_fees, emergency_fees, created_at) 
-		 VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
-		 ON CONFLICT (doctor_id, organization_id) 
-		 DO UPDATE SET recurring_fees = $3, default_fees = $4, emergency_fees = $5, created_at = CURRENT_TIMESTAMP`,
-		userID, orgID, feesData.RecurringFees, feesData.DefaultFees, feesData.EmergencyFees)
+		`INSERT INTO doctor_fees (doctor_id, organization_id, recurring_fees, default_fees, emergency_fees, created_at)
+         VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+         ON CONFLICT (doctor_id, organization_id)
+         DO UPDATE SET recurring_fees = $3, default_fees = $4, emergency_fees = $5, created_at = CURRENT_TIMESTAMP`,
+		doctorID, orgID, feesData.RecurringFees, feesData.DefaultFees, feesData.EmergencyFees)
 	if err != nil {
 		h.logger.Error("failed to update doctor fees", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update fees"})
 	}
 
-	return c.JSON(fiber.Map{"message": "Fees updated successfully"})
+	// Return the successful response with doctor name
+	return c.JSON(fiber.Map{
+		"message": "Fees updated successfully",
+		"data": fiber.Map{
+			"doctorID":       doctorID,
+			"doctorName":     doctorName,
+			"organizationID": orgID,
+			"recurringFees":  feesData.RecurringFees,
+			"defaultFees":    feesData.DefaultFees,
+			"emergencyFees":  feesData.EmergencyFees,
+			"updatedAt":      time.Now().Format(time.RFC3339),
+		},
+	})
 }
 
 // validateDoctorProfileUpdate validates the doctor profile update data
@@ -982,14 +1047,6 @@ func (h *DoctorHandler) validateDoctorProfileUpdate(profile *DoctorProfile) erro
 	return nil
 }
 
-// validateFeesData validates the doctor fees data
-func (h *DoctorHandler) validateFeesData(fees *DoctorFees) error {
-	if fees.RecurringFees < 0 || fees.DefaultFees < 0 || fees.EmergencyFees < 0 {
-		return errors.New("fees cannot be negative")
-	}
-	return nil
-}
-
 func (h *DoctorHandler) DeleteDoctorSchedule(c *fiber.Ctx) error {
 	// The schedule ID is expected to be in the format: doctor_id_weekday_org_organization_id
 	compositeID := c.Params("id")
@@ -1045,39 +1102,66 @@ func (h *DoctorHandler) DeleteDoctorSchedule(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"message": "Schedule deleted successfully"})
 }
 
-// DeleteDoctorFees deletes a doctor's fees entry
+// DeleteDoctorFees deletes a doctor's fees for a specific organization
 func (h *DoctorHandler) DeleteDoctorFees(c *fiber.Ctx) error {
-	feesId := c.Params("id")
-	if feesId == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Fees ID is required"})
-	}
-	// Get the authorized user
-	authID, err := h.getAuthID(c)
-	if err != nil {
-		h.logger.Error("authID not found in context")
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	// Get doctor ID from path parameter
+	doctorIDParam := c.Params("id")
+	if doctorIDParam == "" {
+		h.logger.Error("doctor ID not found in path parameters")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor ID is required"})
 	}
 
-	userID, err := h.getUserID(c.Context(), authID)
+	// Parse the UUID to validate format
+	doctorID, err := uuid.Parse(doctorIDParam)
 	if err != nil {
-		h.logger.Error("failed to get user ID", zap.Error(err))
+		h.logger.Error("invalid doctor ID format", zap.Error(err))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid doctor ID format"})
+	}
+
+	// Get organization ID from request header
+	orgID := c.Get("X-Organization-ID")
+	if orgID == "" {
+		h.logger.Error("organization ID not found in request headers")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID is required"})
+	}
+
+	h.logger.Info("Deleting doctor fees", zap.String("doctor_id", doctorID.String()), zap.String("org_id", orgID))
+
+	// Verify doctor exists
+	var doctorExists bool
+	err = h.pgPool.QueryRow(c.Context(),
+		"SELECT EXISTS(SELECT 1 FROM doctors WHERE doctor_id = $1)", doctorID).Scan(&doctorExists)
+	if err != nil {
+		h.logger.Error("failed to check if doctor exists", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
+	if !doctorExists {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Doctor not found"})
+	}
 
-	// Delete the fees entry, ensuring it belongs to the current doctor
+	// Execute DELETE using the composite primary key columns
 	result, err := h.pgPool.Exec(c.Context(),
-		`DELETE FROM doctor_fees WHERE id = $1 AND doctor_id = $2`, feesId, userID)
+		`DELETE FROM doctor_fees WHERE doctor_id = $1 AND organization_id = $2`, doctorID, orgID)
 	if err != nil {
 		h.logger.Error("failed to delete doctor fees", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to delete fees"})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to delete doctor fees"})
 	}
 
+	// Check if any rows were actually deleted
 	rowsAffected := result.RowsAffected()
 	if rowsAffected == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Fees not found or you don't have permission to delete it"})
+		h.logger.Warn("no doctor fees found to delete", zap.String("doctor_id", doctorID.String()), zap.String("org_id", orgID))
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "No doctor fees found for this doctor in this organization"})
 	}
 
-	return c.JSON(fiber.Map{"message": "Fees deleted successfully"})
+	h.logger.Info("Successfully deleted doctor fees", zap.String("doctor_id", doctorID.String()), zap.String("org_id", orgID))
+	return c.JSON(fiber.Map{
+		"message": "Doctor fees deleted successfully",
+		"data": fiber.Map{
+			"doctorID":       doctorID,
+			"organizationID": orgID,
+		},
+	})
 }
 
 // GetDoctorsByOrganization retrieves all doctors in the same organization
