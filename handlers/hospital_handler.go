@@ -53,13 +53,13 @@ type Hospital struct {
 	Number        int64         `json:"number"`
 	Address       string        `json:"address"`
 	LicenseNumber string        `json:"license_number,omitempty"`
-	StartTime     string        `json:"startTime" validate:"required"` // Time as string HH:MM:SS
-	EndTime       string        `json:"endTime" validate:"required"`   //
+	StartTime     string        `json:"startTime" validate:"required"`
+	EndTime       string        `json:"endTime" validate:"required"`
 	Location      string        `json:"location"`
 	Speciality    string        `json:"speciality,omitempty"`
 	CreatedAt     string        `json:"created_at,omitempty"`
 	Fees          []HospitalFee `json:"fees,omitempty"`
-	HospitalPics  []string      `json:"hospital_pics,omitempty"` // Changed to []string for URLs only
+	HospitalPics  []string      `json:"hospital_pics,omitempty"`
 }
 
 func NewHospitalHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, mongoClient *mongo.Client, pgPool *pgxpool.Pool) (*HospitalHandler, error) {

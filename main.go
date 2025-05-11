@@ -495,15 +495,16 @@ func (a *App) setupRoutes() error {
 	doctorGroup.Put("/profile", doctorHandler.UpdateDoctorProfile)
 	doctorGroup.Delete("/profile", doctorAuthHandler.DeleteDoctor)
 	doctorGroup.Get("/organization", doctorHandler.GetDoctorsByOrganization)
-	doctorGroup.Get("/schedules", doctorHandler.GetDoctorSchedule)
-	doctorGroup.Put("/schedules", doctorHandler.UpdateDoctorSchedule)
-	doctorGroup.Delete("/:id/schedules", doctorHandler.DeleteDoctorSchedule)
-	doctorGroup.Get("/fees", doctorHandler.GetDoctorFees)
-	doctorGroup.Put("/fees", doctorHandler.UpdateDoctorFees)
-	doctorGroup.Delete("/:id/fees", doctorHandler.DeleteDoctorFees)
+	doctorGroup.Get("/:id/schedules", doctorHandler.GetDoctorSchedule)
+	doctorGroup.Put("/schedules/:id", doctorHandler.UpdateDoctorSchedule)
+	doctorGroup.Delete("/schedules/:id", doctorHandler.DeleteDoctorSchedule)
+	doctorGroup.Get("/:id/fees", doctorHandler.GetDoctorFees)
+	doctorGroup.Put("/fees/:id", doctorHandler.UpdateDoctorFees)
+	doctorGroup.Delete("/fees/:id", doctorHandler.DeleteDoctorFees)
 	doctorGroup.Get("/search", appointmentHandler.SearchDoctors)
-	doctorGroup.Post("/schedules", doctorHandler.CreateDoctorSchedule) // Use POST for creation
-	doctorGroup.Post("/fees", doctorHandler.CreateDoctorFees)          // Use POST for creation
+	doctorGroup.Post("/schedules", doctorHandler.CreateDoctorSchedule)
+	doctorGroup.Post("/fees", doctorHandler.CreateDoctorFees)
+
 	// Hospital routes - protected
 	hospitalGroup := a.Fiber.Group("/api/hospital", authMiddleware.Handler())
 	hospitalGroup.Post("/create", hospitalHandler.CreateHospital)
