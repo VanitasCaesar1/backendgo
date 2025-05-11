@@ -69,13 +69,13 @@ type DoctorSchedule struct {
 }
 
 type DoctorFees struct {
-	DoctorID       uuid.UUID `json:"doctor_id"`
-	OrganizationID string    `json:"organization_id"`
-	DoctorName     string    `json:"doctor_name"`
-	RecurringFees  int       `json:"recurring_fees"`
-	DefaultFees    int       `json:"default_fees"`
-	EmergencyFees  int       `json:"emergency_fees"`
-	CreatedAt      string    `json:"created_at,omitempty"`
+	DoctorID       string `json:"doctorID"` // Changed to string to match incoming JSON
+	OrganizationID string `json:"organization_id"`
+	DoctorName     string `json:"doctor_name"`
+	RecurringFees  int    `json:"recurring_fees"`
+	DefaultFees    int    `json:"default_fees"`
+	EmergencyFees  int    `json:"emergency_fees"`
+	CreatedAt      string `json:"created_at,omitempty"`
 }
 
 func NewDoctorHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, pgPool *pgxpool.Pool) (*DoctorHandler, error) {
@@ -398,6 +398,8 @@ func (h *DoctorHandler) GetDoctorFees(c *fiber.Ctx) error {
 	if err != nil {
 		h.logger.Error("failed to fetch doctor fees", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch doctor fees"})
+	} else {
+		h.logger.Info("the fee is there")
 	}
 	defer rows.Close()
 
@@ -737,7 +739,6 @@ func (h *DoctorHandler) UpdateDoctorSchedule(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"message": "Schedule updated successfully"})
 }
 
-// * CreateDoctorFees adds a new doctor's fees structure*
 func (h *DoctorHandler) CreateDoctorFees(c *fiber.Ctx) error {
 	// Get organization ID from headers
 	orgID := c.Get("X-Organization-ID")
@@ -745,41 +746,101 @@ func (h *DoctorHandler) CreateDoctorFees(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID is required"})
 	}
 
+	// Log request body for debugging
+	h.logger.Info("Received doctor fees request",
+		zap.String("body", string(c.Body())),
+		zap.String("orgID", orgID))
+
 	// Parse request body
-	var feesData DoctorFees
-	if err := c.BodyParser(&feesData); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request data"})
+	var feesData struct {
+		DoctorID      string `json:"doctorID"`
+		RecurringFees int    `json:"recurringFees"`
+		DefaultFees   int    `json:"defaultFees"`
+		EmergencyFees int    `json:"emergencyFees"`
 	}
 
-	// Make sure we have the required fields
-	if feesData.DoctorID == uuid.Nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor ID is required"})
+	if err := c.BodyParser(&feesData); err != nil {
+		h.logger.Error("failed to parse request body", zap.Error(err))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error":   "Invalid request data",
+			"details": err.Error(),
+		})
+	}
+
+	// Log parsed data
+	h.logger.Info("Parsed doctor fees data",
+		zap.String("doctorID", feesData.DoctorID),
+		zap.Int("recurringFees", feesData.RecurringFees),
+		zap.Int("defaultFees", feesData.DefaultFees),
+		zap.Int("emergencyFees", feesData.EmergencyFees))
+
+	// Parse the doctor ID string to UUID
+	doctorID, err := uuid.Parse(feesData.DoctorID)
+	if err != nil {
+		h.logger.Warn("invalid doctor ID format", zap.Error(err))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error":      "Invalid doctor ID format",
+			"receivedID": feesData.DoctorID,
+		})
 	}
 
 	// Just check if the doctor exists first
 	var exists bool
-	err := h.pgPool.QueryRow(c.Context(),
+	err = h.pgPool.QueryRow(c.Context(),
 		"SELECT EXISTS(SELECT 1 FROM doctors WHERE doctor_id = $1)",
-		feesData.DoctorID).Scan(&exists)
+		doctorID).Scan(&exists)
 	if err != nil {
 		h.logger.Error("failed to check if doctor exists", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
 	if !exists {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor not found"})
+		h.logger.Warn("doctor not found",
+			zap.String("doctorID", feesData.DoctorID),
+			zap.String("orgID", orgID))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error":          "Doctor not found",
+			"doctorID":       feesData.DoctorID,
+			"organizationID": orgID,
+		})
 	}
 
-	// Insert fees
+	// Check if fees already exist for this doctor in this organization
+	err = h.pgPool.QueryRow(c.Context(),
+		"SELECT EXISTS(SELECT 1 FROM doctor_fees WHERE doctor_id = $1 AND organization_id = $2)",
+		doctorID, orgID).Scan(&exists)
+	if err != nil {
+		h.logger.Error("failed to check if fees exist", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	if exists {
+		h.logger.Warn("fees already exist for this doctor",
+			zap.String("doctorID", feesData.DoctorID),
+			zap.String("orgID", orgID))
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error":          "Fees already exist for this doctor",
+			"doctorID":       feesData.DoctorID,
+			"organizationID": orgID,
+		})
+	}
+
+	// Insert new fees
 	_, err = h.pgPool.Exec(c.Context(),
-		"INSERT INTO doctor_fees (doctor_id, organization_id, recurring_fees, default_fees, emergency_fees, created_at) VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)",
-		feesData.DoctorID, orgID, feesData.RecurringFees, feesData.DefaultFees, feesData.EmergencyFees)
+		`INSERT INTO doctor_fees
+        (doctor_id, organization_id, recurring_fees, default_fees, emergency_fees, created_at)
+        VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)`,
+		doctorID, orgID, feesData.RecurringFees, feesData.DefaultFees, feesData.EmergencyFees)
 	if err != nil {
 		h.logger.Error("failed to create doctor fees", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create fees"})
 	}
 
-	return c.Status(fiber.StatusCreated).JSON(fiber.Map{"message": "Fees created successfully"})
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+		"message":        "Fees created successfully",
+		"doctorID":       feesData.DoctorID,
+		"organizationID": orgID,
+	})
 }
 
 // UpdateDoctorFees adds or updates the doctor's fees structure
