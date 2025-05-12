@@ -16,6 +16,7 @@ import (
 	"github.com/VanitasCaesar1/backend/config"
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/workos/workos-go/v4/pkg/usermanagement"
@@ -157,43 +158,57 @@ type AppointmentRequest struct {
 }
 
 type Appointment struct {
-	PatientID         string    `json:"patient_id" bson:"patient_id"`
-	DoctorID          string    `json:"doctor_id" bson:"doctor_id"`
-	OrgID             string    `json:"org_id" bson:"org_id"`
-	PatientName       string    `json:"patient_name" bson:"patient_name"`
-	DoctorName        string    `json:"doctor_name" bson:"doctor_name"`
-	AppointmentStatus string    `json:"appointment_status" bson:"appointment_status"`
-	PaymentMethod     string    `json:"payment_method" bson:"payment_method"`
-	FeeType           string    `json:"fee_type" bson:"fee_type"`
-	AppointmentFee    int       `json:"appointment_fee" bson:"appointment_fee"` // Changed to int to match schema
-	AppointmentDate   time.Time `json:"appointment_date" bson:"appointment_date"`
-	CreatedAt         time.Time `json:"created_at" bson:"created_at"`
-	UpdatedAt         time.Time `json:"updated_at" bson:"updated_at"`
-	Reason            string    `json:"reason,omitempty" bson:"reason,omitempty"` // Optional field
+	ID                primitive.ObjectID `bson:"_id,omitempty"`
+	AppointmentID     string             `bson:"appointment_id"`       // UUID format
+	PatientID         string             `bson:"patient_id"`           // 8-digit alphanumeric ID
+	DoctorID          string             `bson:"doctor_id"`            // UUID format
+	OrgID             string             `bson:"org_id"`               // Organization ID in ULID format
+	PatientName       string             `bson:"patient_name"`         // Full name of patient
+	DoctorName        string             `bson:"doctor_name"`          // Full name of doctor
+	AppointmentStatus string             `bson:"appointment_status"`   // completed or not_completed
+	PaymentMethod     string             `bson:"payment_method"`       // Method of payment
+	FeeType           string             `bson:"fee_type"`             // emergency, default, or recurring
+	AppointmentFee    int                `bson:"appointment_fee"`      // Amount as integer
+	AppointmentDate   time.Time          `bson:"appointment_date"`     // Date and time of appointment
+	CreatedAt         time.Time          `bson:"created_at"`           // Creation timestamp
+	UpdatedAt         time.Time          `bson:"updated_at,omitempty"` // Last update timestamp
+	IsValid           bool               `bson:"is_valid"`             // Flag for validity
+	NextVisitDate     time.Time          `bson:"next_visit_date"`      // Date for next visit
 }
 
+// Define response type for clarity
 type AppointmentResponse struct {
+	ID                string `json:"id"`
+	AppointmentID     string `json:"appointment_id"`
 	PatientID         string `json:"patient_id"`
 	DoctorID          string `json:"doctor_id"`
-	HospitalID        string `json:"hospital_id"`
+	OrgID             string `json:"org_id"`
 	PatientName       string `json:"patient_name"`
 	DoctorName        string `json:"doctor_name"`
 	AppointmentStatus string `json:"appointment_status"`
 	PaymentMethod     string `json:"payment_method"`
 	FeeType           string `json:"fee_type"`
-	AppointmentFee    int    `json:"appointment_fee"` // Changed from float64 to int
-	AppointmentDate   string `json:"appointment_date,omitempty"`
+	AppointmentFee    int    `json:"appointment_fee"`
+	AppointmentDate   string `json:"appointment_date"`
+	NextVisitDate     string `json:"next_visit_date"`
+	IsValid           bool   `json:"is_valid"`
 	CreatedAt         string `json:"created_at"`
-	UpdatedAt         string `json:"updated_at,omitempty"`
+	UpdatedAt         string `json:"updated_at"`
 }
 
 type AppointmentFilters struct {
-	Status    string `query:"status"`
-	StartDate string `query:"start_date"`
-	EndDate   string `query:"end_date"`
-	DoctorID  string `query:"doctor_id"`
-	Limit     int64  `query:"limit"`
-	Offset    int64  `query:"offset"`
+	AppointmentID string `query:"appointment_id"`
+	PatientID     string `query:"patient_id"`
+	DoctorID      string `query:"doctor_id"`
+	Status        string `query:"status"`
+	FeeType       string `query:"fee_type"`
+	IsValid       *bool  `query:"is_valid"`
+	StartDate     string `query:"start_date"`
+	EndDate       string `query:"end_date"`
+	Limit         int64  `query:"limit"`
+	Offset        int64  `query:"offset"`
+	SortBy        string `query:"sort_by"`
+	SortOrder     string `query:"sort_order"`
 }
 
 func NewAppointmentHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, pgPool *pgxpool.Pool, mongoClient *mongo.Client) (*AppointmentHandler, error) {
@@ -214,12 +229,6 @@ func (h *AppointmentHandler) getUserID(ctx context.Context, authID string) (uuid
 	return userID, err
 }
 
-func (h *AppointmentHandler) getHospitalIDFromOrgID(ctx context.Context, orgID string) (uuid.UUID, error) {
-	var hospitalID uuid.UUID
-	err := h.pgPool.QueryRow(ctx, "SELECT hospital_id FROM hospitals WHERE org_id = $1", orgID).Scan(&hospitalID)
-	return hospitalID, err
-}
-
 func (h *AppointmentHandler) getAuthID(c *fiber.Ctx) (string, error) {
 	authID, ok := c.Locals("authID").(string)
 	if !ok {
@@ -234,7 +243,15 @@ func (h *AppointmentHandler) getUserRole(ctx context.Context, userID uuid.UUID) 
 	return role, err
 }
 
-// GetAppointmentsByOrgID retrieves appointments based on org_id
+// AppointmentFilters struct to capture and validate query parameters
+
+// validateUUID validates that a string is in proper UUID format
+func validateUUID(id string) bool {
+	uuidRegex := regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	return uuidRegex.MatchString(id)
+}
+
+// GetAppointmentsByOrgID retrieves appointments based on org_id from X-Organization-ID header
 func (h *AppointmentHandler) GetAppointmentsByOrgID(c *fiber.Ctx) error {
 	// Get auth ID from context
 	authID, err := h.getAuthID(c)
@@ -243,38 +260,25 @@ func (h *AppointmentHandler) GetAppointmentsByOrgID(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	// Get org ID from params
-	orgID := c.Params("orgID")
+	// Get organization ID from request headers
+	orgID := c.Get("X-Organization-ID")
 	if orgID == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID is required"})
+		h.logger.Error("organization ID not found in headers")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID is required in X-Organization-ID header"})
 	}
 
-	// Get user ID
-	userID, err := h.getUserID(c.Context(), authID)
-	if err != nil {
-		h.logger.Error("failed to get user ID", zap.Error(err), zap.String("authID", authID))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve user information"})
+	// Validate org ID format
+	if !validateOrgID(orgID) {
+		h.logger.Error("invalid organization ID format", zap.String("orgID", orgID))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error":   "Invalid organization ID format",
+			"details": "Organization ID must be in ULID format with org_ prefix",
+		})
 	}
 
-	// Check user role to ensure they have permission
-	role, err := h.getUserRole(c.Context(), userID)
-	if err != nil {
-		h.logger.Error("failed to get user role", zap.Error(err), zap.String("userID", userID.String()))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve user role"})
-	}
-
-	// Only admin or hospital_admin roles should be able to view appointments by org ID
-	if role != "admin" && role != "hospital_admin" {
-		h.logger.Error("unauthorized access attempt", zap.String("userID", userID.String()), zap.String("role", role))
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "Not authorized to view organization appointments"})
-	}
-
-	// Get hospital ID from org ID
-	hospitalID, err := h.getHospitalIDFromOrgID(c.Context(), orgID)
-	if err != nil {
-		h.logger.Error("failed to get hospital ID from org ID", zap.Error(err), zap.String("orgID", orgID))
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Hospital not found for this organization"})
-	}
+	h.logger.Info("Processing request",
+		zap.String("Auth ID", authID),
+		zap.String("Org ID", orgID))
 
 	// Parse query filters
 	var filters AppointmentFilters
@@ -283,105 +287,39 @@ func (h *AppointmentHandler) GetAppointmentsByOrgID(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid query parameters"})
 	}
 
-	// Set defaults for pagination
-	if filters.Limit <= 0 {
-		filters.Limit = 20 // Default limit
-	}
-	if filters.Limit > 100 {
-		filters.Limit = 100 // Maximum limit
+	// Apply validation and defaults to filters
+	if err := validateAndSetFilterDefaults(&filters); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
 	// Build MongoDB query
-	query := bson.M{"hospital_id": hospitalID.String()}
+	query := buildAppointmentQuery(orgID, filters)
 
-	// Add status filter if provided
-	if filters.Status != "" {
-		query["appointment_status"] = filters.Status
-	}
-
-	// Add date range filters if provided
-	if filters.StartDate != "" || filters.EndDate != "" {
-		dateFilter := bson.M{}
-
-		if filters.StartDate != "" {
-			startDate, err := time.Parse("2006-01-02", filters.StartDate)
-			if err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid start date format. Use YYYY-MM-DD"})
-			}
-			dateFilter["$gte"] = startDate
-		}
-
-		if filters.EndDate != "" {
-			endDate, err := time.Parse("2006-01-02", filters.EndDate)
-			if err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid end date format. Use YYYY-MM-DD"})
-			}
-			// Add one day to include the entire end date
-			endDate = endDate.Add(24 * time.Hour)
-			dateFilter["$lt"] = endDate
-		}
-
-		query["appointment_date"] = dateFilter
-	}
-
-	// Add doctor filter if provided
-	if filters.DoctorID != "" {
-		query["doctor_id"] = filters.DoctorID
-	}
-
-	// Configure find options
+	// Configure find options and determine sort direction
 	findOptions := options.Find()
 	findOptions.SetLimit(filters.Limit)
 	findOptions.SetSkip(filters.Offset)
-	findOptions.SetSort(bson.D{{Key: "appointment_date", Value: -1}}) // Sort by appointment date, newest first
+
+	// Set sort order
+	sortDirection := -1 // Default to descending
+	if strings.ToLower(filters.SortOrder) == "asc" {
+		sortDirection = 1
+	}
+	findOptions.SetSort(bson.D{{Key: filters.SortBy, Value: sortDirection}})
 
 	// Query MongoDB
 	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
 	cursor, err := appointmentsCollection.Find(c.Context(), query, findOptions)
 	if err != nil {
-		h.logger.Error("failed to query appointments", zap.Error(err), zap.String("hospitalID", hospitalID.String()))
+		h.logger.Error("failed to query appointments", zap.Error(err), zap.String("orgID", orgID))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch appointments"})
 	}
 	defer cursor.Close(c.Context())
 
 	// Process appointments
-	var appointments []AppointmentResponse
-	for cursor.Next(c.Context()) {
-		var appointment Appointment
-		if err := cursor.Decode(&appointment); err != nil {
-			h.logger.Error("failed to decode appointment", zap.Error(err))
-			continue
-		}
-
-		// Convert to response format
-		appointmentDateStr := ""
-		if !appointment.AppointmentDate.IsZero() {
-			appointmentDateStr = appointment.AppointmentDate.Format(time.RFC3339)
-		}
-
-		updatedAtStr := ""
-		if !appointment.UpdatedAt.IsZero() {
-			updatedAtStr = appointment.UpdatedAt.Format(time.RFC3339)
-		}
-
-		appointments = append(appointments, AppointmentResponse{
-			PatientID:         appointment.PatientID,
-			DoctorID:          appointment.DoctorID,
-			HospitalID:        appointment.OrgID,
-			PatientName:       appointment.PatientName,
-			DoctorName:        appointment.DoctorName,
-			AppointmentStatus: appointment.AppointmentStatus,
-			PaymentMethod:     appointment.PaymentMethod,
-			FeeType:           appointment.FeeType,
-			AppointmentFee:    appointment.AppointmentFee, // No conversion needed - already int
-			AppointmentDate:   appointmentDateStr,
-			CreatedAt:         appointment.CreatedAt.Format(time.RFC3339),
-			UpdatedAt:         updatedAtStr,
-		})
-	}
-
-	if err := cursor.Err(); err != nil {
-		h.logger.Error("cursor error", zap.Error(err))
+	appointments, err := processAppointments(cursor, c.Context())
+	if err != nil {
+		h.logger.Error("error processing appointments", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Error processing appointments"})
 	}
 
@@ -389,8 +327,7 @@ func (h *AppointmentHandler) GetAppointmentsByOrgID(c *fiber.Ctx) error {
 	total, err := appointmentsCollection.CountDocuments(c.Context(), query)
 	if err != nil {
 		h.logger.Error("failed to count appointments", zap.Error(err))
-		// Continue with the results but without total count
-		total = 0
+		total = 0 // Continue with the results but without total count
 	}
 
 	return c.JSON(fiber.Map{
@@ -403,107 +340,384 @@ func (h *AppointmentHandler) GetAppointmentsByOrgID(c *fiber.Ctx) error {
 	})
 }
 
+// Helper functions to improve readability and maintainability
+
+// validateAndSetFilterDefaults validates filter values and sets defaults
+func validateAndSetFilterDefaults(filters *AppointmentFilters) error {
+	// Validate appointment ID if provided
+	if filters.AppointmentID != "" && !validateUUID(filters.AppointmentID) {
+		return fmt.Errorf("invalid appointment ID format: must be in UUID format")
+	}
+
+	// Validate doctor ID if provided
+	if filters.DoctorID != "" && filters.DoctorID != "all" && !validateUUID(filters.DoctorID) {
+		return fmt.Errorf("invalid doctor ID format: must be in UUID format")
+	}
+
+	// Validate patient ID if provided
+	if filters.PatientID != "" && filters.PatientID != "all" && !validatePatientID(filters.PatientID) {
+		return fmt.Errorf("invalid patient ID format: must be an 8-character alphanumeric string")
+	}
+
+	// Set defaults for pagination
+	if filters.Limit <= 0 {
+		filters.Limit = 20 // Default limit
+	}
+	if filters.Limit > 100 {
+		filters.Limit = 100 // Maximum limit
+	}
+
+	// Set default sort parameters if not provided
+	if filters.SortBy == "" {
+		filters.SortBy = "appointment_date"
+	}
+	if filters.SortOrder == "" {
+		filters.SortOrder = "desc"
+	}
+
+	return nil
+}
+
+// buildAppointmentQuery constructs the MongoDB query based on filters
+func buildAppointmentQuery(orgID string, filters AppointmentFilters) bson.M {
+	query := bson.M{"org_id": orgID}
+
+	// Add appointment ID filter if provided
+	if filters.AppointmentID != "" {
+		query["appointment_id"] = filters.AppointmentID
+	}
+
+	// Add patient ID filter if provided
+	if filters.PatientID != "" && filters.PatientID != "all" {
+		query["patient_id"] = filters.PatientID
+	}
+
+	// Add status filter if provided
+	if filters.Status != "" && filters.Status != "all" {
+		query["appointment_status"] = filters.Status
+	}
+
+	// Add doctor filter if provided
+	if filters.DoctorID != "" && filters.DoctorID != "all" {
+		query["doctor_id"] = filters.DoctorID
+	}
+
+	// Add fee type filter if provided
+	if filters.FeeType != "" && filters.FeeType != "all" {
+		query["fee_type"] = filters.FeeType
+	}
+
+	// Add validity filter if provided
+	if filters.IsValid != nil {
+		query["is_valid"] = *filters.IsValid
+	}
+
+	// Add date range filters if provided
+	if filters.StartDate != "" || filters.EndDate != "" {
+		dateFilter := bson.M{}
+
+		if filters.StartDate != "" {
+			startDate, err := time.Parse("2006-01-02", filters.StartDate)
+			if err == nil { // Skip if parse error
+				dateFilter["$gte"] = startDate
+			}
+		}
+
+		if filters.EndDate != "" {
+			endDate, err := time.Parse("2006-01-02", filters.EndDate)
+			if err == nil { // Skip if parse error
+				// Add one day to include the entire end date
+				endDate = endDate.Add(24 * time.Hour)
+				dateFilter["$lt"] = endDate
+			}
+		}
+
+		if len(dateFilter) > 0 {
+			query["appointment_date"] = dateFilter
+		}
+	}
+
+	return query
+}
+
+// processAppointments converts database documents to response format
+func processAppointments(cursor *mongo.Cursor, ctx context.Context) ([]AppointmentResponse, error) {
+	var appointments []AppointmentResponse
+
+	for cursor.Next(ctx) {
+		var appointment struct {
+			// Using direct fields without MongoDB ObjectID
+			AppointmentID     string    `bson:"appointment_id"`
+			PatientID         string    `bson:"patient_id"`
+			DoctorID          string    `bson:"doctor_id"`
+			OrgID             string    `bson:"org_id"`
+			PatientName       string    `bson:"patient_name"`
+			DoctorName        string    `bson:"doctor_name"`
+			AppointmentStatus string    `bson:"appointment_status"`
+			PaymentMethod     string    `bson:"payment_method"`
+			FeeType           string    `bson:"fee_type"`
+			AppointmentFee    int       `bson:"appointment_fee"`
+			AppointmentDate   time.Time `bson:"appointment_date"`
+			NextVisitDate     time.Time `bson:"next_visit_date"`
+			IsValid           bool      `bson:"is_valid"`
+			CreatedAt         time.Time `bson:"created_at"`
+			UpdatedAt         time.Time `bson:"updated_at"`
+		}
+
+		if err := cursor.Decode(&appointment); err != nil {
+			return nil, err
+		}
+
+		// Format dates
+		appointmentDateStr := ""
+		if !appointment.AppointmentDate.IsZero() {
+			appointmentDateStr = appointment.AppointmentDate.Format(time.RFC3339)
+		}
+
+		nextVisitDateStr := ""
+		if !appointment.NextVisitDate.IsZero() {
+			nextVisitDateStr = appointment.NextVisitDate.Format(time.RFC3339)
+		}
+
+		updatedAtStr := ""
+		if !appointment.UpdatedAt.IsZero() {
+			updatedAtStr = appointment.UpdatedAt.Format(time.RFC3339)
+		}
+
+		appointments = append(appointments, AppointmentResponse{
+			ID:                appointment.AppointmentID, // Using appointment_id as the main ID
+			AppointmentID:     appointment.AppointmentID,
+			PatientID:         appointment.PatientID,
+			DoctorID:          appointment.DoctorID,
+			OrgID:             appointment.OrgID,
+			PatientName:       appointment.PatientName,
+			DoctorName:        appointment.DoctorName,
+			AppointmentStatus: appointment.AppointmentStatus,
+			PaymentMethod:     appointment.PaymentMethod,
+			FeeType:           appointment.FeeType,
+			AppointmentFee:    appointment.AppointmentFee,
+			AppointmentDate:   appointmentDateStr,
+			NextVisitDate:     nextVisitDateStr,
+			IsValid:           appointment.IsValid,
+			CreatedAt:         appointment.CreatedAt.Format(time.RFC3339),
+			UpdatedAt:         updatedAtStr,
+		})
+	}
+
+	return appointments, cursor.Err()
+}
+
 func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	// Get auth ID from context
 	authID, err := h.getAuthID(c)
 	if err != nil {
-		h.logger.Error("authID not found in context")
+		h.logger.Error("authID not found in context", zap.Error(err))
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
 	}
+	fmt.Println("Auth ID:", authID)
+	// Log raw request body for debugging
+	var rawBody map[string]interface{}
+	if err := c.BodyParser(&rawBody); err != nil {
+		h.logger.Error("failed to parse raw request body", zap.Error(err))
+	} else {
+		h.logger.Debug("raw request body", zap.Any("body", rawBody))
+	}
+
+	// Reset request body for the actual parsing
+	c.Request().SetBody(c.Request().Body())
 
 	// Parse appointment data from request body
 	var appointmentRequest struct {
-		PatientID       string    `json:"patient_id"`
-		DoctorID        string    `json:"doctor_id"`
-		OrgID           string    `json:"org_id"`       // Changed from HospitalID to OrgID
-		PatientName     string    `json:"patient_name"` // Changed to snake_case to match schema
-		DoctorName      string    `json:"doctor_name"`  // Changed to snake_case to match schema
-		AppointmentDate time.Time `json:"appointment_date"`
-		FeeType         string    `json:"fee_type"`         // Changed to snake_case
-		PaymentMethod   string    `json:"payment_method"`   // Changed to snake_case
-		Reason          string    `json:"reason,omitempty"` // Optional field
+		PatientID         string    `json:"patient_id"`
+		DoctorID          string    `json:"doctor_id"`
+		OrgID             string    `json:"org_id"`
+		PatientName       string    `json:"patient_name"`
+		DoctorName        string    `json:"doctor_name"`
+		AppointmentDate   time.Time `json:"appointment_date"`
+		FeeType           string    `json:"fee_type"`
+		PaymentMethod     string    `json:"payment_method"`
+		Reason            string    `json:"reason,omitempty"` // Optional field
+		AppointmentStatus string    `json:"appointment_status,omitempty"`
+		AppointmentFee    int       `json:"appointment_fee,omitempty"`
+		IsValid           *bool     `json:"is_valid,omitempty"`
 	}
 
 	if err := c.BodyParser(&appointmentRequest); err != nil {
 		h.logger.Error("failed to parse appointment data", zap.Error(err))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid appointment data"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid appointment data: " + err.Error()})
 	}
 
-	// Validate required fields
-	if appointmentRequest.PatientID == "" || appointmentRequest.DoctorID == "" || appointmentRequest.OrgID == "" ||
-		appointmentRequest.PatientName == "" || appointmentRequest.DoctorName == "" ||
-		appointmentRequest.AppointmentDate.IsZero() || appointmentRequest.FeeType == "" || appointmentRequest.PaymentMethod == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Missing required fields"})
+	// Log the parsed request for debugging
+	h.logger.Debug("parsed appointment request",
+		zap.String("patient_id", appointmentRequest.PatientID),
+		zap.String("doctor_id", appointmentRequest.DoctorID),
+		zap.String("org_id", appointmentRequest.OrgID),
+		zap.String("patient_name", appointmentRequest.PatientName),
+		zap.String("doctor_name", appointmentRequest.DoctorName),
+		zap.Any("appointment_date", appointmentRequest.AppointmentDate),
+		zap.String("fee_type", appointmentRequest.FeeType),
+		zap.String("payment_method", appointmentRequest.PaymentMethod))
+
+	// Check required fields individually and log which ones are missing
+	var missingFields []string
+	if appointmentRequest.PatientID == "" {
+		missingFields = append(missingFields, "patient_id")
+	}
+	if appointmentRequest.DoctorID == "" {
+		missingFields = append(missingFields, "doctor_id")
+	}
+	if appointmentRequest.OrgID == "" {
+		missingFields = append(missingFields, "org_id")
+	}
+	if appointmentRequest.PatientName == "" {
+		missingFields = append(missingFields, "patient_name")
+	}
+	if appointmentRequest.DoctorName == "" {
+		missingFields = append(missingFields, "doctor_name")
+	}
+	if appointmentRequest.AppointmentDate.IsZero() {
+		missingFields = append(missingFields, "appointment_date")
+	}
+	if appointmentRequest.FeeType == "" {
+		missingFields = append(missingFields, "fee_type")
+	}
+	if appointmentRequest.PaymentMethod == "" {
+		missingFields = append(missingFields, "payment_method")
+	}
+
+	if len(missingFields) > 0 {
+		h.logger.Error("missing specific required fields in appointment request",
+			zap.Strings("missing_fields", missingFields))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("Missing required fields: %s", strings.Join(missingFields, ", ")),
+		})
 	}
 
 	// Validate ID formats based on schema requirements
 	if !validatePatientID(appointmentRequest.PatientID) {
+		h.logger.Warn("invalid patient ID format", zap.String("patient_id", appointmentRequest.PatientID))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Patient ID must be 8-digit alphanumeric format"})
 	}
 
 	if !validateDoctorID(appointmentRequest.DoctorID) {
+		h.logger.Warn("invalid doctor ID format", zap.String("doctor_id", appointmentRequest.DoctorID))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor ID must be in UUID format"})
 	}
 
 	if !validateOrgID(appointmentRequest.OrgID) {
+		h.logger.Warn("invalid organization ID format", zap.String("org_id", appointmentRequest.OrgID))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID must be in ULID format (org_[A-Z0-9]{26})"})
 	}
 
 	// Validate fee type
 	if appointmentRequest.FeeType != "emergency" && appointmentRequest.FeeType != "default" && appointmentRequest.FeeType != "recurring" {
+		h.logger.Warn("invalid fee type", zap.String("fee_type", appointmentRequest.FeeType))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Fee type must be emergency, default, or recurring"})
 	}
 
-	// Get user ID
-	userID, err := h.getUserID(c.Context(), authID)
-	if err != nil {
-		h.logger.Error("failed to get user ID", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
-	}
-
-	// Check user role
-	_, err = h.getUserRole(c.Context(), userID)
-	if err != nil {
-		h.logger.Error("failed to get user role", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
-	}
-
 	// Verify doctor availability for the selected time slot
-	if !h.isDoctorAvailable(c.Context(), appointmentRequest.DoctorID, appointmentRequest.OrgID, appointmentRequest.AppointmentDate) {
+	h.logger.Debug("checking doctor availability",
+		zap.String("doctor_id", appointmentRequest.DoctorID),
+		zap.Time("appointment_date", appointmentRequest.AppointmentDate))
+
+	available, err := h.checkDoctorAvailabilityMongoDB(c.Context(), appointmentRequest.DoctorID, appointmentRequest.OrgID, appointmentRequest.AppointmentDate)
+	if err != nil {
+		h.logger.Error("failed to check doctor availability", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to check doctor availability"})
+	}
+
+	if !available {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor is not available at selected time"})
 	}
 
 	// Get doctor's fees based on fee type
+	h.logger.Debug("getting doctor fees",
+		zap.String("doctor_id", appointmentRequest.DoctorID),
+		zap.String("org_id", appointmentRequest.OrgID),
+		zap.String("fee_type", appointmentRequest.FeeType))
+
 	appointmentFee, err := h.getDoctorFee(c.Context(), appointmentRequest.DoctorID, appointmentRequest.OrgID, appointmentRequest.FeeType)
 	if err != nil {
-		h.logger.Error("failed to get doctor fees", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to get doctor fees"})
+		h.logger.Warn("failed to get doctor fees, using default", zap.Error(err))
+		appointmentFee = h.getDefaultFee(appointmentRequest.FeeType)
 	}
+
+	h.logger.Debug("determined appointment fee", zap.Int("fee", appointmentFee))
+
+	// If client provided a fee, log it but still use our calculated value
+	if appointmentRequest.AppointmentFee > 0 {
+		h.logger.Debug("client provided fee ignored",
+			zap.Int("client_fee", appointmentRequest.AppointmentFee),
+			zap.Int("calculated_fee", appointmentFee))
+	}
+
+	// Calculate next visit date (required by schema)
+	// Default to 30 days after the appointment date for recurring, 90 days for others
+	nextVisitDate := appointmentRequest.AppointmentDate
+	if appointmentRequest.FeeType == "recurring" {
+		nextVisitDate = nextVisitDate.AddDate(0, 0, 30) // 30 days later
+	} else {
+		nextVisitDate = nextVisitDate.AddDate(0, 0, 90) // 90 days later
+	}
+
+	// Set default appointment status if not provided
+	appointmentStatus := "not_completed"
+	if appointmentRequest.AppointmentStatus == "completed" {
+		appointmentStatus = "completed"
+	}
+
+	// Set default isValid if not provided
+	isValid := true
+	if appointmentRequest.IsValid != nil {
+		isValid = *appointmentRequest.IsValid
+	}
+
+	// Generate a new UUID for appointment_id
+	appointmentID := uuid.New().String()
+	h.logger.Debug("generated appointment_id", zap.String("appointment_id", appointmentID))
 
 	// Create appointment document (using field names that match the schema)
 	now := time.Now()
-	appointment := Appointment{
-		PatientID:         appointmentRequest.PatientID,
-		DoctorID:          appointmentRequest.DoctorID,
-		OrgID:             appointmentRequest.OrgID, // Changed from HospitalID
-		PatientName:       appointmentRequest.PatientName,
-		DoctorName:        appointmentRequest.DoctorName,
-		AppointmentStatus: "not_completed", // Default value that matches schema enum
-		PaymentMethod:     appointmentRequest.PaymentMethod,
-		FeeType:           appointmentRequest.FeeType,
-		AppointmentFee:    appointmentFee,
-		AppointmentDate:   appointmentRequest.AppointmentDate,
-		CreatedAt:         now,
-		UpdatedAt:         now,
+	appointment := bson.M{
+		"appointment_id":     appointmentID, // Added required appointment_id field
+		"patient_id":         appointmentRequest.PatientID,
+		"doctor_id":          appointmentRequest.DoctorID,
+		"org_id":             appointmentRequest.OrgID,
+		"patient_name":       appointmentRequest.PatientName,
+		"doctor_name":        appointmentRequest.DoctorName,
+		"appointment_status": appointmentStatus,
+		"payment_method":     appointmentRequest.PaymentMethod,
+		"fee_type":           appointmentRequest.FeeType,
+		"appointment_fee":    appointmentFee,
+		"appointment_date":   appointmentRequest.AppointmentDate,
+		"created_at":         now,
+		"updated_at":         now,
+		"is_valid":           isValid,
+		"next_visit_date":    nextVisitDate,
 	}
+
+	// Add optional reason field if provided
+	if appointmentRequest.Reason != "" {
+		appointment["reason"] = appointmentRequest.Reason
+	}
+
+	// Log the final document we're about to insert
+	h.logger.Debug("final appointment document for insertion", zap.Any("appointment", appointment))
 
 	// Insert appointment into MongoDB
 	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
-	_, err = appointmentsCollection.InsertOne(c.Context(), appointment)
+	result, err := appointmentsCollection.InsertOne(c.Context(), appointment)
 	if err != nil {
 		h.logger.Error("failed to insert appointment", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create appointment"})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create appointment: " + err.Error()})
 	}
+
+	h.logger.Info("appointment created successfully",
+		zap.Any("insertedID", result.InsertedID),
+		zap.String("appointment_id", appointmentID))
+
+	// Add ID to appointment response
+	appointment["_id"] = result.InsertedID
 
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"message":     "Appointment created successfully",
@@ -511,118 +725,259 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	})
 }
 
-// Helper functions to validate ID formats
-func validatePatientID(id string) bool {
-	// 8-digit alphanumeric format validation
-	match, _ := regexp.MatchString("^[A-Z0-9]{8}$", id)
-	return match
-}
-
-func validateDoctorID(id string) bool {
-	// UUID format validation
-	match, _ := regexp.MatchString("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", id)
-	return match
-}
-
-func validateOrgID(id string) bool {
-	// ULID format with org_ prefix validation
-	match, _ := regexp.MatchString("^org_[A-Z0-9]{26}$", id)
-	return match
-}
-
-// Helper method to check doctor availability
-func (h *AppointmentHandler) isDoctorAvailable(ctx context.Context, doctorID, hospitalID string, appointmentTime time.Time) bool {
-	// Get the weekday of the appointment
-	weekday := strings.ToLower(appointmentTime.Weekday().String())
-
-	// Check doctor's shift for that day
-	var shift struct {
-		StartTime string `json:"starttime"`
-		EndTime   string `json:"endtime"`
-		IsActive  bool   `json:"isactive"`
-	}
-
-	// Query PostgreSQL for doctor shift info
-	err := h.pgPool.QueryRow(ctx,
-		"SELECT starttime, endtime, isactive FROM public.doctorshifts WHERE doctor_id = $1 AND hospital_id = $2 AND weekday = $3",
-		doctorID, hospitalID, weekday).Scan(&shift.StartTime, &shift.EndTime, &shift.IsActive)
-
-	if err != nil {
-		h.logger.Error("failed to get doctor shift", zap.Error(err))
-		return false
-	}
-
-	// Check if the doctor is active for this shift
-	if !shift.IsActive {
-		return false
-	}
-
-	// Parse shift times
-	startTime, err := time.Parse("15:04:05", shift.StartTime)
-	if err != nil {
-		h.logger.Error("failed to parse shift start time", zap.Error(err))
-		return false
-	}
-
-	endTime, err := time.Parse("15:04:05", shift.EndTime)
-	if err != nil {
-		h.logger.Error("failed to parse shift end time", zap.Error(err))
-		return false
-	}
-
-	// Extract appointment hour and minute
-	appointmentTimeOnly := time.Date(2000, 1, 1, appointmentTime.Hour(), appointmentTime.Minute(), 0, 0, time.UTC)
-
-	// Check if appointment time is within shift
-	isWithinShift := !appointmentTimeOnly.Before(startTime) && !appointmentTimeOnly.After(endTime)
-	if !isWithinShift {
-		return false
-	}
-
-	// Check for existing appointments at the same time
-	var count int64
-	filter := bson.M{
-		"doctor_id":   doctorID,
-		"hospital_id": hospitalID,
-		"appointment_date": bson.M{
-			"$gte": appointmentTime,
-			"$lt":  appointmentTime.Add(30 * time.Minute), // Assuming 30-min slots
-		},
-	}
-
-	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
-	count, err = appointmentsCollection.CountDocuments(ctx, filter)
-	if err != nil {
-		h.logger.Error("failed to check existing appointments", zap.Error(err))
-		return false
-	}
-
-	// If count > 0, there's an overlapping appointment
-	return count == 0
-}
-
-// Helper method to get doctor fee based on fee type
-func (h *AppointmentHandler) getDoctorFee(ctx context.Context, doctorID, hospitalID, feeType string) (int, error) {
-	var fee int
-
-	query := "SELECT "
+// Helper function to get default fee based on type
+func (h *AppointmentHandler) getDefaultFee(feeType string) int {
 	switch feeType {
 	case "emergency":
-		query += "emergency_fees"
+		return 200
 	case "recurring":
-		query += "recurring_fees"
+		return 100
 	default:
-		query += "default_fees"
+		return 150
+	}
+}
+
+// Helper function to get doctor fee
+func (h *AppointmentHandler) getDoctorFee(ctx context.Context, doctorID, orgID, feeType string) (int, error) {
+	// SQL query to get fees from doctor_fees table
+	query := `
+		SELECT 
+			CASE 
+				WHEN $3 = 'emergency' THEN emergency_fees
+				WHEN $3 = 'recurring' THEN recurring_fees
+				ELSE default_fees
+			END as fee
+		FROM public.doctor_fees
+		WHERE doctor_id = $1 AND organization_id = $2
+	`
+
+	// Execute query
+	var fee int
+	err := h.pgPool.QueryRow(ctx, query, doctorID, orgID, feeType).Scan(&fee)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return 0, fmt.Errorf("no fee found for doctor %s in organization %s", doctorID, orgID)
+		}
+		return 0, fmt.Errorf("database error: %w", err)
 	}
 
-	query += " FROM public.doctor_fees WHERE doctor_id = $1 AND hospital_id = $2"
-
-	err := h.pgPool.QueryRow(ctx, query, doctorID, hospitalID).Scan(&fee)
-	if err != nil {
-		return 0, err
+	// Ensure fee is valid
+	if fee <= 0 {
+		return 0, fmt.Errorf("invalid fee value: %d", fee)
 	}
 
 	return fee, nil
+}
+
+// Helper function to check if doctor is available
+func (h *AppointmentHandler) checkDoctorAvailabilityMongoDB(ctx context.Context, doctorID, orgID string, appointmentDate time.Time) (bool, error) {
+	// Create time window for checking conflicts (15 minutes before and after)
+	startWindow := appointmentDate.Add(-15 * time.Minute)
+	endWindow := appointmentDate.Add(15 * time.Minute)
+
+	// Query MongoDB for conflicting appointments
+	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
+
+	filter := bson.M{
+		"doctor_id": doctorID,
+		"org_id":    orgID,
+		"appointment_date": bson.M{
+			"$gte": startWindow,
+			"$lte": endWindow,
+		},
+		"is_valid": true,
+	}
+
+	count, err := appointmentsCollection.CountDocuments(ctx, filter)
+	if err != nil {
+		return false, fmt.Errorf("error checking availability: %w", err)
+	}
+
+	// Doctor is available if no conflicting appointments found
+	return count == 0, nil
+}
+
+// Helper functions to validate IDs
+func validatePatientID(patientID string) bool {
+	return regexp.MustCompile(`^[A-Z0-9]{8}$`).MatchString(patientID)
+}
+
+func validateDoctorID(doctorID string) bool {
+	return regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`).MatchString(doctorID)
+}
+
+func validateOrgID(orgID string) bool {
+	return regexp.MustCompile(`^org_[A-Z0-9]{26}$`).MatchString(orgID)
+}
+
+func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
+	// Get auth ID from context
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context", zap.Error(err))
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	fmt.Println("Auth ID:", authID)
+	// Get doctor ID from params
+	doctorID := c.Params("id")
+	if doctorID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor ID is required"})
+	}
+
+	// Get org ID from query params
+	orgID := c.Query("org_id")
+	if orgID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID is required"})
+	}
+
+	// Get date from query params
+	dateStr := c.Query("date")
+	if dateStr == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Date is required"})
+	}
+
+	// Parse date
+	date, err := time.Parse("2006-01-02", dateStr)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid date format. Use YYYY-MM-DD",
+		})
+	}
+
+	// Get weekday
+	weekday := date.Weekday().String()
+
+	// Get doctor shift for the weekday
+	var startTimeStr, endTimeStr string
+	var isActive bool
+	var slotDuration int
+
+	// Join with doctors table to get slot_duration
+	query := `
+        SELECT ds.starttime::text, ds.endtime::text, ds.isactive, d.slot_duration 
+        FROM doctorshifts ds
+        JOIN doctors d ON ds.doctor_id = d.doctor_id
+        WHERE ds.doctor_id = $1 
+        AND ds.weekday = $2 
+        AND ds.organization_id = $3
+    `
+
+	err = h.pgPool.QueryRow(c.Context(), query, doctorID, weekday, orgID).Scan(
+		&startTimeStr,
+		&endTimeStr,
+		&isActive,
+		&slotDuration,
+	)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return c.Status(fiber.StatusOK).JSON(fiber.Map{
+				"available_slots": []string{},
+				"message":         "No shift scheduled for this day",
+			})
+		}
+		h.logger.Error("Error fetching doctor shift", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to fetch doctor shift",
+		})
+	}
+
+	// If shift is not active or no times set
+	if !isActive || startTimeStr == "" || endTimeStr == "" {
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"available_slots": []string{},
+			"message":         "No active shift for this day",
+		})
+	}
+
+	// Parse start and end times
+	startTime, err := time.Parse("15:04:05", startTimeStr)
+	if err != nil {
+		h.logger.Error("Error parsing start time", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Invalid shift start time format",
+		})
+	}
+
+	endTime, err := time.Parse("15:04:05", endTimeStr)
+	if err != nil {
+		h.logger.Error("Error parsing end time", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Invalid shift end time format",
+		})
+	}
+
+	// Use default slot duration if not set
+	if slotDuration <= 0 {
+		slotDuration = 30 // Default 30 minutes
+	}
+
+	// Calculate all possible time slots
+	var allSlots []string
+	currentTime := startTime
+	for currentTime.Before(endTime) {
+		timeStr := currentTime.Format("15:04")
+		allSlots = append(allSlots, timeStr)
+		currentTime = currentTime.Add(time.Duration(slotDuration) * time.Minute)
+	}
+
+	// Get unavailable slots (existing appointments)
+	var bookedSlots []string
+
+	// Create query to get booked appointment times for the date
+	appointmentsQuery := `
+    SELECT TO_CHAR(appointment_date, 'HH24:MI') as time_slot
+    FROM appointments
+    WHERE doctor_id = $1
+    AND org_id = $2
+    AND DATE(appointment_date) = $3
+    AND appointment_status NOT IN ('cancelled', 'declined')
+`
+
+	rows, err := h.pgPool.Query(c.Context(), appointmentsQuery, doctorID, orgID, dateStr)
+	if err != nil {
+		// Log the error but continue with empty booked slots instead of returning error
+		h.logger.Error("Error fetching booked appointments", zap.Error(err))
+		bookedSlots = []string{} // Initialize as empty instead of returning error
+	} else {
+		defer rows.Close()
+
+		for rows.Next() {
+			var slot string
+			if err := rows.Scan(&slot); err != nil {
+				h.logger.Error("Error scanning booked slot", zap.Error(err))
+				continue
+			}
+			bookedSlots = append(bookedSlots, slot)
+		}
+
+		if err := rows.Err(); err != nil {
+			h.logger.Error("Error iterating booked slots", zap.Error(err))
+			// Continue with what we have instead of failing
+		}
+	}
+
+	// Filter out unavailable slots
+	var availableSlots []string
+	for _, slot := range allSlots {
+		isAvailable := true
+		for _, unavailable := range bookedSlots {
+			if slot == unavailable {
+				isAvailable = false
+				break
+			}
+		}
+		if isAvailable {
+			availableSlots = append(availableSlots, slot)
+		}
+	}
+
+	return c.JSON(fiber.Map{
+		"available_slots":   availableSlots,
+		"unavailable_slots": bookedSlots,
+		"message":           "Slot availability fetched successfully",
+	})
 }
 
 // GetAppointment retrieves a single appointment by ID
@@ -666,7 +1021,7 @@ func (h *AppointmentHandler) GetAppointment(c *fiber.Ctx) error {
 	response := AppointmentResponse{
 		PatientID:         appointment.PatientID,
 		DoctorID:          appointment.DoctorID,
-		HospitalID:        appointment.OrgID,
+		OrgID:             appointment.OrgID,
 		PatientName:       appointment.PatientName,
 		DoctorName:        appointment.DoctorName,
 		AppointmentStatus: appointment.AppointmentStatus,
@@ -789,7 +1144,7 @@ func (h *AppointmentHandler) GetDoctorAppointments(c *fiber.Ctx) error {
 		appointments = append(appointments, AppointmentResponse{
 			PatientID:         appointment.PatientID,
 			DoctorID:          appointment.DoctorID,
-			HospitalID:        appointment.OrgID,
+			OrgID:             appointment.OrgID,
 			PatientName:       appointment.PatientName,
 			DoctorName:        appointment.DoctorName,
 			AppointmentStatus: appointment.AppointmentStatus,

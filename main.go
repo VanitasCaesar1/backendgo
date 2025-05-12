@@ -504,6 +504,8 @@ func (a *App) setupRoutes() error {
 	doctorGroup.Get("/search", appointmentHandler.SearchDoctors)
 	doctorGroup.Post("/schedules", doctorHandler.CreateDoctorSchedule)
 	doctorGroup.Post("/fees", doctorHandler.CreateDoctorFees)
+	doctorGroup.Get("/:id/availability", appointmentHandler.GetSlotAvailability)
+	doctorGroup.Get("/appointments", appointmentHandler.GetAppointmentsByOrgID)
 
 	// Hospital routes - protected
 	hospitalGroup := a.Fiber.Group("/api/hospital", authMiddleware.Handler())
@@ -535,7 +537,11 @@ func (a *App) setupRoutes() error {
 	appointmentsGroup.Post("/create", appointmentHandler.CreateAppointment)
 	appointmentsGroup.Get("/:id", appointmentHandler.GetAppointment)
 	appointmentsGroup.Get("/doctor/:id", appointmentHandler.GetDoctorAppointments)
-	appointmentsGroup.Get("/organization/:orgID", appointmentHandler.GetAppointmentsByOrgID)
+	appointmentsGroup.Get("/org", appointmentHandler.GetAppointmentsByOrgID) // Changed from "/organization/:orgID"
+	appointmentsGroup.Put("/:id", appointmentHandler.UpdateAppointment)
+	appointmentsGroup.Delete("/:id", appointmentHandler.DeleteAppointment)
+	appointmentsGroup.Post("/", appointmentHandler.CreateAppointment)
+	appointmentsGroup.Get("/:id", appointmentHandler.GetAppointment)
 	appointmentsGroup.Put("/:id", appointmentHandler.UpdateAppointment)
 	appointmentsGroup.Delete("/:id", appointmentHandler.DeleteAppointment)
 
