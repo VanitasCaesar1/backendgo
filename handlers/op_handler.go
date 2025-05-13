@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"math/rand"
 	"regexp"
@@ -157,23 +158,23 @@ type AppointmentRequest struct {
 	AppointmentFee  int       `json:"appointment_fee"`
 }
 
+// Appointment represents the structure of an appointment in the database
 type Appointment struct {
-	ID                primitive.ObjectID `bson:"_id,omitempty"`
-	AppointmentID     string             `bson:"appointment_id"`       // UUID format
-	PatientID         string             `bson:"patient_id"`           // 8-digit alphanumeric ID
-	DoctorID          string             `bson:"doctor_id"`            // UUID format
-	OrgID             string             `bson:"org_id"`               // Organization ID in ULID format
-	PatientName       string             `bson:"patient_name"`         // Full name of patient
-	DoctorName        string             `bson:"doctor_name"`          // Full name of doctor
-	AppointmentStatus string             `bson:"appointment_status"`   // completed or not_completed
-	PaymentMethod     string             `bson:"payment_method"`       // Method of payment
-	FeeType           string             `bson:"fee_type"`             // emergency, default, or recurring
-	AppointmentFee    int                `bson:"appointment_fee"`      // Amount as integer
-	AppointmentDate   time.Time          `bson:"appointment_date"`     // Date and time of appointment
-	CreatedAt         time.Time          `bson:"created_at"`           // Creation timestamp
-	UpdatedAt         time.Time          `bson:"updated_at,omitempty"` // Last update timestamp
-	IsValid           bool               `bson:"is_valid"`             // Flag for validity
-	NextVisitDate     time.Time          `bson:"next_visit_date"`      // Date for next visit
+	AppointmentID     string    `bson:"appointment_id" json:"appointment_id"`
+	PatientID         string    `bson:"patient_id" json:"patient_id"`
+	DoctorID          string    `bson:"doctor_id" json:"doctor_id"`
+	OrgID             string    `bson:"org_id" json:"org_id"`
+	PatientName       string    `bson:"patient_name" json:"patient_name"`
+	DoctorName        string    `bson:"doctor_name" json:"doctor_name"`
+	AppointmentStatus string    `bson:"appointment_status" json:"appointment_status"`
+	PaymentMethod     string    `bson:"payment_method" json:"payment_method"`
+	FeeType           string    `bson:"fee_type" json:"fee_type"`
+	AppointmentFee    int       `bson:"appointment_fee" json:"appointment_fee"`
+	AppointmentDate   time.Time `bson:"appointment_date,omitempty" json:"appointment_date,omitempty"`
+	CreatedAt         time.Time `bson:"created_at" json:"created_at"`
+	UpdatedAt         time.Time `bson:"updated_at,omitempty" json:"updated_at,omitempty"`
+	IsValid           bool      `bson:"is_valid" json:"is_valid"`
+	NextVisitDate     time.Time `bson:"next_visit_date" json:"next_visit_date"`
 }
 
 // Define response type for clarity
@@ -197,18 +198,16 @@ type AppointmentResponse struct {
 }
 
 type AppointmentFilters struct {
-	AppointmentID string `query:"appointment_id"`
-	PatientID     string `query:"patient_id"`
-	DoctorID      string `query:"doctor_id"`
-	Status        string `query:"status"`
-	FeeType       string `query:"fee_type"`
-	IsValid       *bool  `query:"is_valid"`
-	StartDate     string `query:"start_date"`
-	EndDate       string `query:"end_date"`
-	Limit         int64  `query:"limit"`
-	Offset        int64  `query:"offset"`
-	SortBy        string `query:"sort_by"`
-	SortOrder     string `query:"sort_order"`
+	DoctorID          string `query:"doctor_id"`
+	PatientID         string `query:"patient_id"`
+	AppointmentStatus string `query:"appointment_status"`
+	FeeType           string `query:"fee_type"`
+	StartDate         string `query:"start_date"`
+	EndDate           string `query:"end_date"`
+	Limit             int64  `query:"limit"`
+	Offset            int64  `query:"offset"`
+	SortBy            string `query:"sort_by"`
+	SortOrder         string `query:"sort_order"`
 }
 
 func NewAppointmentHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, pgPool *pgxpool.Pool, mongoClient *mongo.Client) (*AppointmentHandler, error) {
@@ -243,12 +242,86 @@ func (h *AppointmentHandler) getUserRole(ctx context.Context, userID uuid.UUID) 
 	return role, err
 }
 
-// AppointmentFilters struct to capture and validate query parameters
+// buildAppointmentQuery constructs a MongoDB query based on filters
+func buildAppointmentQuery(orgID string, filters AppointmentFilters) bson.M {
+	// Start with the base query that always includes org_id and is_valid=true
+	query := bson.M{
+		"org_id":   orgID,
+		"is_valid": true,
+	}
 
-// validateUUID validates that a string is in proper UUID format
-func validateUUID(id string) bool {
-	uuidRegex := regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
-	return uuidRegex.MatchString(id)
+	// Add doctor_id filter if specified and not "all"
+	if filters.DoctorID != "" && filters.DoctorID != "all" {
+		query["doctor_id"] = filters.DoctorID
+	}
+
+	// Add patient_id filter if specified and not "all"
+	if filters.PatientID != "" && filters.PatientID != "all" {
+		query["patient_id"] = filters.PatientID
+	}
+
+	// Add appointment_status filter if specified and not "all"
+	if filters.AppointmentStatus != "" && filters.AppointmentStatus != "all" {
+		query["appointment_status"] = filters.AppointmentStatus
+	}
+
+	// Add fee_type filter if specified and not "all"
+	if filters.FeeType != "" && filters.FeeType != "all" {
+		query["fee_type"] = filters.FeeType
+	}
+
+	// Add date range filters if specified
+	dateQuery := bson.M{}
+	if filters.StartDate != "" {
+		// Parse start date and set to beginning of day
+		startDate, err := time.Parse("2006-01-02", filters.StartDate)
+		if err != nil {
+			// Handle error gracefully, log it but continue
+			log.Printf("Error parsing start date: %v", err)
+		} else {
+			dateQuery["$gte"] = startDate
+		}
+	}
+
+	if filters.EndDate != "" {
+		// Parse end date and set to end of day
+		endDate, err := time.Parse("2006-01-02", filters.EndDate)
+		if err != nil {
+			// Handle error gracefully, log it but continue
+			log.Printf("Error parsing end date: %v", err)
+		} else {
+			// Add 24 hours to include the entire end date
+			endDate = endDate.Add(24 * time.Hour)
+			dateQuery["$lt"] = endDate
+		}
+	}
+
+	// Add date range to query if any date filters were applied
+	if len(dateQuery) > 0 {
+		query["appointment_date"] = dateQuery
+	}
+
+	return query
+}
+
+// processAppointments converts the MongoDB cursor to a slice of appointments
+func processAppointments(cursor *mongo.Cursor, ctx context.Context) ([]Appointment, error) {
+	var appointments []Appointment
+
+	for cursor.Next(ctx) {
+		var appointment Appointment
+		err := cursor.Decode(&appointment)
+		if err != nil {
+			return nil, err
+		}
+		appointments = append(appointments, appointment)
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, err
+	}
+
+	return appointments, nil
 }
 
 // GetAppointmentsByOrgID retrieves appointments based on org_id from X-Organization-ID header
@@ -267,6 +340,10 @@ func (h *AppointmentHandler) GetAppointmentsByOrgID(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID is required in X-Organization-ID header"})
 	}
 
+	// Log all headers for debugging
+	headers := c.GetReqHeaders()
+	h.logger.Debug("All request headers", zap.Any("headers", headers))
+
 	// Validate org ID format
 	if !validateOrgID(orgID) {
 		h.logger.Error("invalid organization ID format", zap.String("orgID", orgID))
@@ -280,12 +357,39 @@ func (h *AppointmentHandler) GetAppointmentsByOrgID(c *fiber.Ctx) error {
 		zap.String("Auth ID", authID),
 		zap.String("Org ID", orgID))
 
-	// Parse query filters
+	// Extract all query parameters
 	var filters AppointmentFilters
-	if err := c.QueryParser(&filters); err != nil {
-		h.logger.Error("failed to parse query parameters", zap.Error(err))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid query parameters"})
+
+	// Log all query parameters for debugging
+	h.logger.Debug("Request query parameters", zap.Any("params", c.Queries()))
+
+	// Parse query parameters individually to handle name differences
+	filters.DoctorID = c.Query("doctor_id")
+	filters.PatientID = c.Query("patient_id")
+	filters.AppointmentStatus = c.Query("appointment_status")
+	filters.FeeType = c.Query("fee_type")
+	filters.StartDate = c.Query("start_date")
+	filters.EndDate = c.Query("end_date")
+
+	// Parse numeric parameters with defaults
+	limitStr := c.Query("limit", "10")
+	offsetStr := c.Query("offset", "0")
+
+	limit, err := strconv.ParseInt(limitStr, 10, 64)
+	if err != nil || limit < 1 {
+		limit = 10
 	}
+	filters.Limit = limit
+
+	offset, err := strconv.ParseInt(offsetStr, 10, 64)
+	if err != nil || offset < 0 {
+		offset = 0
+	}
+	filters.Offset = offset
+
+	// Parse sorting parameters
+	filters.SortBy = c.Query("sort_by", "created_at")
+	filters.SortOrder = c.Query("sort_order", "desc")
 
 	// Apply validation and defaults to filters
 	if err := validateAndSetFilterDefaults(&filters); err != nil {
@@ -295,6 +399,9 @@ func (h *AppointmentHandler) GetAppointmentsByOrgID(c *fiber.Ctx) error {
 	// Build MongoDB query
 	query := buildAppointmentQuery(orgID, filters)
 
+	// Print debug info for troubleshooting
+	h.logger.Debug("MongoDB query", zap.Any("query", query))
+
 	// Configure find options and determine sort direction
 	findOptions := options.Find()
 	findOptions.SetLimit(filters.Limit)
@@ -302,33 +409,54 @@ func (h *AppointmentHandler) GetAppointmentsByOrgID(c *fiber.Ctx) error {
 
 	// Set sort order
 	sortDirection := -1 // Default to descending
-	if strings.ToLower(filters.SortOrder) == "asc" {
+	if filters.SortOrder == "asc" {
 		sortDirection = 1
 	}
 	findOptions.SetSort(bson.D{{Key: filters.SortBy, Value: sortDirection}})
 
 	// Query MongoDB
 	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
-	cursor, err := appointmentsCollection.Find(c.Context(), query, findOptions)
+
+	// Add debug logging to verify collection exists
+	collections, err := h.mongoClient.Database(h.config.MongoDBName).ListCollectionNames(c.Context(), bson.M{})
 	if err != nil {
-		h.logger.Error("failed to query appointments", zap.Error(err), zap.String("orgID", orgID))
+		h.logger.Error("failed to list collections", zap.Error(err))
+	} else {
+		h.logger.Debug("Available collections", zap.Strings("collections", collections))
+	}
+
+	// Execute query with timeout context
+	ctx, cancel := context.WithTimeout(c.Context(), 15*time.Second)
+	defer cancel()
+
+	cursor, err := appointmentsCollection.Find(ctx, query, findOptions)
+	if err != nil {
+		h.logger.Error("failed to query appointments",
+			zap.Error(err),
+			zap.String("orgID", orgID),
+			zap.Any("query", query))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch appointments"})
 	}
-	defer cursor.Close(c.Context())
+	defer cursor.Close(ctx)
 
 	// Process appointments
-	appointments, err := processAppointments(cursor, c.Context())
+	appointments, err := processAppointments(cursor, ctx)
 	if err != nil {
 		h.logger.Error("error processing appointments", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Error processing appointments"})
 	}
 
 	// Get total count for pagination
-	total, err := appointmentsCollection.CountDocuments(c.Context(), query)
+	total, err := appointmentsCollection.CountDocuments(ctx, query)
 	if err != nil {
 		h.logger.Error("failed to count appointments", zap.Error(err))
 		total = 0 // Continue with the results but without total count
 	}
+
+	// Log result count
+	h.logger.Info("Retrieved appointments",
+		zap.Int("count", len(appointments)),
+		zap.Int64("total", total))
 
 	return c.JSON(fiber.Map{
 		"appointments": appointments,
@@ -340,172 +468,115 @@ func (h *AppointmentHandler) GetAppointmentsByOrgID(c *fiber.Ctx) error {
 	})
 }
 
-// Helper functions to improve readability and maintainability
-
-// validateAndSetFilterDefaults validates filter values and sets defaults
+// validateAndSetFilterDefaults validates filter parameters and applies default values
 func validateAndSetFilterDefaults(filters *AppointmentFilters) error {
-	// Validate appointment ID if provided
-	if filters.AppointmentID != "" && !validateUUID(filters.AppointmentID) {
-		return fmt.Errorf("invalid appointment ID format: must be in UUID format")
+	// Validate doctor_id if provided
+	if filters.DoctorID != "" && filters.DoctorID != "all" {
+		if !validateUUID(filters.DoctorID) {
+			return fmt.Errorf("invalid doctor ID format: must be in UUID format")
+		}
 	}
 
-	// Validate doctor ID if provided
-	if filters.DoctorID != "" && filters.DoctorID != "all" && !validateUUID(filters.DoctorID) {
-		return fmt.Errorf("invalid doctor ID format: must be in UUID format")
+	// Validate patient_id if provided
+	if filters.PatientID != "" && filters.PatientID != "all" {
+		if !validatePatientID(filters.PatientID) {
+			return fmt.Errorf("invalid patient ID format: must be an 8-digit alphanumeric code")
+		}
 	}
 
-	// Validate patient ID if provided
-	if filters.PatientID != "" && filters.PatientID != "all" && !validatePatientID(filters.PatientID) {
-		return fmt.Errorf("invalid patient ID format: must be an 8-character alphanumeric string")
+	// Validate appointment status
+	if filters.AppointmentStatus != "" && filters.AppointmentStatus != "all" {
+		if filters.AppointmentStatus != "completed" && filters.AppointmentStatus != "not_completed" {
+			return fmt.Errorf("invalid appointment status: must be 'completed', 'not_completed', or 'all'")
+		}
 	}
 
-	// Set defaults for pagination
-	if filters.Limit <= 0 {
-		filters.Limit = 20 // Default limit
-	}
-	if filters.Limit > 100 {
-		filters.Limit = 100 // Maximum limit
+	// Validate fee type
+	if filters.FeeType != "" && filters.FeeType != "all" {
+		if filters.FeeType != "emergency" && filters.FeeType != "default" && filters.FeeType != "recurring" {
+			return fmt.Errorf("invalid fee type: must be 'emergency', 'default', 'recurring', or 'all'")
+		}
 	}
 
-	// Set default sort parameters if not provided
-	if filters.SortBy == "" {
-		filters.SortBy = "appointment_date"
+	// Validate date formats
+	if filters.StartDate != "" {
+		if !validateDateFormat(filters.StartDate) {
+			return fmt.Errorf("invalid start date format: must be in YYYY-MM-DD format")
+		}
 	}
-	if filters.SortOrder == "" {
-		filters.SortOrder = "desc"
+
+	if filters.EndDate != "" {
+		if !validateDateFormat(filters.EndDate) {
+			return fmt.Errorf("invalid end date format: must be in YYYY-MM-DD format")
+		}
+	}
+
+	// Apply default limit if not valid
+	if filters.Limit <= 0 || filters.Limit > 100 {
+		filters.Limit = 10 // Default to 10
+	}
+
+	// Apply default offset if not valid
+	if filters.Offset < 0 {
+		filters.Offset = 0 // Default to 0
+	}
+
+	// Validate and apply default sort field
+	validSortFields := []string{
+		"created_at",
+		"appointment_date",
+		"appointment_fee",
+		"appointment_status",
+		"next_visit_date",
+	}
+
+	if !contains(validSortFields, filters.SortBy) {
+		filters.SortBy = "created_at" // Default sort field
+	}
+
+	// Validate and apply default sort order
+	if filters.SortOrder != "asc" && filters.SortOrder != "desc" {
+		filters.SortOrder = "desc" // Default to descending
 	}
 
 	return nil
 }
 
-// buildAppointmentQuery constructs the MongoDB query based on filters
-func buildAppointmentQuery(orgID string, filters AppointmentFilters) bson.M {
-	query := bson.M{"org_id": orgID}
-
-	// Add appointment ID filter if provided
-	if filters.AppointmentID != "" {
-		query["appointment_id"] = filters.AppointmentID
-	}
-
-	// Add patient ID filter if provided
-	if filters.PatientID != "" && filters.PatientID != "all" {
-		query["patient_id"] = filters.PatientID
-	}
-
-	// Add status filter if provided
-	if filters.Status != "" && filters.Status != "all" {
-		query["appointment_status"] = filters.Status
-	}
-
-	// Add doctor filter if provided
-	if filters.DoctorID != "" && filters.DoctorID != "all" {
-		query["doctor_id"] = filters.DoctorID
-	}
-
-	// Add fee type filter if provided
-	if filters.FeeType != "" && filters.FeeType != "all" {
-		query["fee_type"] = filters.FeeType
-	}
-
-	// Add validity filter if provided
-	if filters.IsValid != nil {
-		query["is_valid"] = *filters.IsValid
-	}
-
-	// Add date range filters if provided
-	if filters.StartDate != "" || filters.EndDate != "" {
-		dateFilter := bson.M{}
-
-		if filters.StartDate != "" {
-			startDate, err := time.Parse("2006-01-02", filters.StartDate)
-			if err == nil { // Skip if parse error
-				dateFilter["$gte"] = startDate
-			}
-		}
-
-		if filters.EndDate != "" {
-			endDate, err := time.Parse("2006-01-02", filters.EndDate)
-			if err == nil { // Skip if parse error
-				// Add one day to include the entire end date
-				endDate = endDate.Add(24 * time.Hour)
-				dateFilter["$lt"] = endDate
-			}
-		}
-
-		if len(dateFilter) > 0 {
-			query["appointment_date"] = dateFilter
+// Helper function to check if a slice contains a string
+func contains(slice []string, item string) bool {
+	for _, a := range slice {
+		if a == item {
+			return true
 		}
 	}
-
-	return query
+	return false
 }
 
-// processAppointments converts database documents to response format
-func processAppointments(cursor *mongo.Cursor, ctx context.Context) ([]AppointmentResponse, error) {
-	var appointments []AppointmentResponse
-
-	for cursor.Next(ctx) {
-		var appointment struct {
-			// Using direct fields without MongoDB ObjectID
-			AppointmentID     string    `bson:"appointment_id"`
-			PatientID         string    `bson:"patient_id"`
-			DoctorID          string    `bson:"doctor_id"`
-			OrgID             string    `bson:"org_id"`
-			PatientName       string    `bson:"patient_name"`
-			DoctorName        string    `bson:"doctor_name"`
-			AppointmentStatus string    `bson:"appointment_status"`
-			PaymentMethod     string    `bson:"payment_method"`
-			FeeType           string    `bson:"fee_type"`
-			AppointmentFee    int       `bson:"appointment_fee"`
-			AppointmentDate   time.Time `bson:"appointment_date"`
-			NextVisitDate     time.Time `bson:"next_visit_date"`
-			IsValid           bool      `bson:"is_valid"`
-			CreatedAt         time.Time `bson:"created_at"`
-			UpdatedAt         time.Time `bson:"updated_at"`
-		}
-
-		if err := cursor.Decode(&appointment); err != nil {
-			return nil, err
-		}
-
-		// Format dates
-		appointmentDateStr := ""
-		if !appointment.AppointmentDate.IsZero() {
-			appointmentDateStr = appointment.AppointmentDate.Format(time.RFC3339)
-		}
-
-		nextVisitDateStr := ""
-		if !appointment.NextVisitDate.IsZero() {
-			nextVisitDateStr = appointment.NextVisitDate.Format(time.RFC3339)
-		}
-
-		updatedAtStr := ""
-		if !appointment.UpdatedAt.IsZero() {
-			updatedAtStr = appointment.UpdatedAt.Format(time.RFC3339)
-		}
-
-		appointments = append(appointments, AppointmentResponse{
-			ID:                appointment.AppointmentID, // Using appointment_id as the main ID
-			AppointmentID:     appointment.AppointmentID,
-			PatientID:         appointment.PatientID,
-			DoctorID:          appointment.DoctorID,
-			OrgID:             appointment.OrgID,
-			PatientName:       appointment.PatientName,
-			DoctorName:        appointment.DoctorName,
-			AppointmentStatus: appointment.AppointmentStatus,
-			PaymentMethod:     appointment.PaymentMethod,
-			FeeType:           appointment.FeeType,
-			AppointmentFee:    appointment.AppointmentFee,
-			AppointmentDate:   appointmentDateStr,
-			NextVisitDate:     nextVisitDateStr,
-			IsValid:           appointment.IsValid,
-			CreatedAt:         appointment.CreatedAt.Format(time.RFC3339),
-			UpdatedAt:         updatedAtStr,
-		})
-	}
-
-	return appointments, cursor.Err()
+// Helper function to validate Patient ID format (8-digit alphanumeric ID)
+func validatePatientID(id string) bool {
+	patientIDRegex := regexp.MustCompile(`^[A-Z0-9]{8}$`)
+	return patientIDRegex.MatchString(id)
 }
+
+// validateUUID checks if a string is a valid UUID
+func validateUUID(id string) bool {
+	uuidRegex := regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	return uuidRegex.MatchString(id)
+}
+
+// validateOrgID checks if a string is a valid organization ID
+func validateOrgID(id string) bool {
+	orgIDRegex := regexp.MustCompile(`^org_[A-Z0-9]{26}$`)
+	return orgIDRegex.MatchString(id)
+}
+
+// validateDateFormat checks if a string is in YYYY-MM-DD format
+func validateDateFormat(date string) bool {
+	dateRegex := regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+	return dateRegex.MatchString(date)
+}
+
+// Helper functions to improve readability and maintainability
 
 func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	// Get auth ID from context
@@ -797,17 +868,8 @@ func (h *AppointmentHandler) checkDoctorAvailabilityMongoDB(ctx context.Context,
 	return count == 0, nil
 }
 
-// Helper functions to validate IDs
-func validatePatientID(patientID string) bool {
-	return regexp.MustCompile(`^[A-Z0-9]{8}$`).MatchString(patientID)
-}
-
 func validateDoctorID(doctorID string) bool {
 	return regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`).MatchString(doctorID)
-}
-
-func validateOrgID(orgID string) bool {
-	return regexp.MustCompile(`^org_[A-Z0-9]{26}$`).MatchString(orgID)
 }
 
 func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
@@ -1077,8 +1139,8 @@ func (h *AppointmentHandler) GetDoctorAppointments(c *fiber.Ctx) error {
 	query := bson.M{"doctor_id": doctorID}
 
 	// Add status filter if provided
-	if filters.Status != "" {
-		query["appointment_status"] = filters.Status
+	if filters.AppointmentStatus != "" {
+		query["appointment_status"] = filters.AppointmentStatus
 	}
 
 	// Add date range filters if provided

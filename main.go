@@ -537,7 +537,7 @@ func (a *App) setupRoutes() error {
 	appointmentsGroup.Post("/create", appointmentHandler.CreateAppointment)
 	appointmentsGroup.Get("/:id", appointmentHandler.GetAppointment)
 	appointmentsGroup.Get("/doctor/:id", appointmentHandler.GetDoctorAppointments)
-	appointmentsGroup.Get("/org", appointmentHandler.GetAppointmentsByOrgID) // Changed from "/organization/:orgID"
+	appointmentsGroup.Get("/", appointmentHandler.GetAppointmentsByOrgID) // Changed from "/organization/:orgID"
 	appointmentsGroup.Put("/:id", appointmentHandler.UpdateAppointment)
 	appointmentsGroup.Delete("/:id", appointmentHandler.DeleteAppointment)
 	appointmentsGroup.Post("/", appointmentHandler.CreateAppointment)
