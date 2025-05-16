@@ -175,6 +175,8 @@ type Appointment struct {
 	UpdatedAt         time.Time `bson:"updated_at,omitempty" json:"updated_at,omitempty"`
 	IsValid           bool      `bson:"is_valid" json:"is_valid"`
 	NextVisitDate     time.Time `bson:"next_visit_date" json:"next_visit_date"`
+	SlotStartTime     string    `bson:"slot_start_time" json:"slot_start_time"`
+	SlotEndTime       string    `bson:"slot_end_time" json:"slot_end_time"`
 }
 
 // Define response type for clarity
@@ -195,6 +197,8 @@ type AppointmentResponse struct {
 	IsValid           bool   `json:"is_valid"`
 	CreatedAt         string `json:"created_at"`
 	UpdatedAt         string `json:"updated_at"`
+	SlotStartTime     string `json:"slot_start_time"`
+	SlotEndTime       string `json:"slot_end_time"`
 }
 
 type AppointmentFilters struct {
@@ -577,7 +581,6 @@ func validateDateFormat(date string) bool {
 }
 
 // Helper functions to improve readability and maintainability
-
 func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	// Get auth ID from context
 	authID, err := h.getAuthID(c)
@@ -605,6 +608,8 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 		PatientName       string    `json:"patient_name"`
 		DoctorName        string    `json:"doctor_name"`
 		AppointmentDate   time.Time `json:"appointment_date"`
+		SlotStartTime     string    `json:"slot_start_time"` // New field for slot start time
+		SlotEndTime       string    `json:"slot_end_time"`   // New field for slot end time
 		FeeType           string    `json:"fee_type"`
 		PaymentMethod     string    `json:"payment_method"`
 		Reason            string    `json:"reason,omitempty"` // Optional field
@@ -626,6 +631,8 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 		zap.String("patient_name", appointmentRequest.PatientName),
 		zap.String("doctor_name", appointmentRequest.DoctorName),
 		zap.Any("appointment_date", appointmentRequest.AppointmentDate),
+		zap.String("slot_start_time", appointmentRequest.SlotStartTime),
+		zap.String("slot_end_time", appointmentRequest.SlotEndTime),
 		zap.String("fee_type", appointmentRequest.FeeType),
 		zap.String("payment_method", appointmentRequest.PaymentMethod))
 
@@ -648,6 +655,12 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	}
 	if appointmentRequest.AppointmentDate.IsZero() {
 		missingFields = append(missingFields, "appointment_date")
+	}
+	if appointmentRequest.SlotStartTime == "" {
+		missingFields = append(missingFields, "slot_start_time")
+	}
+	if appointmentRequest.SlotEndTime == "" {
+		missingFields = append(missingFields, "slot_end_time")
 	}
 	if appointmentRequest.FeeType == "" {
 		missingFields = append(missingFields, "fee_type")
@@ -680,6 +693,25 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID must be in ULID format (org_[A-Z0-9]{26})"})
 	}
 
+	// Validate time slot format (expected format: "HH:MM")
+	if !validateTimeFormat(appointmentRequest.SlotStartTime) {
+		h.logger.Warn("invalid slot start time format", zap.String("slot_start_time", appointmentRequest.SlotStartTime))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Slot start time must be in HH:MM format (24-hour)"})
+	}
+
+	if !validateTimeFormat(appointmentRequest.SlotEndTime) {
+		h.logger.Warn("invalid slot end time format", zap.String("slot_end_time", appointmentRequest.SlotEndTime))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Slot end time must be in HH:MM format (24-hour)"})
+	}
+
+	// Validate that start time is before end time
+	if !validateTimeRange(appointmentRequest.SlotStartTime, appointmentRequest.SlotEndTime) {
+		h.logger.Warn("invalid time slot range",
+			zap.String("slot_start_time", appointmentRequest.SlotStartTime),
+			zap.String("slot_end_time", appointmentRequest.SlotEndTime))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Slot start time must be before slot end time"})
+	}
+
 	// Validate fee type
 	if appointmentRequest.FeeType != "emergency" && appointmentRequest.FeeType != "default" && appointmentRequest.FeeType != "recurring" {
 		h.logger.Warn("invalid fee type", zap.String("fee_type", appointmentRequest.FeeType))
@@ -689,16 +721,23 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	// Verify doctor availability for the selected time slot
 	h.logger.Debug("checking doctor availability",
 		zap.String("doctor_id", appointmentRequest.DoctorID),
-		zap.Time("appointment_date", appointmentRequest.AppointmentDate))
+		zap.Time("appointment_date", appointmentRequest.AppointmentDate),
+		zap.String("slot_start_time", appointmentRequest.SlotStartTime),
+		zap.String("slot_end_time", appointmentRequest.SlotEndTime))
 
-	available, err := h.checkDoctorAvailabilityMongoDB(c.Context(), appointmentRequest.DoctorID, appointmentRequest.OrgID, appointmentRequest.AppointmentDate)
+	available, err := h.checkDoctorAvailabilityForSlot(c.Context(),
+		appointmentRequest.DoctorID,
+		appointmentRequest.OrgID,
+		appointmentRequest.AppointmentDate,
+		appointmentRequest.SlotStartTime,
+		appointmentRequest.SlotEndTime)
 	if err != nil {
 		h.logger.Error("failed to check doctor availability", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to check doctor availability"})
 	}
 
 	if !available {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor is not available at selected time"})
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor is not available during the selected time slot"})
 	}
 
 	// Get doctor's fees based on fee type
@@ -761,6 +800,8 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 		"fee_type":           appointmentRequest.FeeType,
 		"appointment_fee":    appointmentFee,
 		"appointment_date":   appointmentRequest.AppointmentDate,
+		"slot_start_time":    appointmentRequest.SlotStartTime,
+		"slot_end_time":      appointmentRequest.SlotEndTime,
 		"created_at":         now,
 		"updated_at":         now,
 		"is_valid":           isValid,
@@ -794,6 +835,191 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 		"message":     "Appointment created successfully",
 		"appointment": appointment,
 	})
+}
+
+// Helper function to validate time format (HH:MM in 24-hour format)
+func validateTimeFormat(timeStr string) bool {
+	_, err := time.Parse("15:04", timeStr)
+	return err == nil
+}
+
+// Helper function to validate that start time is before end time
+func validateTimeRange(startTime, endTime string) bool {
+	start, err1 := time.Parse("15:04", startTime)
+	end, err2 := time.Parse("15:04", endTime)
+
+	if err1 != nil || err2 != nil {
+		return false
+	}
+
+	return start.Before(end)
+}
+
+// Helper function to check doctor availability for a specific time slot
+func (h *AppointmentHandler) checkDoctorAvailabilityForSlot(
+	ctx context.Context,
+	doctorID string,
+	orgID string,
+	appointmentDate time.Time,
+	slotStartTime string,
+	slotEndTime string,
+) (bool, error) {
+	// Get the weekday for the appointment date
+	weekday := appointmentDate.Weekday().String()
+
+	h.logger.Info("Checking doctor availability",
+		zap.String("doctor_id", doctorID),
+		zap.String("org_id", orgID),
+		zap.Time("appointment_date", appointmentDate),
+		zap.String("weekday", weekday),
+		zap.String("slot_start_time", slotStartTime),
+		zap.String("slot_end_time", slotEndTime))
+
+	// Step 1: Check if the doctor has a shift defined for this weekday in PostgreSQL
+	var startTimeStr, endTimeStr string
+	var isActive bool
+	var slotDuration int
+
+	query := `
+		SELECT ds.starttime::text, ds.endtime::text, ds.isactive, d.slot_duration 
+		FROM doctorshifts ds
+		JOIN doctors d ON ds.doctor_id = d.doctor_id
+		WHERE ds.doctor_id = $1 
+		AND ds.weekday = $2 
+		AND ds.organization_id = $3
+	`
+
+	err := h.pgPool.QueryRow(ctx, query, doctorID, weekday, orgID).Scan(
+		&startTimeStr,
+		&endTimeStr,
+		&isActive,
+		&slotDuration,
+	)
+
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			h.logger.Info("No shift found for doctor on this day",
+				zap.String("doctor_id", doctorID),
+				zap.String("weekday", weekday))
+			return false, nil
+		}
+		h.logger.Error("Error fetching doctor shift", zap.Error(err))
+		return false, err
+	}
+
+	// If shift is not active or no times set
+	if !isActive || startTimeStr == "" || endTimeStr == "" {
+		h.logger.Info("Shift is not active for this day",
+			zap.String("doctor_id", doctorID),
+			zap.Bool("is_active", isActive))
+		return false, nil
+	}
+
+	// Parse shift start and end times
+	shiftStart, err := parseTimeWithFallbacks(startTimeStr)
+	if err != nil {
+		h.logger.Error("Error parsing shift start time", zap.Error(err))
+		return false, fmt.Errorf("invalid shift start time: %w", err)
+	}
+
+	shiftEnd, err := parseTimeWithFallbacks(endTimeStr)
+	if err != nil {
+		h.logger.Error("Error parsing shift end time", zap.Error(err))
+		return false, fmt.Errorf("invalid shift end time: %w", err)
+	}
+
+	// Parse requested slot times
+	requestedStart, err := time.Parse("15:04", slotStartTime)
+	if err != nil {
+		h.logger.Error("Error parsing requested start time", zap.Error(err))
+		return false, fmt.Errorf("invalid slot start time: %w", err)
+	}
+
+	requestedEnd, err := time.Parse("15:04", slotEndTime)
+	if err != nil {
+		h.logger.Error("Error parsing requested end time", zap.Error(err))
+		return false, fmt.Errorf("invalid slot end time: %w", err)
+	}
+
+	// Step 2: Check if the requested time slot is within the doctor's working hours
+	// Normalize times for comparison (strip date part)
+	normalizedRequestedStart := time.Date(0, 1, 1, requestedStart.Hour(), requestedStart.Minute(), 0, 0, time.UTC)
+	normalizedRequestedEnd := time.Date(0, 1, 1, requestedEnd.Hour(), requestedEnd.Minute(), 0, 0, time.UTC)
+	normalizedShiftStart := time.Date(0, 1, 1, shiftStart.Hour(), shiftStart.Minute(), 0, 0, time.UTC)
+	normalizedShiftEnd := time.Date(0, 1, 1, shiftEnd.Hour(), shiftEnd.Minute(), 0, 0, time.UTC)
+
+	// Check if requested slot is within doctor's shift hours
+	if normalizedRequestedStart.Before(normalizedShiftStart) || normalizedRequestedEnd.After(normalizedShiftEnd) {
+		h.logger.Info("Requested time slot is outside doctor's working hours",
+			zap.String("shift_start", startTimeStr),
+			zap.String("shift_end", endTimeStr),
+			zap.String("requested_start", slotStartTime),
+			zap.String("requested_end", slotEndTime))
+		return false, nil
+	}
+
+	// Step 3: Check for existing appointments during this time slot
+	// Create start and end of day for date filtering
+	startOfDay := time.Date(appointmentDate.Year(), appointmentDate.Month(), appointmentDate.Day(), 0, 0, 0, 0, appointmentDate.Location())
+	endOfDay := startOfDay.AddDate(0, 0, 1)
+
+	// MongoDB query filter for conflicting appointments
+	filter := bson.M{
+		"doctor_id": doctorID,
+		"org_id":    orgID,
+		"appointment_date": bson.M{
+			"$gte": primitive.NewDateTimeFromTime(startOfDay),
+			"$lt":  primitive.NewDateTimeFromTime(endOfDay),
+		},
+		"is_valid": true,
+		"appointment_status": bson.M{
+			"$nin": []string{"cancelled", "declined"},
+		},
+		"$or": []bson.M{
+			{
+				// Requested slot starts during an existing appointment
+				"slot_start_time": bson.M{"$lte": slotStartTime},
+				"slot_end_time":   bson.M{"$gt": slotStartTime},
+			},
+			{
+				// Requested slot ends during an existing appointment
+				"slot_start_time": bson.M{"$lt": slotEndTime},
+				"slot_end_time":   bson.M{"$gte": slotEndTime},
+			},
+			{
+				// Existing appointment is entirely within requested slot
+				"slot_start_time": bson.M{"$gte": slotStartTime},
+				"slot_end_time":   bson.M{"$lte": slotEndTime},
+			},
+			{
+				// Requested slot is entirely within an existing appointment
+				"slot_start_time": bson.M{"$lte": slotStartTime},
+				"slot_end_time":   bson.M{"$gte": slotEndTime},
+			},
+		},
+	}
+
+	// Execute MongoDB query
+	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
+	count, err := appointmentsCollection.CountDocuments(ctx, filter)
+	if err != nil {
+		h.logger.Error("Error checking for conflicting appointments", zap.Error(err))
+		return false, err
+	}
+
+	// If count > 0, there are conflicting appointments
+	if count > 0 {
+		h.logger.Info("Found conflicting appointments for requested time slot",
+			zap.Int64("conflict_count", count))
+		return false, nil
+	}
+
+	h.logger.Info("Time slot is available",
+		zap.String("doctor_id", doctorID),
+		zap.String("slot_start", slotStartTime),
+		zap.String("slot_end", slotEndTime))
+
+	return true, nil
 }
 
 // Helper function to get default fee based on type
@@ -840,34 +1066,6 @@ func (h *AppointmentHandler) getDoctorFee(ctx context.Context, doctorID, orgID, 
 	return fee, nil
 }
 
-// Helper function to check if doctor is available
-func (h *AppointmentHandler) checkDoctorAvailabilityMongoDB(ctx context.Context, doctorID, orgID string, appointmentDate time.Time) (bool, error) {
-	// Create time window for checking conflicts (15 minutes before and after)
-	startWindow := appointmentDate.Add(-15 * time.Minute)
-	endWindow := appointmentDate.Add(15 * time.Minute)
-
-	// Query MongoDB for conflicting appointments
-	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
-
-	filter := bson.M{
-		"doctor_id": doctorID,
-		"org_id":    orgID,
-		"appointment_date": bson.M{
-			"$gte": startWindow,
-			"$lte": endWindow,
-		},
-		"is_valid": true,
-	}
-
-	count, err := appointmentsCollection.CountDocuments(ctx, filter)
-	if err != nil {
-		return false, fmt.Errorf("error checking availability: %w", err)
-	}
-
-	// Doctor is available if no conflicting appointments found
-	return count == 0, nil
-}
-
 func validateDoctorID(doctorID string) bool {
 	return regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`).MatchString(doctorID)
 }
@@ -880,17 +1078,19 @@ func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
 	}
 
-	fmt.Println("Auth ID:", authID)
+	h.logger.Info("Auth ID:", zap.String("auth_id", authID))
+
 	// Get doctor ID from params
 	doctorID := c.Params("id")
 	if doctorID == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor ID is required"})
 	}
 
-	// Get org ID from query params
+	// Get org ID from query params with better error message
 	orgID := c.Query("org_id")
 	if orgID == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID is required"})
+		h.logger.Error("Missing organization ID in request", zap.String("doctor_id", doctorID))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID is required in the query parameters"})
 	}
 
 	// Get date from query params
@@ -899,9 +1099,10 @@ func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Date is required"})
 	}
 
-	// Parse date
+	// Parse date with error logging
 	date, err := time.Parse("2006-01-02", dateStr)
 	if err != nil {
+		h.logger.Error("Invalid date format", zap.String("date", dateStr), zap.Error(err))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Invalid date format. Use YYYY-MM-DD",
 		})
@@ -909,6 +1110,11 @@ func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
 
 	// Get weekday
 	weekday := date.Weekday().String()
+	h.logger.Info("Fetching availability",
+		zap.String("doctor_id", doctorID),
+		zap.String("org_id", orgID),
+		zap.String("date", dateStr),
+		zap.String("weekday", weekday))
 
 	// Get doctor shift for the weekday
 	var startTimeStr, endTimeStr string
@@ -925,6 +1131,13 @@ func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
         AND ds.organization_id = $3
     `
 
+	// Log the query being executed
+	h.logger.Info("Executing query",
+		zap.String("query", query),
+		zap.String("doctor_id", doctorID),
+		zap.String("weekday", weekday),
+		zap.String("org_id", orgID))
+
 	err = h.pgPool.QueryRow(c.Context(), query, doctorID, weekday, orgID).Scan(
 		&startTimeStr,
 		&endTimeStr,
@@ -934,44 +1147,73 @@ func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			h.logger.Info("No shift found for doctor",
+				zap.String("doctor_id", doctorID),
+				zap.String("weekday", weekday))
+
 			return c.Status(fiber.StatusOK).JSON(fiber.Map{
 				"available_slots": []string{},
 				"message":         "No shift scheduled for this day",
 			})
 		}
-		h.logger.Error("Error fetching doctor shift", zap.Error(err))
+
+		h.logger.Error("Error fetching doctor shift",
+			zap.String("doctor_id", doctorID),
+			zap.String("weekday", weekday),
+			zap.Error(err))
+
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to fetch doctor shift",
+			"error": "Failed to fetch doctor shift: " + err.Error(),
 		})
 	}
 
+	// Log the shift details that were found
+	h.logger.Info("Shift found",
+		zap.String("doctor_id", doctorID),
+		zap.String("start_time", startTimeStr),
+		zap.String("end_time", endTimeStr),
+		zap.Bool("is_active", isActive),
+		zap.Int("slot_duration", slotDuration))
+
 	// If shift is not active or no times set
 	if !isActive || startTimeStr == "" || endTimeStr == "" {
+		h.logger.Info("Shift is not active",
+			zap.String("doctor_id", doctorID),
+			zap.Bool("is_active", isActive))
+
 		return c.Status(fiber.StatusOK).JSON(fiber.Map{
 			"available_slots": []string{},
 			"message":         "No active shift for this day",
 		})
 	}
 
-	// Parse start and end times
-	startTime, err := time.Parse("15:04:05", startTimeStr)
+	// Parse start and end times, handling potential format issues
+	startTime, err := parseTimeWithFallbacks(startTimeStr)
 	if err != nil {
-		h.logger.Error("Error parsing start time", zap.Error(err))
+		h.logger.Error("Error parsing start time",
+			zap.String("time", startTimeStr),
+			zap.Error(err))
+
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Invalid shift start time format",
+			"error": "Invalid shift start time format: " + startTimeStr,
 		})
 	}
 
-	endTime, err := time.Parse("15:04:05", endTimeStr)
+	endTime, err := parseTimeWithFallbacks(endTimeStr)
 	if err != nil {
-		h.logger.Error("Error parsing end time", zap.Error(err))
+		h.logger.Error("Error parsing end time",
+			zap.String("time", endTimeStr),
+			zap.Error(err))
+
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Invalid shift end time format",
+			"error": "Invalid shift end time format: " + endTimeStr,
 		})
 	}
 
 	// Use default slot duration if not set
 	if slotDuration <= 0 {
+		h.logger.Info("Using default slot duration of 30 minutes",
+			zap.String("doctor_id", doctorID))
 		slotDuration = 30 // Default 30 minutes
 	}
 
@@ -984,41 +1226,89 @@ func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
 		currentTime = currentTime.Add(time.Duration(slotDuration) * time.Minute)
 	}
 
-	// Get unavailable slots (existing appointments)
+	h.logger.Info("Generated potential time slots",
+		zap.Int("slot_count", len(allSlots)),
+		zap.Strings("slots", allSlots))
+
+	// Get unavailable slots (existing appointments) from MongoDB
 	var bookedSlots []string
 
-	// Create query to get booked appointment times for the date
-	appointmentsQuery := `
-    SELECT TO_CHAR(appointment_date, 'HH24:MI') as time_slot
-    FROM appointments
-    WHERE doctor_id = $1
-    AND org_id = $2
-    AND DATE(appointment_date) = $3
-    AND appointment_status NOT IN ('cancelled', 'declined')
-`
+	// Create start and end of day for date filtering
+	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, date.Location())
+	endOfDay := startOfDay.AddDate(0, 0, 1)
 
-	rows, err := h.pgPool.Query(c.Context(), appointmentsQuery, doctorID, orgID, dateStr)
+	// Create MongoDB query filter for appointments on the specified date
+	filter := bson.M{
+		"doctor_id": doctorID,
+		"org_id":    orgID,
+		// Filter by appointments on this date
+		"appointment_date": bson.M{
+			"$gte": primitive.NewDateTimeFromTime(startOfDay),
+			"$lt":  primitive.NewDateTimeFromTime(endOfDay),
+		},
+		// Exclude cancelled or declined appointments
+		"appointment_status": bson.M{
+			"$nin": []string{"cancelled", "declined"},
+		},
+	}
+
+	h.logger.Info("Checking for booked slots",
+		zap.Any("filter", filter))
+
+	// Execute MongoDB query
+	ctx := c.Context()
+	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
+	cursor, err := appointmentsCollection.Find(ctx, filter)
+
 	if err != nil {
-		// Log the error but continue with empty booked slots instead of returning error
-		h.logger.Error("Error fetching booked appointments", zap.Error(err))
-		bookedSlots = []string{} // Initialize as empty instead of returning error
+		h.logger.Error("Error querying MongoDB for appointments", zap.Error(err))
+		// Continue with empty booked slots instead of returning error
+		bookedSlots = []string{}
 	} else {
-		defer rows.Close()
+		defer cursor.Close(ctx)
 
-		for rows.Next() {
-			var slot string
-			if err := rows.Scan(&slot); err != nil {
-				h.logger.Error("Error scanning booked slot", zap.Error(err))
-				continue
-			}
-			bookedSlots = append(bookedSlots, slot)
+		// Define a struct to hold the appointment data we need
+		type AppointmentTime struct {
+			SlotStartTime string `bson:"slot_start_time"`
+			SlotEndTime   string `bson:"slot_end_time"`
 		}
 
-		if err := rows.Err(); err != nil {
-			h.logger.Error("Error iterating booked slots", zap.Error(err))
+		// Iterate through the results and extract the time slots
+		for cursor.Next(ctx) {
+			var appointment AppointmentTime
+			if err := cursor.Decode(&appointment); err != nil {
+				h.logger.Error("Error decoding appointment", zap.Error(err))
+				continue
+			}
+
+			// Add both the start and end times to booked slots
+			bookedSlots = append(bookedSlots, appointment.SlotStartTime)
+
+			// Calculate intermediate slots that should also be marked as unavailable
+			startSlot, err := time.Parse("15:04", appointment.SlotStartTime)
+			if err == nil {
+				endSlot, err := time.Parse("15:04", appointment.SlotEndTime)
+				if err == nil {
+					// Mark intermediate slots as booked
+					intermediateTime := startSlot.Add(time.Duration(slotDuration) * time.Minute)
+					for intermediateTime.Before(endSlot) {
+						intermediateSlot := intermediateTime.Format("15:04")
+						bookedSlots = append(bookedSlots, intermediateSlot)
+						intermediateTime = intermediateTime.Add(time.Duration(slotDuration) * time.Minute)
+					}
+				}
+			}
+		}
+
+		if err := cursor.Err(); err != nil {
+			h.logger.Error("Error iterating through appointments cursor", zap.Error(err))
 			// Continue with what we have instead of failing
 		}
 	}
+
+	h.logger.Info("Found booked slots",
+		zap.Int("booked_slot_count", len(bookedSlots)),
+		zap.Strings("booked_slots", bookedSlots))
 
 	// Filter out unavailable slots
 	var availableSlots []string
@@ -1035,11 +1325,66 @@ func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
 		}
 	}
 
+	h.logger.Info("Final available slots",
+		zap.Int("available_slot_count", len(availableSlots)))
+
+	// Format the response in a structure matching the frontend expectations
+	var formattedSlots []map[string]string
+	for _, slot := range availableSlots {
+		// Calculate end time for the slot
+		startSlot, _ := time.Parse("15:04", slot)
+		endSlot := startSlot.Add(time.Duration(slotDuration) * time.Minute)
+
+		formattedSlots = append(formattedSlots, map[string]string{
+			"start_time": slot,
+			"end_time":   endSlot.Format("15:04"),
+		})
+	}
+
 	return c.JSON(fiber.Map{
-		"available_slots":   availableSlots,
+		"available_slots":   formattedSlots, // Return formatted slots with start/end times
+		"raw_slots":         availableSlots, // Also include the raw slot times for compatibility
 		"unavailable_slots": bookedSlots,
 		"message":           "Slot availability fetched successfully",
 	})
+}
+
+// Helper function to handle different time formats that might be in the database
+func parseTimeWithFallbacks(timeStr string) (time.Time, error) {
+	// Try standard format first (15:04:05)
+	t, err := time.Parse("15:04:05", timeStr)
+	if err == nil {
+		return t, nil
+	}
+
+	// Try without seconds (15:04)
+	t, err = time.Parse("15:04", timeStr)
+	if err == nil {
+		return t, nil
+	}
+
+	// Try with AM/PM format (3:04 PM)
+	t, err = time.Parse("3:04 PM", timeStr)
+	if err == nil {
+		return t, nil
+	}
+
+	// Try 24-hour format without colon (e.g. "1430" for 2:30 PM)
+	if len(timeStr) == 4 {
+		hourStr := timeStr[0:2]
+		minStr := timeStr[2:4]
+
+		hour, errHour := strconv.Atoi(hourStr)
+		min, errMin := strconv.Atoi(minStr)
+
+		if errHour == nil && errMin == nil && hour >= 0 && hour < 24 && min >= 0 && min < 60 {
+			t = time.Date(0, 1, 1, hour, min, 0, 0, time.UTC)
+			return t, nil
+		}
+	}
+
+	// Return the original error if all parsing attempts fail
+	return time.Time{}, fmt.Errorf("could not parse time: %s", timeStr)
 }
 
 // GetAppointment retrieves a single appointment by ID
@@ -1050,22 +1395,24 @@ func (h *AppointmentHandler) GetAppointment(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Appointment ID is required"})
 	}
 
-	// Query MongoDB for the appointment
-	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
-	var appointment Appointment
-
-	objID, err := primitive.ObjectIDFromHex(appointmentID)
-	if err != nil {
-		h.logger.Error("invalid appointment ID format", zap.Error(err))
+	// Validate UUID format
+	if !isValidUUID(appointmentID) {
+		h.logger.Error("invalid appointment ID format", zap.String("id", appointmentID))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid appointment ID format"})
 	}
 
-	err = appointmentsCollection.FindOne(c.Context(), bson.M{"_id": objID}).Decode(&appointment)
+	// Query MongoDB for the appointment using the appointment_id field
+	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
+
+	var appointment Appointment
+	err := appointmentsCollection.FindOne(c.Context(), bson.M{"appointment_id": appointmentID}).Decode(&appointment)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Appointment not found"})
 		}
-		h.logger.Error("failed to fetch appointment", zap.Error(err))
+		h.logger.Error("failed to fetch appointment",
+			zap.Error(err),
+			zap.String("appointment_id", appointmentID))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch appointment"})
 	}
 
@@ -1080,7 +1427,13 @@ func (h *AppointmentHandler) GetAppointment(c *fiber.Ctx) error {
 		updatedAtStr = appointment.UpdatedAt.Format(time.RFC3339)
 	}
 
+	nextVisitDateStr := ""
+	if !appointment.NextVisitDate.IsZero() {
+		nextVisitDateStr = appointment.NextVisitDate.Format(time.RFC3339)
+	}
+
 	response := AppointmentResponse{
+		AppointmentID:     appointment.AppointmentID,
 		PatientID:         appointment.PatientID,
 		DoctorID:          appointment.DoctorID,
 		OrgID:             appointment.OrgID,
@@ -1093,9 +1446,19 @@ func (h *AppointmentHandler) GetAppointment(c *fiber.Ctx) error {
 		AppointmentDate:   appointmentDateStr,
 		CreatedAt:         appointment.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:         updatedAtStr,
+		IsValid:           appointment.IsValid,
+		NextVisitDate:     nextVisitDateStr,
+		SlotStartTime:     appointment.SlotStartTime,
+		SlotEndTime:       appointment.SlotEndTime,
 	}
 
 	return c.JSON(response)
+}
+
+// isValidUUID validates if the string is a valid UUID
+func isValidUUID(id string) bool {
+	regex := regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+	return regex.MatchString(id)
 }
 
 // GetDoctorAppointments retrieves appointments for a specific doctor
