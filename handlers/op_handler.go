@@ -580,7 +580,31 @@ func validateDateFormat(date string) bool {
 	return dateRegex.MatchString(date)
 }
 
-// Helper functions to improve readability and maintainability
+// Helper function to validate doctor ID format (UUID)
+func validateDoctorID(doctorID string) bool {
+	return regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`).MatchString(doctorID)
+}
+
+// Helper function to parse time with multiple possible formats
+func parseTimeWithFallbacks(timeStr string) (time.Time, error) {
+	formats := []string{
+		"15:04:05",
+		"15:04",
+		"3:04 PM",
+		"3:04:05 PM",
+	}
+
+	for _, format := range formats {
+		t, err := time.Parse(format, timeStr)
+		if err == nil {
+			return t, nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("could not parse time from %s", timeStr)
+}
+
+// Set default isValid if not provided// Helper functions to improve readability and maintainability
 func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	// Get auth ID from context
 	authID, err := h.getAuthID(c)
@@ -855,7 +879,7 @@ func validateTimeRange(startTime, endTime string) bool {
 	return start.Before(end)
 }
 
-// Helper function to check doctor availability for a specific time slot
+// Fix for the checkDoctorAvailabilityForSlot function
 func (h *AppointmentHandler) checkDoctorAvailabilityForSlot(
 	ctx context.Context,
 	doctorID string,
@@ -963,7 +987,8 @@ func (h *AppointmentHandler) checkDoctorAvailabilityForSlot(
 	startOfDay := time.Date(appointmentDate.Year(), appointmentDate.Month(), appointmentDate.Day(), 0, 0, 0, 0, appointmentDate.Location())
 	endOfDay := startOfDay.AddDate(0, 0, 1)
 
-	// MongoDB query filter for conflicting appointments
+	// FIX: Improved MongoDB query for overlapping time slots
+	// This query properly combines date/doctor filtering with time overlap check
 	filter := bson.M{
 		"doctor_id": doctorID,
 		"org_id":    orgID,
@@ -975,26 +1000,13 @@ func (h *AppointmentHandler) checkDoctorAvailabilityForSlot(
 		"appointment_status": bson.M{
 			"$nin": []string{"cancelled", "declined"},
 		},
-		"$or": []bson.M{
+		// Use the proper time overlap check conditions within the main filter
+		"$and": []bson.M{
 			{
-				// Requested slot starts during an existing appointment
-				"slot_start_time": bson.M{"$lte": slotStartTime},
-				"slot_end_time":   bson.M{"$gt": slotStartTime},
+				"slot_start_time": bson.M{"$lt": slotEndTime}, // Existing appointment starts before requested slot ends
 			},
 			{
-				// Requested slot ends during an existing appointment
-				"slot_start_time": bson.M{"$lt": slotEndTime},
-				"slot_end_time":   bson.M{"$gte": slotEndTime},
-			},
-			{
-				// Existing appointment is entirely within requested slot
-				"slot_start_time": bson.M{"$gte": slotStartTime},
-				"slot_end_time":   bson.M{"$lte": slotEndTime},
-			},
-			{
-				// Requested slot is entirely within an existing appointment
-				"slot_start_time": bson.M{"$lte": slotStartTime},
-				"slot_end_time":   bson.M{"$gte": slotEndTime},
+				"slot_end_time": bson.M{"$gt": slotStartTime}, // Existing appointment ends after requested slot starts
 			},
 		},
 	}
@@ -1010,7 +1022,9 @@ func (h *AppointmentHandler) checkDoctorAvailabilityForSlot(
 	// If count > 0, there are conflicting appointments
 	if count > 0 {
 		h.logger.Info("Found conflicting appointments for requested time slot",
-			zap.Int64("conflict_count", count))
+			zap.Int64("conflict_count", count),
+			zap.String("slot_start", slotStartTime),
+			zap.String("slot_end", slotEndTime))
 		return false, nil
 	}
 
@@ -1064,10 +1078,6 @@ func (h *AppointmentHandler) getDoctorFee(ctx context.Context, doctorID, orgID, 
 	}
 
 	return fee, nil
-}
-
-func validateDoctorID(doctorID string) bool {
-	return regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`).MatchString(doctorID)
 }
 
 func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
@@ -1347,44 +1357,6 @@ func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
 		"unavailable_slots": bookedSlots,
 		"message":           "Slot availability fetched successfully",
 	})
-}
-
-// Helper function to handle different time formats that might be in the database
-func parseTimeWithFallbacks(timeStr string) (time.Time, error) {
-	// Try standard format first (15:04:05)
-	t, err := time.Parse("15:04:05", timeStr)
-	if err == nil {
-		return t, nil
-	}
-
-	// Try without seconds (15:04)
-	t, err = time.Parse("15:04", timeStr)
-	if err == nil {
-		return t, nil
-	}
-
-	// Try with AM/PM format (3:04 PM)
-	t, err = time.Parse("3:04 PM", timeStr)
-	if err == nil {
-		return t, nil
-	}
-
-	// Try 24-hour format without colon (e.g. "1430" for 2:30 PM)
-	if len(timeStr) == 4 {
-		hourStr := timeStr[0:2]
-		minStr := timeStr[2:4]
-
-		hour, errHour := strconv.Atoi(hourStr)
-		min, errMin := strconv.Atoi(minStr)
-
-		if errHour == nil && errMin == nil && hour >= 0 && hour < 24 && min >= 0 && min < 60 {
-			t = time.Date(0, 1, 1, hour, min, 0, 0, time.UTC)
-			return t, nil
-		}
-	}
-
-	// Return the original error if all parsing attempts fail
-	return time.Time{}, fmt.Errorf("could not parse time: %s", timeStr)
 }
 
 // GetAppointment retrieves a single appointment by ID

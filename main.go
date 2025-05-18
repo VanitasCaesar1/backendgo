@@ -412,6 +412,15 @@ func (a *App) setupRoutes() error {
 		return fmt.Errorf("failed to initialize appointment handler: %v", err)
 	}
 
+	diagnosisHandler, err := handlers.NewDiagnosisHandler(a.Config, a.Redis, a.Logger, a.Postgres, a.MongoDB)
+	if err != nil {
+		return fmt.Errorf("failed to initialize appointment handler: %v", err)
+	}
+
+	medicinesHandler := handlers.NewMedicineHandler(a.Postgres, a.Logger, a.Config, a.Redis, a.MongoDB)
+	if err != nil {
+		return fmt.Errorf("failed to initialize medicines handler: %v", err)
+	}
 	// Initialize the WorkOS webhook handler with better error handling
 	workosWebhookHandler, err := handlers.NewWorkOSWebhookHandler(a.Config, a.Redis, a.Logger, a.Postgres)
 	if err != nil {
@@ -545,12 +554,21 @@ func (a *App) setupRoutes() error {
 	appointmentsGroup.Put("/:id", appointmentHandler.UpdateAppointment)
 	appointmentsGroup.Delete("/:id", appointmentHandler.DeleteAppointment)
 
+	diagnosisGroup := a.Fiber.Group("/api/diagnosis", authMiddleware.Handler())
+	diagnosisGroup.Get("/", diagnosisHandler.GetDiagnosis)
+	diagnosisGroup.Post("/create", diagnosisHandler.CreateDiagnosis)
+	diagnosisGroup.Put("/:id", diagnosisHandler.UpdateDiagnosis)
+	diagnosisGroup.Delete("/:id", diagnosisHandler.DeleteDiagnosis)
+
 	patientsGroup := a.Fiber.Group("/api/patients", authMiddleware.Handler())
 	patientsGroup.Get("/", appointmentHandler.GetAllPatients) // Add this line for listing all patients
 	patientsGroup.Post("/create", appointmentHandler.CreatePatient)
 	patientsGroup.Get("/:id", appointmentHandler.PatientHandler)
 	patientsGroup.Put("/:id", appointmentHandler.PatientHandler)
 	patientsGroup.Post("/:id", appointmentHandler.PatientHandler)
+
+	medicinesGroup := a.Fiber.Group("/api/medicines", authMiddleware.Handler())
+	medicinesGroup.Get("/search", medicinesHandler.SearchMedicines)
 
 	// Additional protected API routes from the middleware file
 	a.Fiber.Use("/api/protected/*", authMiddleware.Handler())
