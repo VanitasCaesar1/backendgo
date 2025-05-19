@@ -585,7 +585,6 @@ func validateDoctorID(doctorID string) bool {
 	return regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`).MatchString(doctorID)
 }
 
-// Helper function to parse time with multiple possible formats
 func parseTimeWithFallbacks(timeStr string) (time.Time, error) {
 	formats := []string{
 		"15:04:05",
@@ -604,7 +603,33 @@ func parseTimeWithFallbacks(timeStr string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("could not parse time from %s", timeStr)
 }
 
-// Set default isValid if not provided// Helper functions to improve readability and maintainability
+// Improved helper function to strictly validate time format (HH:MM in 24-hour format)
+func validateTimeFormat(timeStr string) bool {
+	// Use regex to ensure strict HH:MM format
+	match, _ := regexp.MatchString(`^([01]?[0-9]|2[0-3]):[0-5][0-9]$`, timeStr)
+	if !match {
+		return false
+	}
+
+	// Double check with time.Parse for additional validation
+	_, err := time.Parse("15:04", timeStr)
+	return err == nil
+}
+
+// Improved helper function to validate that start time is before end time
+func validateTimeRange(startTime, endTime string) bool {
+	start, err1 := time.Parse("15:04", startTime)
+	end, err2 := time.Parse("15:04", endTime)
+
+	if err1 != nil || err2 != nil {
+		return false
+	}
+
+	// Ensure start time is strictly before end time (not equal)
+	return start.Before(end)
+}
+
+// Improved function to create appointments
 func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	// Get auth ID from context
 	authID, err := h.getAuthID(c)
@@ -612,7 +637,9 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 		h.logger.Error("authID not found in context", zap.Error(err))
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
 	}
-	fmt.Println("Auth ID:", authID)
+
+	h.logger.Info("Auth ID:", zap.String("auth_id", authID))
+
 	// Log raw request body for debugging
 	var rawBody map[string]interface{}
 	if err := c.BodyParser(&rawBody); err != nil {
@@ -632,11 +659,11 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 		PatientName       string    `json:"patient_name"`
 		DoctorName        string    `json:"doctor_name"`
 		AppointmentDate   time.Time `json:"appointment_date"`
-		SlotStartTime     string    `json:"slot_start_time"` // New field for slot start time
-		SlotEndTime       string    `json:"slot_end_time"`   // New field for slot end time
+		SlotStartTime     string    `json:"slot_start_time"`
+		SlotEndTime       string    `json:"slot_end_time"`
 		FeeType           string    `json:"fee_type"`
 		PaymentMethod     string    `json:"payment_method"`
-		Reason            string    `json:"reason,omitempty"` // Optional field
+		Reason            string    `json:"reason,omitempty"`
 		AppointmentStatus string    `json:"appointment_status,omitempty"`
 		AppointmentFee    int       `json:"appointment_fee,omitempty"`
 		IsValid           *bool     `json:"is_valid,omitempty"`
@@ -647,7 +674,7 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid appointment data: " + err.Error()})
 	}
 
-	// Log the parsed request for debugging
+	// Log the parsed request and the original time values
 	h.logger.Debug("parsed appointment request",
 		zap.String("patient_id", appointmentRequest.PatientID),
 		zap.String("doctor_id", appointmentRequest.DoctorID),
@@ -655,8 +682,8 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 		zap.String("patient_name", appointmentRequest.PatientName),
 		zap.String("doctor_name", appointmentRequest.DoctorName),
 		zap.Any("appointment_date", appointmentRequest.AppointmentDate),
-		zap.String("slot_start_time", appointmentRequest.SlotStartTime),
-		zap.String("slot_end_time", appointmentRequest.SlotEndTime),
+		zap.String("original_slot_start_time", appointmentRequest.SlotStartTime),
+		zap.String("original_slot_end_time", appointmentRequest.SlotEndTime),
 		zap.String("fee_type", appointmentRequest.FeeType),
 		zap.String("payment_method", appointmentRequest.PaymentMethod))
 
@@ -701,6 +728,44 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 		})
 	}
 
+	// Store original time values before standardization
+	originalStartTime := appointmentRequest.SlotStartTime
+	originalEndTime := appointmentRequest.SlotEndTime
+
+	// Validate time formats first without modifying
+	if !validateTimeFormat(appointmentRequest.SlotStartTime) {
+		h.logger.Warn("invalid slot start time format", zap.String("slot_start_time", appointmentRequest.SlotStartTime))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Slot start time must be in HH:MM format (24-hour)"})
+	}
+
+	if !validateTimeFormat(appointmentRequest.SlotEndTime) {
+		h.logger.Warn("invalid slot end time format", zap.String("slot_end_time", appointmentRequest.SlotEndTime))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Slot end time must be in HH:MM format (24-hour)"})
+	}
+
+	// Now standardize time formats to ensure consistent HH:MM format with padding
+	// We only pad the hours if needed (e.g., "9:00" becomes "09:00")
+	startTimeParts := strings.Split(appointmentRequest.SlotStartTime, ":")
+	if len(startTimeParts) == 2 {
+		hour, _ := strconv.Atoi(startTimeParts[0])
+		minute, _ := strconv.Atoi(startTimeParts[1])
+		appointmentRequest.SlotStartTime = fmt.Sprintf("%02d:%02d", hour, minute)
+	}
+
+	endTimeParts := strings.Split(appointmentRequest.SlotEndTime, ":")
+	if len(endTimeParts) == 2 {
+		hour, _ := strconv.Atoi(endTimeParts[0])
+		minute, _ := strconv.Atoi(endTimeParts[1])
+		appointmentRequest.SlotEndTime = fmt.Sprintf("%02d:%02d", hour, minute)
+	}
+
+	// Log standardized times
+	h.logger.Debug("standardized time formats",
+		zap.String("original_start", originalStartTime),
+		zap.String("standardized_start", appointmentRequest.SlotStartTime),
+		zap.String("original_end", originalEndTime),
+		zap.String("standardized_end", appointmentRequest.SlotEndTime))
+
 	// Validate ID formats based on schema requirements
 	if !validatePatientID(appointmentRequest.PatientID) {
 		h.logger.Warn("invalid patient ID format", zap.String("patient_id", appointmentRequest.PatientID))
@@ -715,17 +780,6 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	if !validateOrgID(appointmentRequest.OrgID) {
 		h.logger.Warn("invalid organization ID format", zap.String("org_id", appointmentRequest.OrgID))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID must be in ULID format (org_[A-Z0-9]{26})"})
-	}
-
-	// Validate time slot format (expected format: "HH:MM")
-	if !validateTimeFormat(appointmentRequest.SlotStartTime) {
-		h.logger.Warn("invalid slot start time format", zap.String("slot_start_time", appointmentRequest.SlotStartTime))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Slot start time must be in HH:MM format (24-hour)"})
-	}
-
-	if !validateTimeFormat(appointmentRequest.SlotEndTime) {
-		h.logger.Warn("invalid slot end time format", zap.String("slot_end_time", appointmentRequest.SlotEndTime))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Slot end time must be in HH:MM format (24-hour)"})
 	}
 
 	// Validate that start time is before end time
@@ -813,7 +867,7 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	// Create appointment document (using field names that match the schema)
 	now := time.Now()
 	appointment := bson.M{
-		"appointment_id":     appointmentID, // Added required appointment_id field
+		"appointment_id":     appointmentID,
 		"patient_id":         appointmentRequest.PatientID,
 		"doctor_id":          appointmentRequest.DoctorID,
 		"org_id":             appointmentRequest.OrgID,
@@ -861,25 +915,6 @@ func (h *AppointmentHandler) CreateAppointment(c *fiber.Ctx) error {
 	})
 }
 
-// Helper function to validate time format (HH:MM in 24-hour format)
-func validateTimeFormat(timeStr string) bool {
-	_, err := time.Parse("15:04", timeStr)
-	return err == nil
-}
-
-// Helper function to validate that start time is before end time
-func validateTimeRange(startTime, endTime string) bool {
-	start, err1 := time.Parse("15:04", startTime)
-	end, err2 := time.Parse("15:04", endTime)
-
-	if err1 != nil || err2 != nil {
-		return false
-	}
-
-	return start.Before(end)
-}
-
-// Fix for the checkDoctorAvailabilityForSlot function
 func (h *AppointmentHandler) checkDoctorAvailabilityForSlot(
 	ctx context.Context,
 	doctorID string,
@@ -899,6 +934,28 @@ func (h *AppointmentHandler) checkDoctorAvailabilityForSlot(
 		zap.String("slot_start_time", slotStartTime),
 		zap.String("slot_end_time", slotEndTime))
 
+	// CRUCIAL: Standardize time formats for consistent comparison
+	// This ensures "9:00" and "09:00" are treated the same
+	standardizedStartTime, err := standardizeTimeFormat(slotStartTime)
+	if err != nil {
+		h.logger.Error("Error standardizing start time", zap.Error(err))
+		return false, fmt.Errorf("invalid start time format: %w", err)
+	}
+
+	standardizedEndTime, err := standardizeTimeFormat(slotEndTime)
+	if err != nil {
+		h.logger.Error("Error standardizing end time", zap.Error(err))
+		return false, fmt.Errorf("invalid end time format: %w", err)
+	}
+
+	// Use the standardized times from here on
+	slotStartTime = standardizedStartTime
+	slotEndTime = standardizedEndTime
+
+	h.logger.Debug("Using standardized time formats",
+		zap.String("standardized_start", slotStartTime),
+		zap.String("standardized_end", slotEndTime))
+
 	// Step 1: Check if the doctor has a shift defined for this weekday in PostgreSQL
 	var startTimeStr, endTimeStr string
 	var isActive bool
@@ -913,7 +970,7 @@ func (h *AppointmentHandler) checkDoctorAvailabilityForSlot(
 		AND ds.organization_id = $3
 	`
 
-	err := h.pgPool.QueryRow(ctx, query, doctorID, weekday, orgID).Scan(
+	err = h.pgPool.QueryRow(ctx, query, doctorID, weekday, orgID).Scan(
 		&startTimeStr,
 		&endTimeStr,
 		&isActive,
@@ -973,8 +1030,10 @@ func (h *AppointmentHandler) checkDoctorAvailabilityForSlot(
 	normalizedShiftEnd := time.Date(0, 1, 1, shiftEnd.Hour(), shiftEnd.Minute(), 0, 0, time.UTC)
 
 	// Check if requested slot is within doctor's shift hours
-	if normalizedRequestedStart.Before(normalizedShiftStart) || normalizedRequestedEnd.After(normalizedShiftEnd) {
-		h.logger.Info("Requested time slot is outside doctor's working hours",
+	if normalizedRequestedStart.Before(normalizedShiftStart) ||
+		normalizedRequestedEnd.After(normalizedShiftEnd) ||
+		normalizedRequestedStart.Equal(normalizedRequestedEnd) {
+		h.logger.Info("Requested time slot is outside doctor's working hours or invalid",
 			zap.String("shift_start", startTimeStr),
 			zap.String("shift_end", endTimeStr),
 			zap.String("requested_start", slotStartTime),
@@ -987,8 +1046,7 @@ func (h *AppointmentHandler) checkDoctorAvailabilityForSlot(
 	startOfDay := time.Date(appointmentDate.Year(), appointmentDate.Month(), appointmentDate.Day(), 0, 0, 0, 0, appointmentDate.Location())
 	endOfDay := startOfDay.AddDate(0, 0, 1)
 
-	// FIX: Improved MongoDB query for overlapping time slots
-	// This query properly combines date/doctor filtering with time overlap check
+	// Create a 4-way check that uses the standardized time strings
 	filter := bson.M{
 		"doctor_id": doctorID,
 		"org_id":    orgID,
@@ -1000,31 +1058,73 @@ func (h *AppointmentHandler) checkDoctorAvailabilityForSlot(
 		"appointment_status": bson.M{
 			"$nin": []string{"cancelled", "declined"},
 		},
-		// Use the proper time overlap check conditions within the main filter
-		"$and": []bson.M{
+		// Properly check for all time overlap conditions
+		"$or": []bson.M{
+			// Case 1: Existing appointment starts within the requested slot
 			{
-				"slot_start_time": bson.M{"$lt": slotEndTime}, // Existing appointment starts before requested slot ends
+				"slot_start_time": bson.M{
+					"$gte": slotStartTime,
+					"$lt":  slotEndTime,
+				},
 			},
+			// Case 2: Existing appointment ends within the requested slot
 			{
-				"slot_end_time": bson.M{"$gt": slotStartTime}, // Existing appointment ends after requested slot starts
+				"slot_end_time": bson.M{
+					"$gt":  slotStartTime,
+					"$lte": slotEndTime,
+				},
+			},
+			// Case 3: Existing appointment completely encompasses the requested slot
+			{
+				"slot_start_time": bson.M{"$lte": slotStartTime},
+				"slot_end_time":   bson.M{"$gte": slotEndTime},
+			},
+			// Case 4: Existing appointment is exactly the same as requested slot
+			{
+				"slot_start_time": slotStartTime,
+				"slot_end_time":   slotEndTime,
 			},
 		},
 	}
 
-	// Execute MongoDB query
+	// For debugging, fetch any conflicting appointments and log their details
 	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
+
+	// First count conflicts
 	count, err := appointmentsCollection.CountDocuments(ctx, filter)
 	if err != nil {
 		h.logger.Error("Error checking for conflicting appointments", zap.Error(err))
 		return false, err
 	}
 
-	// If count > 0, there are conflicting appointments
+	// If conflicts found, fetch and log the details
 	if count > 0 {
 		h.logger.Info("Found conflicting appointments for requested time slot",
 			zap.Int64("conflict_count", count),
 			zap.String("slot_start", slotStartTime),
 			zap.String("slot_end", slotEndTime))
+
+		// Log the details of conflicting appointments for debugging
+		cursor, err := appointmentsCollection.Find(ctx, filter)
+		if err != nil {
+			h.logger.Error("Error fetching conflicting appointments", zap.Error(err))
+		} else {
+			defer cursor.Close(ctx)
+
+			var conflicts []bson.M
+			if err = cursor.All(ctx, &conflicts); err != nil {
+				h.logger.Error("Error decoding conflicting appointments", zap.Error(err))
+			} else {
+				for i, conflict := range conflicts {
+					h.logger.Debug("Conflicting appointment",
+						zap.Int("index", i),
+						zap.Any("appointment_id", conflict["appointment_id"]),
+						zap.Any("slot_start_time", conflict["slot_start_time"]),
+						zap.Any("slot_end_time", conflict["slot_end_time"]))
+				}
+			}
+		}
+
 		return false, nil
 	}
 
@@ -1080,6 +1180,7 @@ func (h *AppointmentHandler) getDoctorFee(ctx context.Context, doctorID, orgID, 
 	return fee, nil
 }
 
+// Improved function to get slot availability
 func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
 	// Get auth ID from context
 	authID, err := h.getAuthID(c)
@@ -1162,7 +1263,7 @@ func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
 				zap.String("weekday", weekday))
 
 			return c.Status(fiber.StatusOK).JSON(fiber.Map{
-				"available_slots": []string{},
+				"available_slots": []map[string]string{},
 				"message":         "No shift scheduled for this day",
 			})
 		}
@@ -1192,13 +1293,13 @@ func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
 			zap.Bool("is_active", isActive))
 
 		return c.Status(fiber.StatusOK).JSON(fiber.Map{
-			"available_slots": []string{},
+			"available_slots": []map[string]string{},
 			"message":         "No active shift for this day",
 		})
 	}
 
 	// Parse start and end times, handling potential format issues
-	startTime, err := parseTimeWithFallbacks(startTimeStr)
+	shiftStart, err := parseTimeWithFallbacks(startTimeStr)
 	if err != nil {
 		h.logger.Error("Error parsing start time",
 			zap.String("time", startTimeStr),
@@ -1209,7 +1310,7 @@ func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
 		})
 	}
 
-	endTime, err := parseTimeWithFallbacks(endTimeStr)
+	shiftEnd, err := parseTimeWithFallbacks(endTimeStr)
 	if err != nil {
 		h.logger.Error("Error parsing end time",
 			zap.String("time", endTimeStr),
@@ -1227,36 +1328,46 @@ func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
 		slotDuration = 30 // Default 30 minutes
 	}
 
-	// Calculate all possible time slots
-	var allSlots []string
-	currentTime := startTime
-	for currentTime.Before(endTime) {
-		timeStr := currentTime.Format("15:04")
-		allSlots = append(allSlots, timeStr)
+	// Normalize times to use consistent format
+	normalizedShiftStart := time.Date(0, 1, 1, shiftStart.Hour(), shiftStart.Minute(), 0, 0, time.UTC)
+	normalizedShiftEnd := time.Date(0, 1, 1, shiftEnd.Hour(), shiftEnd.Minute(), 0, 0, time.UTC)
+
+	// Calculate all possible time slots with start and end times
+	var allTimeSlots []map[string]string
+	currentTime := normalizedShiftStart
+
+	// Ensure we don't create a slot that extends beyond end time
+	for currentTime.Add(time.Duration(slotDuration)*time.Minute).Before(normalizedShiftEnd) ||
+		currentTime.Add(time.Duration(slotDuration)*time.Minute).Equal(normalizedShiftEnd) {
+
+		// CRITICAL: Format times as "HH:MM" with leading zeros to match appointment creation format
+		slotStart := currentTime.Format("15:04")
+		slotEnd := currentTime.Add(time.Duration(slotDuration) * time.Minute).Format("15:04")
+
+		allTimeSlots = append(allTimeSlots, map[string]string{
+			"start_time": slotStart,
+			"end_time":   slotEnd,
+		})
+
 		currentTime = currentTime.Add(time.Duration(slotDuration) * time.Minute)
 	}
 
 	h.logger.Info("Generated potential time slots",
-		zap.Int("slot_count", len(allSlots)),
-		zap.Strings("slots", allSlots))
-
-	// Get unavailable slots (existing appointments) from MongoDB
-	var bookedSlots []string
+		zap.Int("slot_count", len(allTimeSlots)))
 
 	// Create start and end of day for date filtering
 	startOfDay := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, date.Location())
 	endOfDay := startOfDay.AddDate(0, 0, 1)
 
-	// Create MongoDB query filter for appointments on the specified date
+	// Get existing appointments from MongoDB - use the EXACT SAME FORMAT as in checkDoctorAvailabilityForSlot
 	filter := bson.M{
 		"doctor_id": doctorID,
 		"org_id":    orgID,
-		// Filter by appointments on this date
 		"appointment_date": bson.M{
 			"$gte": primitive.NewDateTimeFromTime(startOfDay),
 			"$lt":  primitive.NewDateTimeFromTime(endOfDay),
 		},
-		// Exclude cancelled or declined appointments
+		"is_valid": true,
 		"appointment_status": bson.M{
 			"$nin": []string{"cancelled", "declined"},
 		},
@@ -1265,98 +1376,120 @@ func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
 	h.logger.Info("Checking for booked slots",
 		zap.Any("filter", filter))
 
-	// Execute MongoDB query
-	ctx := c.Context()
+	// Fetch all booked appointment slots from MongoDB
 	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
-	cursor, err := appointmentsCollection.Find(ctx, filter)
+	cursor, err := appointmentsCollection.Find(c.Context(), filter)
 
 	if err != nil {
 		h.logger.Error("Error querying MongoDB for appointments", zap.Error(err))
 		// Continue with empty booked slots instead of returning error
-		bookedSlots = []string{}
-	} else {
-		defer cursor.Close(ctx)
+	}
 
-		// Define a struct to hold the appointment data we need
-		type AppointmentTime struct {
-			SlotStartTime string `bson:"slot_start_time"`
-			SlotEndTime   string `bson:"slot_end_time"`
-		}
+	// Use map for O(1) lookup of booked slots based on exact string match (same as appointment creation)
+	bookedSlots := make(map[string]bool)
+	var bookedSlotsList []map[string]string
 
-		// Iterate through the results and extract the time slots
-		for cursor.Next(ctx) {
-			var appointment AppointmentTime
-			if err := cursor.Decode(&appointment); err != nil {
-				h.logger.Error("Error decoding appointment", zap.Error(err))
-				continue
-			}
+	if err == nil {
+		defer cursor.Close(c.Context())
 
-			// Add both the start and end times to booked slots
-			bookedSlots = append(bookedSlots, appointment.SlotStartTime)
+		// Collect all booked appointments
+		var appointmentDocs []bson.M
+		if err := cursor.All(c.Context(), &appointmentDocs); err != nil {
+			h.logger.Error("Error decoding appointments", zap.Error(err))
+		} else {
+			for _, doc := range appointmentDocs {
+				startTimeStr, okStart := doc["slot_start_time"].(string)
+				endTimeStr, okEnd := doc["slot_end_time"].(string)
 
-			// Calculate intermediate slots that should also be marked as unavailable
-			startSlot, err := time.Parse("15:04", appointment.SlotStartTime)
-			if err == nil {
-				endSlot, err := time.Parse("15:04", appointment.SlotEndTime)
-				if err == nil {
-					// Mark intermediate slots as booked
-					intermediateTime := startSlot.Add(time.Duration(slotDuration) * time.Minute)
-					for intermediateTime.Before(endSlot) {
-						intermediateSlot := intermediateTime.Format("15:04")
-						bookedSlots = append(bookedSlots, intermediateSlot)
-						intermediateTime = intermediateTime.Add(time.Duration(slotDuration) * time.Minute)
+				if okStart && okEnd {
+					// Standardize time format to ensure exact string matching
+					stdStart, err1 := standardizeTimeFormat(startTimeStr)
+					stdEnd, err2 := standardizeTimeFormat(endTimeStr)
+
+					if err1 == nil && err2 == nil {
+						// Add to map for quick lookup
+						bookedKey := stdStart + "-" + stdEnd
+						bookedSlots[bookedKey] = true
+
+						// Add to list for response
+						bookedSlotsList = append(bookedSlotsList, map[string]string{
+							"start_time": stdStart,
+							"end_time":   stdEnd,
+						})
+
+						h.logger.Debug("Booked appointment found",
+							zap.String("start", stdStart),
+							zap.String("end", stdEnd),
+							zap.String("key", bookedKey))
 					}
 				}
 			}
 		}
-
-		if err := cursor.Err(); err != nil {
-			h.logger.Error("Error iterating through appointments cursor", zap.Error(err))
-			// Continue with what we have instead of failing
-		}
 	}
 
-	h.logger.Info("Found booked slots",
-		zap.Int("booked_slot_count", len(bookedSlots)),
-		zap.Strings("booked_slots", bookedSlots))
+	// Filter out unavailable slots using the SAME string comparison approach as in appointment creation
+	var availableSlots []map[string]string
 
-	// Filter out unavailable slots
-	var availableSlots []string
-	for _, slot := range allSlots {
-		isAvailable := true
-		for _, unavailable := range bookedSlots {
-			if slot == unavailable {
-				isAvailable = false
-				break
-			}
-		}
-		if isAvailable {
+	for _, slot := range allTimeSlots {
+		slotKey := slot["start_time"] + "-" + slot["end_time"]
+
+		// If slot is not in booked slots map, it's available
+		if !bookedSlots[slotKey] {
 			availableSlots = append(availableSlots, slot)
+		} else {
+			h.logger.Debug("Filtered out booked slot", zap.String("slot", slotKey))
 		}
 	}
 
 	h.logger.Info("Final available slots",
-		zap.Int("available_slot_count", len(availableSlots)))
-
-	// Format the response in a structure matching the frontend expectations
-	var formattedSlots []map[string]string
-	for _, slot := range availableSlots {
-		// Calculate end time for the slot
-		startSlot, _ := time.Parse("15:04", slot)
-		endSlot := startSlot.Add(time.Duration(slotDuration) * time.Minute)
-
-		formattedSlots = append(formattedSlots, map[string]string{
-			"start_time": slot,
-			"end_time":   endSlot.Format("15:04"),
-		})
-	}
+		zap.Int("available_slot_count", len(availableSlots)),
+		zap.Int("booked_slot_count", len(bookedSlots)))
 
 	return c.JSON(fiber.Map{
-		"available_slots":   formattedSlots, // Return formatted slots with start/end times
-		"raw_slots":         availableSlots, // Also include the raw slot times for compatibility
-		"unavailable_slots": bookedSlots,
+		"available_slots":   availableSlots,
+		"unavailable_slots": bookedSlotsList,
 		"message":           "Slot availability fetched successfully",
 	})
+}
+
+// Helper function to standardize time format to "HH:MM" (24-hour format)
+func standardizeTimeFormat(timeStr string) (string, error) {
+	// Handle empty or invalid input
+	if timeStr == "" {
+		return "", fmt.Errorf("empty time string")
+	}
+
+	// If it already has the right format with proper padding, return as is
+	if matched, _ := regexp.MatchString(`^[0-2]\d:[0-5]\d$`, timeStr); matched {
+		return timeStr, nil
+	}
+
+	// Try to parse with several formats
+	formats := []string{"15:04", "3:04PM", "3:04 PM", "15:04:05"}
+	var t time.Time
+	var err error
+
+	for _, format := range formats {
+		t, err = time.Parse(format, timeStr)
+		if err == nil {
+			// Successfully parsed, return in standard format
+			return t.Format("15:04"), nil
+		}
+	}
+
+	// If we reach here, try parsing parts manually
+	parts := strings.Split(timeStr, ":")
+	if len(parts) >= 2 {
+		hours, errH := strconv.Atoi(parts[0])
+		minutes, errM := strconv.Atoi(parts[1])
+
+		if errH == nil && errM == nil && hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59 {
+			return fmt.Sprintf("%02d:%02d", hours, minutes), nil
+		}
+	}
+
+	// Could not parse the time string with any method
+	return "", fmt.Errorf("invalid time format: %s", timeStr)
 }
 
 // GetAppointment retrieves a single appointment by ID

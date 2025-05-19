@@ -418,9 +418,6 @@ func (a *App) setupRoutes() error {
 	}
 
 	medicinesHandler := handlers.NewMedicineHandler(a.Postgres, a.Logger, a.Config, a.Redis, a.MongoDB)
-	if err != nil {
-		return fmt.Errorf("failed to initialize medicines handler: %v", err)
-	}
 	// Initialize the WorkOS webhook handler with better error handling
 	workosWebhookHandler, err := handlers.NewWorkOSWebhookHandler(a.Config, a.Redis, a.Logger, a.Postgres)
 	if err != nil {
@@ -515,6 +512,7 @@ func (a *App) setupRoutes() error {
 	doctorGroup.Post("/fees", doctorHandler.CreateDoctorFees)
 	doctorGroup.Get("/:id/availability", appointmentHandler.GetSlotAvailability)
 	doctorGroup.Get("/appointments", appointmentHandler.GetAppointmentsByOrgID)
+	doctorGroup.Get("/:id/slots", appointmentHandler.GetSlotAvailability)
 
 	// Hospital routes - protected
 	hospitalGroup := a.Fiber.Group("/api/hospital", authMiddleware.Handler())
