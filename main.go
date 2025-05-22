@@ -497,9 +497,9 @@ func (a *App) setupRoutes() error {
 
 	// Doctor routes - protected
 	doctorGroup := a.Fiber.Group("/api/doctors", authMiddleware.Handler())
-	doctorGroup.Get("/profile", doctorHandler.GetDoctorProfile)
-	doctorGroup.Put("/profile", doctorHandler.UpdateDoctorProfile)
-	doctorGroup.Delete("/profile", doctorAuthHandler.DeleteDoctor)
+	doctorGroup.Get("/:id/profile", doctorHandler.GetDoctorProfile)
+	doctorGroup.Put("/:id/profile", doctorHandler.UpdateDoctorProfile)
+	doctorGroup.Delete("/:id/profile", doctorAuthHandler.DeleteDoctor)
 	doctorGroup.Get("/organization", doctorHandler.GetDoctorsByOrganization)
 	doctorGroup.Get("/:id/schedules", doctorHandler.GetDoctorSchedule)
 	doctorGroup.Put("/schedules/:id", doctorHandler.UpdateDoctorSchedule)
