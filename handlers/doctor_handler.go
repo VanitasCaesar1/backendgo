@@ -458,12 +458,37 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
+	// Check if username is being changed and if it conflicts with existing usernames
+	var currentUsername string
+	err = tx.QueryRow(c.Context(),
+		"SELECT username FROM users WHERE auth_id = $1",
+		authID).Scan(&currentUsername)
+	if err != nil {
+		h.logger.Error("failed to get current username", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+	}
+
+	// If username is changing, check if the new username already exists
+	if updateData.Username != currentUsername {
+		var usernameExists bool
+		err = tx.QueryRow(c.Context(),
+			"SELECT EXISTS(SELECT 1 FROM users WHERE username = $1 AND auth_id != $2)",
+			updateData.Username, authID).Scan(&usernameExists)
+		if err != nil {
+			h.logger.Error("failed to check username uniqueness", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+		}
+
+		if usernameExists {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "Username already exists"})
+		}
+	}
+
 	// Check if doctor record exists - CREATE IT IF IT DOESN'T
 	var doctorExists bool
 	err = tx.QueryRow(c.Context(),
 		"SELECT EXISTS(SELECT 1 FROM doctors WHERE doctor_id = $1)",
 		userID).Scan(&doctorExists)
-
 	if err != nil {
 		h.logger.Error("failed to check doctor existence", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
@@ -479,10 +504,15 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 	// Update users table
 	_, err = tx.Exec(c.Context(),
 		`UPDATE users SET username = $1, name = $2, mobile = $3, blood_group = $4, location = $5, address = $6
-         WHERE auth_id = $7`,
+		 WHERE auth_id = $7`,
 		updateData.Username, updateData.Name, updateData.Mobile, updateData.BloodGroup,
 		updateData.Location, updateData.Address, authID)
 	if err != nil {
+		// Handle specific constraint violations
+		if strings.Contains(err.Error(), "users_username_key") {
+			h.logger.Error("username already exists", zap.Error(err), zap.String("username", updateData.Username))
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "Username already exists"})
+		}
 		h.logger.Error("failed to update user profile", zap.Error(err), zap.String("auth_id", authID))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update profile"})
 	}
@@ -491,7 +521,7 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		// INSERT new doctor record
 		_, err = tx.Exec(c.Context(),
 			`INSERT INTO doctors (doctor_id, name, imr_number, age, specialization, is_active, qualification, slot_duration)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 			userID, updateData.Name, updateData.IMRNumber, updateData.Age,
 			specializationJSON, updateData.IsActive, updateData.Qualification, updateData.SlotDuration)
 		if err != nil {
@@ -502,7 +532,7 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		// UPDATE existing doctor record
 		_, err = tx.Exec(c.Context(),
 			`UPDATE doctors SET name = $1, imr_number = $2, age = $3, specialization = $4, is_active = $5, qualification = $6, slot_duration = $7
-             WHERE doctor_id = $8`,
+			 WHERE doctor_id = $8`,
 			updateData.Name, updateData.IMRNumber, updateData.Age, specializationJSON,
 			updateData.IsActive, updateData.Qualification, updateData.SlotDuration, userID)
 		if err != nil {
