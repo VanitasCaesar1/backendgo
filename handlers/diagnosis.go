@@ -773,7 +773,7 @@ func (h *DiagnosisHandler) ListDiagnoses(c *fiber.Ctx) error {
 	findOptions := options.Find()
 	findOptions.SetSkip(int64(skip))
 	findOptions.SetLimit(int64(limit))
-	findOptions.SetSort(bson.D{{"created_at", -1}}) // Sort by creation date, newest first
+	findOptions.SetSort(bson.D{{Key: "created_at", Value: -1}}) // Sort by creation date, newest first
 
 	// Execute query
 	cursor, err := diagnosisCollection.Find(c.Context(), filter, findOptions)
@@ -816,4 +816,167 @@ func (h *DiagnosisHandler) ListDiagnoses(c *fiber.Ctx) error {
 			"has_prev":    page > 1,
 		},
 	})
+}
+
+// MedicalHistoryRecord represents a diagnosis record for medical history
+type MedicalHistoryRecord struct {
+	ID                 string                `json:"id" bson:"diagnosis_id"`
+	DiagnosisName      string                `json:"diagnosis_name" bson:"diagnosis_name"`
+	PrimaryDiagnosis   string                `json:"primary_diagnosis" bson:"primary_diagnosis"`
+	SecondaryDiagnoses []string              `json:"secondary_diagnoses,omitempty" bson:"secondary_diagnoses"`
+	Symptoms           []string              `json:"symptoms,omitempty" bson:"symptoms"`
+	Severity           string                `json:"severity,omitempty" bson:"severity"`
+	Status             string                `json:"status" bson:"status"`
+	DiagnosisDate      time.Time             `json:"diagnosis_date" bson:"diagnosis_date"`
+	Notes              string                `json:"notes,omitempty" bson:"notes"`
+	Prescriptions      []PrescriptionHistory `json:"prescriptions,omitempty" bson:"prescriptions"`
+	CreatedAt          time.Time             `json:"created_at" bson:"created_at"`
+	// Note: Deliberately excluding doctor_id, doctor_name, org_id for privacy
+}
+
+// PrescriptionHistory represents prescription data for medical history
+type PrescriptionHistory struct {
+	MedicationName string `json:"medication_name" bson:"medication_name"`
+	Dosage         string `json:"dosage" bson:"dosage"`
+	Frequency      string `json:"frequency" bson:"frequency"`
+	Duration       string `json:"duration,omitempty" bson:"duration"`
+	Instructions   string `json:"instructions,omitempty" bson:"instructions"`
+}
+
+// MedicalHistoryResponse represents the response structure
+type MedicalHistoryResponse struct {
+	PatientID string                 `json:"patient_id"`
+	History   []MedicalHistoryRecord `json:"history"`
+	Total     int64                  `json:"total"`
+}
+
+// GetPatientMedicalHistory fetches comprehensive medical history for a patient
+func (h *DiagnosisHandler) GetPatientMedicalHistory(c *fiber.Ctx) error {
+	// Get organization ID from headers (required for authentication)
+	orgID := c.Get("X-Organization-ID")
+	if orgID == "" {
+		h.logger.Warn("missing organization ID in request headers")
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "Organization ID is required",
+		})
+	}
+
+	// Get user role from headers for authorization
+	userRole := c.Get("X-User-Role")
+	userID := c.Get("X-User-ID")
+
+	// Log the authenticated request
+	h.logger.Info("Received medical history request",
+		zap.String("orgID", orgID),
+		zap.String("userRole", userRole),
+		zap.String("userID", userID))
+
+	// Get patient ID from URL params
+	patientID := c.Params("id")
+	if patientID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Patient ID is required",
+		})
+	}
+
+	// Validate patient ID format (8-digit alphanumeric)
+	if !isValidPatientID(patientID) {
+		h.logger.Error("invalid patient ID format", zap.String("patient_id", patientID))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid patient ID format",
+		})
+	}
+
+	// Get optional query parameters
+	limit := c.QueryInt("limit", 50)
+	if limit > 100 {
+		limit = 100 // Cap at 100 records
+	}
+	includeActive := c.QueryBool("include_active", true)
+
+	// Build MongoDB query
+	filter := bson.M{"patient_id": patientID}
+
+	// Add organization filter if not cross-org request
+	crossOrg := c.QueryBool("cross_org", false)
+	if !crossOrg {
+		filter["organization_id"] = orgID
+	}
+
+	// Optionally exclude active/draft diagnoses
+	if !includeActive {
+		filter["status"] = bson.M{"$ne": "draft"}
+	}
+
+	// Get diagnoses collection
+	diagnosesCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("diagnoses")
+
+	// Set up options for sorting and limiting
+	// FIXED: Use bson.D instead of bson.M for ordered sort parameters
+	opts := options.Find().
+		SetSort(bson.D{
+			{"diagnosis_date", -1},
+			{"created_at", -1},
+		}). // Most recent first
+		SetLimit(int64(limit))
+
+	// Execute query
+	cursor, err := diagnosesCollection.Find(c.Context(), filter, opts)
+	if err != nil {
+		h.logger.Error("failed to fetch medical history",
+			zap.Error(err),
+			zap.String("patient_id", patientID),
+			zap.String("organization_id", orgID))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to fetch medical history",
+		})
+	}
+	defer cursor.Close(c.Context())
+
+	// Decode results
+	var diagnoses []MedicalHistoryRecord
+	if err = cursor.All(c.Context(), &diagnoses); err != nil {
+		h.logger.Error("failed to decode medical history",
+			zap.Error(err),
+			zap.String("patient_id", patientID))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to process medical history",
+		})
+	}
+
+	// Get total count for pagination info
+	totalCount, err := diagnosesCollection.CountDocuments(c.Context(), filter)
+	if err != nil {
+		h.logger.Warn("failed to get total count", zap.Error(err))
+		totalCount = int64(len(diagnoses))
+	}
+
+	// Log successful response
+	h.logger.Info("Successfully retrieved medical history",
+		zap.String("patient_id", patientID),
+		zap.String("organization_id", orgID),
+		zap.Int("record_count", len(diagnoses)),
+		zap.Int64("total_count", totalCount))
+
+	// Format response
+	response := MedicalHistoryResponse{
+		PatientID: patientID,
+		History:   diagnoses,
+		Total:     totalCount,
+	}
+
+	return c.JSON(response)
+}
+
+// Helper function to validate patient ID format (8-digit alphanumeric)
+func isValidPatientID(patientID string) bool {
+	if len(patientID) != 8 {
+		return false
+	}
+	for _, char := range patientID {
+		if !((char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9')) {
+			return false
+		}
+	}
+	return true
 }
