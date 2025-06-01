@@ -506,7 +506,7 @@ func (a *App) setupRoutes() error {
 	doctorGroup.Delete("/schedules/:id", doctorHandler.DeleteDoctorSchedule)
 	doctorGroup.Get("/:id/fees", doctorHandler.GetDoctorFees)
 	doctorGroup.Put("/fees/:id", doctorHandler.UpdateDoctorFees)
-	doctorGroup.Delete("/:id/fees", doctorHandler.DeleteDoctorFees)
+	doctorGroup.Delete("/fees/:id", doctorHandler.DeleteDoctorFees)
 	doctorGroup.Get("/search", appointmentHandler.SearchDoctors)
 	doctorGroup.Post("/schedules", doctorHandler.CreateDoctorSchedule)
 	doctorGroup.Post("/fees", doctorHandler.CreateDoctorFees)

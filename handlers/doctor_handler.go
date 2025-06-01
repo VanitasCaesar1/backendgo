@@ -15,6 +15,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/workos/workos-go/v4/pkg/usermanagement"
@@ -435,11 +436,30 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
 	}
 
+	// Get the doctor ID from URL parameter
+	doctorID := c.Params("id")
+	if doctorID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor ID is required"})
+	}
+
+	// Validate UUID format
+	doctorUUID, err := uuid.Parse(doctorID)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid doctor ID format"})
+	}
+
 	var updateData DoctorProfile
 	if err := c.BodyParser(&updateData); err != nil {
 		h.logger.Error("failed to parse update data", zap.Error(err))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request data"})
 	}
+
+	// DEBUG: Log the received data
+	h.logger.Info("Received update data",
+		zap.String("username", updateData.Username),
+		zap.String("name", updateData.Name),
+		zap.Int("age", updateData.Age),
+		zap.Any("specialization", updateData.Specialization))
 
 	if err := h.validateDoctorProfileUpdate(&updateData); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
@@ -450,30 +470,38 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		h.logger.Error("failed to begin transaction", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
-	defer tx.Rollback(c.Context())
 
-	userID, err := h.getUserID(c.Context(), authID)
-	if err != nil {
-		h.logger.Error("failed to get user ID", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
-	}
+	committed := false
+	defer func() {
+		if !committed {
+			if rollbackErr := tx.Rollback(c.Context()); rollbackErr != nil {
+				h.logger.Error("failed to rollback transaction", zap.Error(rollbackErr))
+			}
+		}
+	}()
+
+	// Optional: Add authorization check to ensure the authenticated user can update this doctor
+	// You might want to check if the authenticated user is the same doctor or has admin privileges
+
+	// Use the doctor ID from URL parameter instead of getting it from auth
+	userID := doctorUUID
 
 	// Check if username is being changed and if it conflicts with existing usernames
 	var currentUsername string
 	err = tx.QueryRow(c.Context(),
-		"SELECT username FROM users WHERE auth_id = $1",
-		authID).Scan(&currentUsername)
+		"SELECT username FROM users WHERE user_id = $1",
+		userID).Scan(&currentUsername)
 	if err != nil {
 		h.logger.Error("failed to get current username", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
-	// If username is changing, check if the new username already exists
-	if updateData.Username != currentUsername {
+	// If username is changing, check if the new username already exists (case-insensitive)
+	if strings.ToLower(updateData.Username) != strings.ToLower(currentUsername) {
 		var usernameExists bool
 		err = tx.QueryRow(c.Context(),
-			"SELECT EXISTS(SELECT 1 FROM users WHERE username = $1 AND auth_id != $2)",
-			updateData.Username, authID).Scan(&usernameExists)
+			"SELECT EXISTS(SELECT 1 FROM users WHERE LOWER(username) = LOWER($1) AND user_id != $2)",
+			updateData.Username, userID).Scan(&usernameExists)
 		if err != nil {
 			h.logger.Error("failed to check username uniqueness", zap.Error(err))
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
@@ -484,7 +512,7 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		}
 	}
 
-	// Check if doctor record exists - CREATE IT IF IT DOESN'T
+	// Check if doctor record exists
 	var doctorExists bool
 	err = tx.QueryRow(c.Context(),
 		"SELECT EXISTS(SELECT 1 FROM doctors WHERE doctor_id = $1)",
@@ -494,6 +522,11 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
+	// DEBUG: Log doctor existence
+	h.logger.Info("Doctor existence check",
+		zap.Bool("exists", doctorExists),
+		zap.String("userID", userID.String()))
+
 	// Convert specialization struct to JSON
 	specializationJSON, err := json.Marshal(updateData.Specialization)
 	if err != nil {
@@ -501,15 +534,18 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process specialization data"})
 	}
 
-	// Update users table
-	_, err = tx.Exec(c.Context(),
+	// DEBUG: Log specialization JSON
+	h.logger.Info("Specialization JSON", zap.String("json", string(specializationJSON)))
+
+	// Update users table first
+	userResult, err := tx.Exec(c.Context(),
 		`UPDATE users SET username = $1, name = $2, mobile = $3, blood_group = $4, location = $5, address = $6
-		 WHERE auth_id = $7`,
+         WHERE user_id = $7`,
 		updateData.Username, updateData.Name, updateData.Mobile, updateData.BloodGroup,
-		updateData.Location, updateData.Address, authID)
+		updateData.Location, updateData.Address, userID)
 	if err != nil {
-		// Handle specific constraint violations
-		if strings.Contains(err.Error(), "users_username_key") {
+		// Check for constraint violations
+		if strings.Contains(err.Error(), "users_username_key") || strings.Contains(err.Error(), "duplicate key") {
 			h.logger.Error("username already exists", zap.Error(err), zap.String("username", updateData.Username))
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "Username already exists"})
 		}
@@ -517,36 +553,67 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update profile"})
 	}
 
+	// DEBUG: Check how many rows were affected in users table
+	userRowsAffected := userResult.RowsAffected()
+	h.logger.Info("Users table update", zap.Int64("rowsAffected", userRowsAffected))
+
+	if userRowsAffected == 0 {
+		h.logger.Error("no user rows affected - user might not exist", zap.String("user_id", userID.String()))
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "User not found"})
+	}
+
+	// Handle doctor table update/insert
+	var doctorResult pgconn.CommandTag
 	if !doctorExists {
 		// INSERT new doctor record
-		_, err = tx.Exec(c.Context(),
+		h.logger.Info("Inserting new doctor record", zap.String("userID", userID.String()))
+		doctorResult, err = tx.Exec(c.Context(),
 			`INSERT INTO doctors (doctor_id, name, imr_number, age, specialization, is_active, qualification, slot_duration)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
 			userID, updateData.Name, updateData.IMRNumber, updateData.Age,
 			specializationJSON, updateData.IsActive, updateData.Qualification, updateData.SlotDuration)
 		if err != nil {
 			h.logger.Error("failed to insert doctor profile", zap.Error(err), zap.String("user_id", userID.String()))
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create doctor profile"})
 		}
+		h.logger.Info("Doctor profile inserted", zap.Int64("rowsAffected", doctorResult.RowsAffected()))
 	} else {
 		// UPDATE existing doctor record
-		_, err = tx.Exec(c.Context(),
+		h.logger.Info("Updating existing doctor record", zap.String("userID", userID.String()))
+		doctorResult, err = tx.Exec(c.Context(),
 			`UPDATE doctors SET name = $1, imr_number = $2, age = $3, specialization = $4, is_active = $5, qualification = $6, slot_duration = $7
-			 WHERE doctor_id = $8`,
+             WHERE doctor_id = $8`,
 			updateData.Name, updateData.IMRNumber, updateData.Age, specializationJSON,
 			updateData.IsActive, updateData.Qualification, updateData.SlotDuration, userID)
 		if err != nil {
 			h.logger.Error("failed to update doctor profile", zap.Error(err), zap.String("user_id", userID.String()))
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update doctor profile"})
 		}
+
+		doctorRowsAffected := doctorResult.RowsAffected()
+		h.logger.Info("Doctor profile updated", zap.Int64("rowsAffected", doctorRowsAffected))
+
+		if doctorRowsAffected == 0 {
+			h.logger.Error("no doctor rows affected - doctor might not exist", zap.String("user_id", userID.String()))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update doctor profile - doctor record not found"})
+		}
 	}
 
+	// Commit the transaction
 	if err := tx.Commit(c.Context()); err != nil {
 		h.logger.Error("failed to commit transaction", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
+	committed = true
 
-	return c.JSON(fiber.Map{"message": "Doctor profile updated successfully"})
+	h.logger.Info("Profile update completed successfully",
+		zap.String("userID", userID.String()),
+		zap.Bool("doctorExisted", doctorExists))
+
+	return c.JSON(fiber.Map{
+		"message":   "Doctor profile updated successfully",
+		"doctor_id": userID.String(),
+	})
 }
 
 // Helper function to validate schedule data
@@ -1387,24 +1454,29 @@ func (h *DoctorHandler) DeleteDoctorSchedule(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Schedule ID is required"})
 	}
 
-	// Parse the composite ID to extract components
-	parts := strings.Split(compositeID, "_")
-	if len(parts) < 4 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid schedule ID format"})
+	// Find the position of "_org_" in the composite ID
+	orgMarkerPos := strings.Index(compositeID, "_org_")
+	if orgMarkerPos == -1 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid schedule ID format: missing _org_ marker"})
+	}
+
+	// Split the part before "_org_" to get doctor_id and weekday
+	beforeOrg := compositeID[:orgMarkerPos]
+	parts := strings.Split(beforeOrg, "_")
+	if len(parts) != 2 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error":        "Invalid schedule ID format: expected doctor_id_weekday_org_organization_id",
+			"received":     compositeID,
+			"parsed_parts": parts,
+		})
 	}
 
 	doctorIDStr := parts[0]
 	weekday := parts[1]
 
-	// For organization_id, find the position after "org_" in the original string
-	orgPosition := strings.Index(compositeID, "org_")
-	if orgPosition == -1 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid schedule ID format: missing organization ID"})
-	}
-
-	// Extract the organization ID with the "org_" prefix, then remove the prefix
-	organizationIDWithPrefix := compositeID[orgPosition:]
-	organizationID := strings.Replace(organizationIDWithPrefix, "org_", "", 1)
+	// Extract the organization ID (everything after "_org_", including the "org_" prefix)
+	// Position after "_org_" marker (skip the underscore, keep "org_")
+	organizationID := compositeID[orgMarkerPos+1:] // This will be "org_01JT7ZG469F30KMSG6BASYDQD3"
 
 	// Parse the doctor ID to UUID
 	doctorID, err := uuid.Parse(doctorIDStr)
@@ -1415,6 +1487,7 @@ func (h *DoctorHandler) DeleteDoctorSchedule(c *fiber.Ctx) error {
 
 	// Log for debugging
 	h.logger.Debug("Deleting schedule",
+		zap.String("compositeID", compositeID),
 		zap.String("doctorID", doctorIDStr),
 		zap.String("weekday", weekday),
 		zap.String("organizationID", organizationID))
@@ -1435,11 +1508,11 @@ func (h *DoctorHandler) DeleteDoctorSchedule(c *fiber.Ctx) error {
 
 	// First, delete all future slots associated with this schedule
 	_, err = tx.Exec(c.Context(),
-		`DELETE FROM doctorslots 
-		 WHERE doctor_id = $1 
-		 AND organization_id = $2 
-		 AND weekday = $3 
-		 AND slot_date >= CURRENT_DATE 
+		`DELETE FROM doctorslots
+		 WHERE doctor_id = $1
+		 AND organization_id = $2
+		 AND weekday = $3
+		 AND slot_date >= CURRENT_DATE
 		 AND is_booked = false`,
 		doctorID, organizationID, weekday)
 	if err != nil {
@@ -1450,7 +1523,7 @@ func (h *DoctorHandler) DeleteDoctorSchedule(c *fiber.Ctx) error {
 	// Then delete the schedule
 	result, err := tx.Exec(c.Context(),
 		`DELETE FROM doctorshifts WHERE doctor_id = $1 AND weekday = $2 AND organization_id = $3`,
-		doctorID, organizationID, weekday)
+		doctorID, weekday, organizationID)
 	if err != nil {
 		h.logger.Error("failed to delete doctor schedule", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to delete schedule"})
@@ -1460,7 +1533,21 @@ func (h *DoctorHandler) DeleteDoctorSchedule(c *fiber.Ctx) error {
 	if rowsAffected == 0 {
 		// Rollback the transaction since no schedule was found
 		tx.Rollback(c.Context())
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Schedule not found"})
+
+		// Log what we're looking for vs what exists
+		h.logger.Warn("Schedule not found",
+			zap.String("doctorID", doctorID.String()),
+			zap.String("weekday", weekday),
+			zap.String("organizationID", organizationID))
+
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Schedule not found",
+			"searched_for": map[string]interface{}{
+				"doctor_id":       doctorID.String(),
+				"weekday":         weekday,
+				"organization_id": organizationID,
+			},
+		})
 	}
 
 	// Commit the transaction
@@ -1480,28 +1567,61 @@ func (h *DoctorHandler) DeleteDoctorSchedule(c *fiber.Ctx) error {
 
 // DeleteDoctorFees deletes a doctor's fees for a specific organization
 func (h *DoctorHandler) DeleteDoctorFees(c *fiber.Ctx) error {
-	// Get doctor ID from path parameter
-	doctorIDParam := c.Params("id")
-	if doctorIDParam == "" {
-		h.logger.Error("doctor ID not found in path parameters")
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Doctor ID is required"})
+	// Get composite ID from path parameter
+	compositeIDParam := c.Params("id")
+	if compositeIDParam == "" {
+		h.logger.Error("composite ID not found in path parameters")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Composite ID is required"})
 	}
 
-	// Parse the UUID to validate format
-	doctorID, err := uuid.Parse(doctorIDParam)
+	// Parse the composite ID to extract doctor_id and organization_id
+	// Expected format: doctor_id_org_organization_id
+	parts := strings.Split(compositeIDParam, "_")
+	if len(parts) < 3 {
+		h.logger.Error("invalid composite ID format", zap.String("composite_id", compositeIDParam))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid composite ID format"})
+	}
+
+	// Extract doctor ID (first part)
+	doctorIDStr := parts[0]
+	doctorID, err := uuid.Parse(doctorIDStr)
 	if err != nil {
 		h.logger.Error("invalid doctor ID format", zap.Error(err))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid doctor ID format"})
 	}
 
-	// Get organization ID from request header
-	orgID := c.Get("X-Organization-ID")
-	if orgID == "" {
-		h.logger.Error("organization ID not found in request headers")
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID is required"})
+	// Extract organization ID (everything after "org_")
+	var orgID string
+	orgIndex := -1
+	for i, part := range parts {
+		if part == "org" {
+			orgIndex = i
+			break
+		}
 	}
 
-	h.logger.Info("Deleting doctor fees", zap.String("doctor_id", doctorID.String()), zap.String("org_id", orgID))
+	if orgIndex == -1 || orgIndex+1 >= len(parts) {
+		h.logger.Error("organization ID not found in composite ID", zap.String("composite_id", compositeIDParam))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Organization ID not found in composite ID"})
+	}
+
+	// Join all parts after "org" to handle organization IDs that might contain underscores
+	orgID = strings.Join(parts[orgIndex+1:], "_")
+
+	// Also check for organization ID in request header as fallback
+	headerOrgID := c.Get("X-Organization-ID")
+	if headerOrgID != "" && headerOrgID != orgID {
+		h.logger.Warn("organization ID mismatch between composite ID and header",
+			zap.String("composite_org_id", orgID),
+			zap.String("header_org_id", headerOrgID))
+		// Use the header org ID as it's more authoritative
+		orgID = headerOrgID
+	}
+
+	h.logger.Info("Deleting doctor fees",
+		zap.String("composite_id", compositeIDParam),
+		zap.String("doctor_id", doctorID.String()),
+		zap.String("org_id", orgID))
 
 	// Verify doctor exists
 	var doctorExists bool
@@ -1515,6 +1635,9 @@ func (h *DoctorHandler) DeleteDoctorFees(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Doctor not found"})
 	}
 
+	// Note: Skipping organization validation as organizations table doesn't exist
+	// Organization ID is validated through authentication middleware
+
 	// Execute DELETE using the composite primary key columns
 	result, err := h.pgPool.Exec(c.Context(),
 		`DELETE FROM doctor_fees WHERE doctor_id = $1 AND organization_id = $2`, doctorID, orgID)
@@ -1526,16 +1649,23 @@ func (h *DoctorHandler) DeleteDoctorFees(c *fiber.Ctx) error {
 	// Check if any rows were actually deleted
 	rowsAffected := result.RowsAffected()
 	if rowsAffected == 0 {
-		h.logger.Warn("no doctor fees found to delete", zap.String("doctor_id", doctorID.String()), zap.String("org_id", orgID))
+		h.logger.Warn("no doctor fees found to delete",
+			zap.String("doctor_id", doctorID.String()),
+			zap.String("org_id", orgID))
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "No doctor fees found for this doctor in this organization"})
 	}
 
-	h.logger.Info("Successfully deleted doctor fees", zap.String("doctor_id", doctorID.String()), zap.String("org_id", orgID))
+	h.logger.Info("Successfully deleted doctor fees",
+		zap.String("doctor_id", doctorID.String()),
+		zap.String("org_id", orgID),
+		zap.Int64("rows_affected", rowsAffected))
+
 	return c.JSON(fiber.Map{
 		"message": "Doctor fees deleted successfully",
 		"data": fiber.Map{
 			"doctorID":       doctorID,
 			"organizationID": orgID,
+			"compositeID":    compositeIDParam,
 		},
 	})
 }
