@@ -1604,14 +1604,17 @@ func (h *AppointmentHandler) GetSlotAvailability(c *fiber.Ctx) error {
 		"message":           "Slot availability fetched successfully",
 	})
 }
-
-// GetAppointment retrieves a single appointment by ID
 func (h *AppointmentHandler) GetAppointment(c *fiber.Ctx) error {
 	// Get appointment ID from params
 	appointmentID := c.Params("id")
+	h.logger.Info("Received appointment request", zap.String("appointment_id", appointmentID))
+
 	if appointmentID == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Appointment ID is required"})
 	}
+
+	// Clean the appointment ID - remove whitespace and convert to lowercase
+	appointmentID = strings.ToLower(strings.TrimSpace(appointmentID))
 
 	// Validate UUID format
 	if !isValidUUID(appointmentID) {
@@ -1619,20 +1622,25 @@ func (h *AppointmentHandler) GetAppointment(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid appointment ID format"})
 	}
 
-	// Query MongoDB for the appointment using the appointment_id field
+	// Query MongoDB
 	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
 
 	var appointment Appointment
-	err := appointmentsCollection.FindOne(c.Context(), bson.M{"appointment_id": appointmentID}).Decode(&appointment)
+	// Try case-insensitive search first
+	err := appointmentsCollection.FindOne(c.Context(), bson.M{
+		"appointment_id": bson.M{"$regex": "^" + appointmentID + "$", "$options": "i"},
+	}).Decode(&appointment)
+
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
+			h.logger.Warn("Appointment not found", zap.String("appointment_id", appointmentID))
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Appointment not found"})
 		}
-		h.logger.Error("failed to fetch appointment",
-			zap.Error(err),
-			zap.String("appointment_id", appointmentID))
+		h.logger.Error("failed to fetch appointment", zap.Error(err), zap.String("appointment_id", appointmentID))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch appointment"})
 	}
+
+	h.logger.Info("Successfully found appointment", zap.String("appointment_id", appointment.AppointmentID))
 
 	// Convert to response format
 	appointmentDateStr := ""
@@ -1673,10 +1681,33 @@ func (h *AppointmentHandler) GetAppointment(c *fiber.Ctx) error {
 	return c.JSON(response)
 }
 
-// isValidUUID validates if the string is a valid UUID
-func isValidUUID(id string) bool {
-	regex := regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
-	return regex.MatchString(id)
+// Also check your UUID validation function
+func isValidUUID(u string) bool {
+	_, err := uuid.Parse(u)
+	if err != nil {
+		// Add debug logging
+		log.Printf("UUID validation failed for: %s, error: %v", u, err)
+		return false
+	}
+	return true
+}
+
+// Test function to verify your MongoDB connection and data
+func (h *AppointmentHandler) TestAppointmentQuery(c *fiber.Ctx) error {
+	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
+
+	// Test query with the exact appointment_id from your MongoDB document
+	testID := "f6778c71-ddcb-46ee-b01b-5fecd3a55e4c"
+
+	var appointment Appointment
+	err := appointmentsCollection.FindOne(c.Context(), bson.M{"appointment_id": testID}).Decode(&appointment)
+	if err != nil {
+		h.logger.Error("Test query failed", zap.Error(err))
+		return c.JSON(fiber.Map{"error": err.Error()})
+	}
+
+	h.logger.Info("Test query successful", zap.String("found_appointment", appointment.AppointmentID))
+	return c.JSON(fiber.Map{"success": true, "appointment": appointment})
 }
 
 // GetDoctorAppointments retrieves appointments for a specific doctor

@@ -1,214 +1,119 @@
 package handlers
 
 import (
+	"context"
+	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
-	"strconv"
+	"strings"
 	"time"
 
-	"github.com/VanitasCaesar1/backend/config"
 	"github.com/go-playground/validator/v10"
 	"github.com/gofiber/fiber/v2"
-	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/redis/go-redis/v9"
-	"github.com/workos/workos-go/v4/pkg/usermanagement"
-	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
-	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.uber.org/zap"
 )
 
-// DiagnosisHandler handles diagnosis-related operations
 type DiagnosisHandler struct {
-	config      *config.Config
-	redisClient *redis.Client
-	logger      *zap.Logger
 	pgPool      *pgxpool.Pool
-	mongoClient *mongo.Client
-	validator   *validator.Validate
+	mongoClient *mongo.Client // MongoDB connection for appointments
+	logger      *zap.Logger
 }
 
 type DiagnosisRequest struct {
-	AppointmentID  string       `json:"appointment_id" validate:"required,uuid"`
-	PatientID      string       `json:"patient_id" validate:"required"`
-	DoctorID       string       `json:"doctor_id" validate:"required,uuid"`
-	OrgID          string       `json:"org_id" validate:"required"`
-	Vitals         VitalsData   `json:"vitals" validate:"required"`
-	Symptoms       []Symptom    `json:"symptoms" validate:"required,min=1,dive"`
-	DiagnosisInfo  []Diagnosis  `json:"diagnosis_info" validate:"required,min=1,dive"`
-	History        *History     `json:"history,omitempty"`
-	Status         string       `json:"status" validate:"required,oneof=draft finalized amended cancelled"`
-	TreatmentPlan  *Treatment   `json:"treatment_plan,omitempty"`
-	LabDiagnostics *LabTests    `json:"lab_diagnostics,omitempty"`
-	Notes          string       `json:"notes,omitempty"`
-	Specialization *Specialty   `json:"specialization,omitempty"`
-	Attachments    []Attachment `json:"attachments,omitempty"`
+	AppointmentID      string           `json:"appointment_id" validate:"required,uuid"`
+	PatientID          string           `json:"patient_id" validate:"required"`
+	DoctorID           string           `json:"doctor_id" validate:"required,uuid"`
+	OrgID              string           `json:"org_id" validate:"required"`
+	PatientName        *string          `json:"patient_name,omitempty"`
+	PatientAge         *int             `json:"patient_age,omitempty"`
+	PatientGender      *string          `json:"patient_gender,omitempty" validate:"omitempty,oneof=male female other"`
+	DoctorName         *string          `json:"doctor_name,omitempty"`
+	DoctorSpecialty    *string          `json:"doctor_specialty,omitempty"`
+	Vitals             VitalsData       `json:"vitals" validate:"required"`
+	ChiefComplaint     *string          `json:"chief_complaint,omitempty"`
+	Symptoms           []Symptom        `json:"symptoms" validate:"required,min=1,dive"`
+	PhysicalExam       *string          `json:"physical_exam,omitempty"`
+	PrimaryDiagnosis   string           `json:"primary_diagnosis" validate:"required"`
+	SecondaryDiagnoses []string         `json:"secondary_diagnoses,omitempty"`
+	ICDCodes           []string         `json:"icd_codes,omitempty"`
+	Status             string           `json:"status" validate:"required,oneof=draft finalized amended"`
+	TreatmentPlan      *Treatment       `json:"treatment_plan,omitempty"`
+	LabOrders          []string         `json:"lab_orders,omitempty"`
+	TestResults        []TestResult     `json:"test_results,omitempty"`
+	Specialty          *string          `json:"specialty,omitempty"`
+	SpecialtyData      *json.RawMessage `json:"specialty_data,omitempty"`
+	FollowUpDate       *time.Time       `json:"follow_up_date,omitempty"`
+	FollowUpNotes      *string          `json:"follow_up_notes,omitempty"`
+	Referrals          []string         `json:"referrals,omitempty"`
+	ClinicalNotes      *string          `json:"clinical_notes,omitempty"`
+	Attachments        []Attachment     `json:"attachments,omitempty"`
 }
 
 // VitalsData represents vital signs data
 type VitalsData struct {
-	Timestamp        time.Time `json:"timestamp" validate:"required"`
-	Temperature      *float64  `json:"temperature,omitempty"`
-	TemperatureUnit  *string   `json:"temperature_unit,omitempty" validate:"omitempty,oneof=F C"`
-	BloodPressure    *string   `json:"blood_pressure,omitempty"`
-	HeartRate        *int      `json:"heart_rate,omitempty"`
-	RespiratoryRate  *int      `json:"respiratory_rate,omitempty"`
-	Weight           *float64  `json:"weight,omitempty"`
-	WeightUnit       *string   `json:"weight_unit,omitempty" validate:"omitempty,oneof=kg lb"`
-	Height           *float64  `json:"height,omitempty"`
-	HeightUnit       *string   `json:"height_unit,omitempty" validate:"omitempty,oneof=cm in"`
-	BMI              *float64  `json:"bmi,omitempty"`
-	BloodGlucose     *float64  `json:"blood_glucose,omitempty"`
-	BloodGlucoseUnit *string   `json:"blood_glucose_unit,omitempty" validate:"omitempty,oneof=mg/dL mmol/L"`
-	OxygenSaturation *float64  `json:"oxygen_saturation,omitempty"`
-	PainLevel        *int      `json:"pain_level,omitempty" validate:"omitempty,min=0,max=10"`
-}
-
-// Symptom represents a patient symptom
-type Symptom struct {
-	Name               string   `json:"name" validate:"required"`
-	Since              *string  `json:"since,omitempty"`
-	Severity           *string  `json:"severity,omitempty" validate:"omitempty,oneof=mild moderate severe"`
-	Location           *string  `json:"location,omitempty"`
-	Character          *string  `json:"character,omitempty"`
-	AlleviatingFactors *string  `json:"alleviating_factors,omitempty"`
-	AggravatingFactors *string  `json:"aggravating_factors,omitempty"`
-	AssociatedSymptoms []string `json:"associated_symptoms,omitempty"`
-	Notes              *string  `json:"notes,omitempty"`
-}
-
-// Diagnosis represents a medical diagnosis
-type Diagnosis struct {
-	Name                  string   `json:"name" validate:"required"`
-	ICDCode               *string  `json:"icd_code,omitempty"`
-	Since                 *string  `json:"since,omitempty"`
-	Status                string   `json:"status" validate:"required,oneof=provisional working confirmed ruled_out"`
-	Notes                 *string  `json:"notes,omitempty"`
-	SupportingFactors     []string `json:"supporting_factors,omitempty"`
-	DifferentialDiagnoses []string `json:"differential_diagnoses,omitempty"`
-}
-
-// History represents patient medical history
-type History struct {
-	MedicalHistory  *string        `json:"medical_history,omitempty"`
-	FamilyHistory   *string        `json:"family_history,omitempty"`
-	Allergies       []Allergy      `json:"allergies,omitempty"`
-	SurgicalHistory []Surgery      `json:"surgical_history,omitempty"`
-	SocialHistory   *SocialHistory `json:"social_history,omitempty"`
-}
-
-// Allergy represents an allergic reaction
-type Allergy struct {
-	Allergen string  `json:"allergen" validate:"required"`
-	Reaction *string `json:"reaction,omitempty"`
-	Severity *string `json:"severity,omitempty" validate:"omitempty,oneof=mild moderate severe"`
-}
-
-// Surgery represents surgical history
-type Surgery struct {
-	Procedure string     `json:"procedure,omitempty"`
-	Date      *time.Time `json:"date,omitempty"`
-	Notes     *string    `json:"notes,omitempty"`
-}
-
-// SocialHistory represents social history
-type SocialHistory struct {
-	TobaccoUse *bool   `json:"tobacco_use,omitempty"`
-	AlcoholUse *bool   `json:"alcohol_use,omitempty"`
-	DrugUse    *bool   `json:"drug_use,omitempty"`
-	Notes      *string `json:"notes,omitempty"`
+	Temperature   *float64 `json:"temperature,omitempty"`
+	BloodPressure *string  `json:"blood_pressure,omitempty"`
+	HeartRate     *int     `json:"heart_rate,omitempty"`
+	Weight        *float64 `json:"weight,omitempty"`
+	Height        *float64 `json:"height,omitempty"`
+	BMI           *float64 `json:"bmi,omitempty"`
 }
 
 // Treatment represents treatment plan
 type Treatment struct {
-	Medications      []Medication `json:"medications,omitempty"`
-	Procedures       []Procedure  `json:"procedures,omitempty"`
-	LifestyleChanges []string     `json:"lifestyle_changes,omitempty"`
-	FollowUp         *FollowUp    `json:"follow_up,omitempty"`
-	Referrals        []Referral   `json:"referrals,omitempty"`
+	Medications     []Medication `json:"medications,omitempty"`
+	Procedures      []string     `json:"procedures,omitempty"`
+	Recommendations *string      `json:"recommendations,omitempty"`
 }
 
-// Medication represents prescribed medication
-type Medication struct {
-	Name         string  `json:"name" validate:"required"`
-	GenericName  *string `json:"generic_name,omitempty"`
-	Dosage       string  `json:"dosage" validate:"required"`
-	Route        *string `json:"route,omitempty"`
-	Frequency    string  `json:"frequency" validate:"required"`
-	Duration     *string `json:"duration,omitempty"`
-	Instructions *string `json:"instructions,omitempty"`
+// Implement Valuer interface for PostgreSQL JSON fields
+func (s Symptom) Value() (driver.Value, error) {
+	return json.Marshal(s)
 }
 
-// Procedure represents medical procedure
-type Procedure struct {
-	Name  string     `json:"name" validate:"required"`
-	Date  *time.Time `json:"date,omitempty"`
-	Notes *string    `json:"notes,omitempty"`
+func (t Treatment) Value() (driver.Value, error) {
+	return json.Marshal(t)
 }
 
-// FollowUp represents follow-up instructions
-type FollowUp struct {
-	Date     *time.Time `json:"date,omitempty"`
-	Duration *string    `json:"duration,omitempty"`
-	Notes    *string    `json:"notes,omitempty"`
+func (tr TestResult) Value() (driver.Value, error) {
+	return json.Marshal(tr)
 }
 
-// Referral represents specialist referral
-type Referral struct {
-	Specialist string  `json:"specialist" validate:"required"`
-	Reason     *string `json:"reason,omitempty"`
-	Urgency    *string `json:"urgency,omitempty" validate:"omitempty,oneof=routine urgent emergency"`
+func (a Attachment) Value() (driver.Value, error) {
+	return json.Marshal(a)
 }
 
-// LabTests represents laboratory diagnostics
-type LabTests struct {
-	OrderedTests []OrderedTest `json:"ordered_tests,omitempty"`
-	TestResults  []TestResult  `json:"test_results,omitempty"`
-}
+// Option 1: Return both handler and error (Recommended)
+func NewDiagnosisHandler(pgPool *pgxpool.Pool, mongoClient *mongo.Client, logger *zap.Logger) (*DiagnosisHandler, error) {
+	// Add validation logic here if needed
+	if pgPool == nil {
+		return nil, errors.New("postgres pool cannot be nil")
+	}
+	if mongoClient == nil {
+		return nil, errors.New("mongo client cannot be nil")
+	}
+	if logger == nil {
+		return nil, errors.New("logger cannot be nil")
+	}
 
-// OrderedTest represents an ordered test
-type OrderedTest struct {
-	Name   string  `json:"name" validate:"required"`
-	Status *string `json:"status,omitempty" validate:"omitempty,oneof=ordered completed pending cancelled"`
-	Notes  *string `json:"notes,omitempty"`
-}
-
-// TestResult represents test results
-type TestResult struct {
-	Name           string      `json:"name" validate:"required"`
-	Date           time.Time   `json:"date" validate:"required"`
-	Result         interface{} `json:"result,omitempty"`
-	Interpretation *string     `json:"interpretation,omitempty"`
-	ReferenceRange *string     `json:"reference_range,omitempty"`
-}
-
-// Specialty represents specialty-specific information
-type Specialty struct {
-	SpecialtyType string      `json:"specialty_type,omitempty" validate:"omitempty,oneof=general_medicine cardiology neurology orthopedics pediatrics dermatology ophthalmology ent gynecology urology psychiatry endocrinology gastroenterology oncology pulmonology nephrology rheumatology other"`
-	CustomFields  interface{} `json:"custom_fields,omitempty"`
-}
-
-// Attachment represents file attachments
-type Attachment struct {
-	FileID      string     `json:"file_id" validate:"required"`
-	FileName    string     `json:"file_name" validate:"required"`
-	FileType    string     `json:"file_type" validate:"required"`
-	Description *string    `json:"description,omitempty"`
-	UploadDate  *time.Time `json:"upload_date,omitempty"`
-}
-
-func NewDiagnosisHandler(cfg *config.Config, rds *redis.Client, logger *zap.Logger, pgPool *pgxpool.Pool, mongoClient *mongo.Client) (*DiagnosisHandler, error) {
-	usermanagement.SetAPIKey(cfg.WorkOSApiKey)
 	return &DiagnosisHandler{
-		config:      cfg,
-		redisClient: rds,
-		logger:      logger,
 		pgPool:      pgPool,
 		mongoClient: mongoClient,
-		validator:   validator.New(),
+		logger:      logger,
 	}, nil
+}
+
+// Option 2: Alternative constructor that only returns handler (if you prefer no error handling)
+func NewDiagnosisHandlerNoError(pgPool *pgxpool.Pool, mongoClient *mongo.Client, logger *zap.Logger) *DiagnosisHandler {
+	return &DiagnosisHandler{
+		pgPool:      pgPool,
+		mongoClient: mongoClient,
+		logger:      logger,
+	}
 }
 
 // getAuthID extracts the authenticated user ID from the request context
@@ -218,6 +123,69 @@ func (h *DiagnosisHandler) getAuthID(c *fiber.Ctx) (string, error) {
 		return "", errors.New("auth ID not found in context")
 	}
 	return authID.(string), nil
+}
+
+// formatValidationErrors formats validation errors for response
+func formatValidationErrors(err error) map[string]string {
+	errors := make(map[string]string)
+	if validationErrors, ok := err.(validator.ValidationErrors); ok {
+		for _, validationError := range validationErrors {
+			field := strings.ToLower(validationError.Field())
+			errors[field] = fmt.Sprintf("Field validation failed on the '%s' tag", validationError.Tag())
+		}
+	}
+	return errors
+}
+
+// validateDiagnosisRequest performs custom validation
+func (h *DiagnosisHandler) validateDiagnosisRequest(req *DiagnosisRequest) error {
+	// Validate UUID fields
+	if req.AppointmentID != "" && !validateUUID(req.AppointmentID) {
+		return errors.New("invalid appointment ID format")
+	}
+	if req.DoctorID != "" && !validateUUID(req.DoctorID) {
+		return errors.New("invalid doctor ID format")
+	}
+
+	// Validate vitals ranges
+	if req.Vitals.Temperature != nil && (*req.Vitals.Temperature < 95.0 || *req.Vitals.Temperature > 110.0) {
+		return errors.New("temperature must be between 95.0 and 110.0")
+	}
+	if req.Vitals.HeartRate != nil && (*req.Vitals.HeartRate < 30 || *req.Vitals.HeartRate > 250) {
+		return errors.New("heart rate must be between 30 and 250")
+	}
+	if req.Vitals.BMI != nil && (*req.Vitals.BMI < 10.0 || *req.Vitals.BMI > 60.0) {
+		return errors.New("BMI must be between 10.0 and 60.0")
+	}
+
+	return nil
+}
+
+// validateAppointmentExists checks if appointment exists and belongs to the organization
+func (h *DiagnosisHandler) validateAppointmentExists(c *fiber.Ctx, appointmentID, orgID string) error {
+	var exists bool
+	query := `SELECT EXISTS(SELECT 1 FROM appointments WHERE appointment_id = $1 AND org_id = $2)`
+
+	err := h.pgPool.QueryRow(c.Context(), query, appointmentID, orgID).Scan(&exists)
+	if err != nil {
+		h.logger.Error("failed to validate appointment", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
+	}
+
+	if !exists {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid appointment ID or appointment does not belong to organization"})
+	}
+
+	return nil
+}
+
+// checkExistingDiagnosis checks if diagnosis already exists for appointment
+func (h *DiagnosisHandler) checkExistingDiagnosis(c context.Context, appointmentID string) (bool, error) {
+	var exists bool
+	query := `SELECT EXISTS(SELECT 1 FROM medical_diagnoses WHERE appointment_id = $1)`
+
+	err := h.pgPool.QueryRow(c, query, appointmentID).Scan(&exists)
+	return exists, err
 }
 
 // UpdateDiagnosis updates an existing diagnosis
@@ -251,25 +219,17 @@ func (h *DiagnosisHandler) UpdateDiagnosis(c *fiber.Ctx) error {
 		})
 	}
 
-	// Validate the request using the validator (optional fields will be ignored if empty)
-	if err := h.validator.Struct(&updateRequest); err != nil {
-		h.logger.Error("validation failed", zap.Error(err))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error":   "Validation failed",
-			"details": formatValidationErrors(err),
-		})
+	// Check if diagnosis exists first
+	var exists bool
+	checkQuery := `SELECT EXISTS(SELECT 1 FROM medical_diagnoses WHERE id = $1)`
+	err = h.pgPool.QueryRow(c.Context(), checkQuery, diagnosisID).Scan(&exists)
+	if err != nil {
+		h.logger.Error("failed to check diagnosis existence", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
 	}
 
-	// Check if diagnosis exists first
-	diagnosisCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("diagnoses")
-	var existingDiagnosis bson.M
-	err = diagnosisCollection.FindOne(c.Context(), bson.M{"diagnosis_id": diagnosisID}).Decode(&existingDiagnosis)
-	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Diagnosis not found"})
-		}
-		h.logger.Error("failed to find diagnosis", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
+	if !exists {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Diagnosis not found"})
 	}
 
 	// Additional custom validations if needed
@@ -281,89 +241,118 @@ func (h *DiagnosisHandler) UpdateDiagnosis(c *fiber.Ctx) error {
 		}
 	}
 
-	// Build update document
-	updateDoc := bson.M{}
-	now := time.Now()
+	// Build update query dynamically
+	setParts := []string{}
+	args := []interface{}{}
+	argCount := 1
 
-	// Only update fields that are provided in the request
-	if updateRequest.Vitals.Timestamp != (time.Time{}) {
-		updateDoc["vitals"] = updateRequest.Vitals
+	// Helper function to add update fields
+	addField := func(field string, value interface{}, condition bool) {
+		if condition {
+			setParts = append(setParts, fmt.Sprintf("%s = $%d", field, argCount))
+			args = append(args, value)
+			argCount++
+		}
 	}
+
+	// Add fields to update if they are provided
+	addField("patient_name", updateRequest.PatientName, updateRequest.PatientName != nil)
+	addField("patient_age", updateRequest.PatientAge, updateRequest.PatientAge != nil)
+	addField("patient_gender", updateRequest.PatientGender, updateRequest.PatientGender != nil)
+	addField("doctor_name", updateRequest.DoctorName, updateRequest.DoctorName != nil)
+	addField("doctor_specialty", updateRequest.DoctorSpecialty, updateRequest.DoctorSpecialty != nil)
+	addField("temperature", updateRequest.Vitals.Temperature, updateRequest.Vitals.Temperature != nil)
+	addField("blood_pressure", updateRequest.Vitals.BloodPressure, updateRequest.Vitals.BloodPressure != nil)
+	addField("heart_rate", updateRequest.Vitals.HeartRate, updateRequest.Vitals.HeartRate != nil)
+	addField("weight", updateRequest.Vitals.Weight, updateRequest.Vitals.Weight != nil)
+	addField("height", updateRequest.Vitals.Height, updateRequest.Vitals.Height != nil)
+	addField("bmi", updateRequest.Vitals.BMI, updateRequest.Vitals.BMI != nil)
+	addField("chief_complaint", updateRequest.ChiefComplaint, updateRequest.ChiefComplaint != nil)
+	addField("physical_exam", updateRequest.PhysicalExam, updateRequest.PhysicalExam != nil)
+	addField("primary_diagnosis", updateRequest.PrimaryDiagnosis, updateRequest.PrimaryDiagnosis != "")
+	addField("status", updateRequest.Status, updateRequest.Status != "")
+	addField("specialty", updateRequest.Specialty, updateRequest.Specialty != nil)
+	addField("follow_up_date", updateRequest.FollowUpDate, updateRequest.FollowUpDate != nil)
+	addField("follow_up_notes", updateRequest.FollowUpNotes, updateRequest.FollowUpNotes != nil)
+	addField("clinical_notes", updateRequest.ClinicalNotes, updateRequest.ClinicalNotes != nil)
+
+	// Handle JSONB fields
 	if len(updateRequest.Symptoms) > 0 {
-		updateDoc["symptoms"] = updateRequest.Symptoms
+		symptomsJSON, _ := json.Marshal(updateRequest.Symptoms)
+		addField("symptoms", symptomsJSON, true)
 	}
-	if len(updateRequest.DiagnosisInfo) > 0 {
-		updateDoc["diagnosis_info"] = updateRequest.DiagnosisInfo
+	if len(updateRequest.SecondaryDiagnoses) > 0 {
+		addField("secondary_diagnoses", updateRequest.SecondaryDiagnoses, true)
 	}
-	if updateRequest.Status != "" {
-		updateDoc["status"] = updateRequest.Status
-	}
-	if updateRequest.History != nil {
-		updateDoc["history"] = updateRequest.History
+	if len(updateRequest.ICDCodes) > 0 {
+		addField("icd_codes", updateRequest.ICDCodes, true)
 	}
 	if updateRequest.TreatmentPlan != nil {
-		updateDoc["treatment_plan"] = updateRequest.TreatmentPlan
+		medicationsJSON, _ := json.Marshal(updateRequest.TreatmentPlan.Medications)
+		addField("medications", medicationsJSON, true)
+		addField("procedures", updateRequest.TreatmentPlan.Procedures, true)
+		addField("recommendations", updateRequest.TreatmentPlan.Recommendations, updateRequest.TreatmentPlan.Recommendations != nil)
 	}
-	if updateRequest.LabDiagnostics != nil {
-		updateDoc["lab_diagnostics"] = updateRequest.LabDiagnostics
+	if len(updateRequest.LabOrders) > 0 {
+		addField("lab_orders", updateRequest.LabOrders, true)
 	}
-	if updateRequest.Notes != "" {
-		updateDoc["notes"] = updateRequest.Notes
+	if len(updateRequest.TestResults) > 0 {
+		testResultsJSON, _ := json.Marshal(updateRequest.TestResults)
+		addField("test_results", testResultsJSON, true)
 	}
-	if updateRequest.Specialization != nil {
-		updateDoc["specialization"] = updateRequest.Specialization
+	if updateRequest.SpecialtyData != nil {
+		addField("specialty_data", updateRequest.SpecialtyData, true)
+	}
+	if len(updateRequest.Referrals) > 0 {
+		addField("referrals", updateRequest.Referrals, true)
 	}
 	if len(updateRequest.Attachments) > 0 {
-		updateDoc["attachments"] = updateRequest.Attachments
+		attachmentsJSON, _ := json.Marshal(updateRequest.Attachments)
+		addField("attachments", attachmentsJSON, true)
+	}
+
+	if len(setParts) == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "No fields to update"})
 	}
 
 	// Always update the updated_at timestamp
-	updateDoc["updated_at"] = now
+	setParts = append(setParts, fmt.Sprintf("updated_at = $%d", argCount))
+	args = append(args, time.Now())
+	argCount++
 
-	// Log update operation
-	h.logger.Debug("updating diagnosis",
-		zap.String("diagnosis_id", diagnosisID),
-		zap.Any("update_fields", updateDoc))
+	// Add WHERE clause
+	args = append(args, diagnosisID)
 
-	// Perform the update operation directly
-	result, err := diagnosisCollection.UpdateOne(
-		c.Context(),
-		bson.M{"diagnosis_id": diagnosisID},
-		bson.M{"$set": updateDoc},
-	)
+	// Build and execute update query
+	updateQuery := fmt.Sprintf(`
+		UPDATE medical_diagnoses 
+		SET %s 
+		WHERE id = $%d 
+		RETURNING id, updated_at`,
+		strings.Join(setParts, ", "), argCount)
 
+	h.logger.Debug("executing update query", zap.String("query", updateQuery))
+
+	var updatedID string
+	var updatedAt time.Time
+	err = h.pgPool.QueryRow(c.Context(), updateQuery, args...).Scan(&updatedID, &updatedAt)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Diagnosis not found"})
+		}
 		h.logger.Error("failed to update diagnosis", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update diagnosis"})
 	}
 
-	if result.MatchedCount == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Diagnosis not found"})
-	}
-
 	h.logger.Info("diagnosis updated successfully",
 		zap.String("diagnosis_id", diagnosisID),
-		zap.Int64("modified_count", result.ModifiedCount))
-
-	// Get the updated diagnosis
-	var updatedDiagnosis bson.M
-	err = diagnosisCollection.FindOne(c.Context(), bson.M{"diagnosis_id": diagnosisID}).Decode(&updatedDiagnosis)
-	if err != nil {
-		h.logger.Error("failed to retrieve updated diagnosis", zap.Error(err))
-		return c.Status(fiber.StatusOK).JSON(fiber.Map{
-			"message":        "Diagnosis updated successfully",
-			"modified_count": result.ModifiedCount,
-			"updated_at":     now,
-		})
-	}
+		zap.Time("updated_at", updatedAt))
 
 	// Prepare response
 	response := fiber.Map{
-		"message":        "Diagnosis updated successfully",
-		"diagnosis_id":   diagnosisID,
-		"modified_count": result.ModifiedCount,
-		"updated_at":     now,
-		"diagnosis":      updatedDiagnosis,
+		"message":      "Diagnosis updated successfully",
+		"diagnosis_id": updatedID,
+		"updated_at":   updatedAt,
 	}
 
 	return c.Status(fiber.StatusOK).JSON(response)
@@ -390,13 +379,6 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 	}
 
 	// Validate the request using the validator
-	if err := h.validator.Struct(&diagnosisRequest); err != nil {
-		h.logger.Error("validation failed", zap.Error(err))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error":   "Validation failed",
-			"details": formatValidationErrors(err),
-		})
-	}
 
 	// Log the parsed request for debugging
 	h.logger.Debug("parsed diagnosis request",
@@ -418,7 +400,7 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 	}
 
 	// Check for existing diagnosis for this appointment
-	if exists, err := h.checkExistingDiagnosis(c, diagnosisRequest.AppointmentID); err != nil {
+	if exists, err := h.checkExistingDiagnosis(c.Context(), diagnosisRequest.AppointmentID); err != nil {
 		h.logger.Error("failed to check existing diagnosis", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
 	} else if exists {
@@ -426,60 +408,92 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "Diagnosis already exists for this appointment"})
 	}
 
-	// Generate a new UUID for diagnosis_id
-	diagnosisID := uuid.New().String()
-	h.logger.Debug("generated diagnosis_id", zap.String("diagnosis_id", diagnosisID))
-
-	// Create diagnosis document
-	now := time.Now()
-	diagnosis := bson.M{
-		"diagnosis_id":   diagnosisID,
-		"appointment_id": diagnosisRequest.AppointmentID,
-		"patient_id":     diagnosisRequest.PatientID,
-		"doctor_id":      diagnosisRequest.DoctorID,
-		"org_id":         diagnosisRequest.OrgID,
-		"vitals":         diagnosisRequest.Vitals,
-		"symptoms":       diagnosisRequest.Symptoms,
-		"diagnosis_info": diagnosisRequest.DiagnosisInfo,
-		"status":         diagnosisRequest.Status,
-		"created_at":     now,
-		"updated_at":     now,
+	// Prepare JSON fields
+	var symptomsJSON, medicationsJSON, testResultsJSON, attachmentsJSON []byte
+	if len(diagnosisRequest.Symptoms) > 0 {
+		symptomsJSON, _ = json.Marshal(diagnosisRequest.Symptoms)
 	}
-
-	// Add optional fields if provided
-	if diagnosisRequest.History != nil {
-		diagnosis["history"] = diagnosisRequest.History
+	if diagnosisRequest.TreatmentPlan != nil && len(diagnosisRequest.TreatmentPlan.Medications) > 0 {
+		medicationsJSON, _ = json.Marshal(diagnosisRequest.TreatmentPlan.Medications)
 	}
-	if diagnosisRequest.TreatmentPlan != nil {
-		diagnosis["treatment_plan"] = diagnosisRequest.TreatmentPlan
-	}
-	if diagnosisRequest.LabDiagnostics != nil {
-		diagnosis["lab_diagnostics"] = diagnosisRequest.LabDiagnostics
-	}
-	if diagnosisRequest.Notes != "" {
-		diagnosis["notes"] = diagnosisRequest.Notes
-	}
-	if diagnosisRequest.Specialization != nil {
-		diagnosis["specialization"] = diagnosisRequest.Specialization
+	if len(diagnosisRequest.TestResults) > 0 {
+		testResultsJSON, _ = json.Marshal(diagnosisRequest.TestResults)
 	}
 	if len(diagnosisRequest.Attachments) > 0 {
-		diagnosis["attachments"] = diagnosisRequest.Attachments
+		attachmentsJSON, _ = json.Marshal(diagnosisRequest.Attachments)
 	}
 
-	// Insert the diagnosis directly
-	diagnosisCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("diagnoses")
-	result, err := diagnosisCollection.InsertOne(c.Context(), diagnosis)
+	// Get procedures and recommendations from treatment plan
+	var procedures []string
+	var recommendations *string
+	if diagnosisRequest.TreatmentPlan != nil {
+		procedures = diagnosisRequest.TreatmentPlan.Procedures
+		recommendations = diagnosisRequest.TreatmentPlan.Recommendations
+	}
+
+	// Insert the diagnosis
+	insertQuery := `
+		INSERT INTO medical_diagnoses (
+			appointment_id, patient_id, doctor_id, org_id, patient_name, patient_age, 
+			patient_gender, doctor_name, doctor_specialty, temperature, blood_pressure, 
+			heart_rate, weight, height, bmi, chief_complaint, symptoms, physical_exam, 
+			primary_diagnosis, secondary_diagnoses, icd_codes, medications, procedures, 
+			recommendations, lab_orders, test_results, specialty, specialty_data, 
+			follow_up_date, follow_up_notes, referrals, status, clinical_notes, attachments
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 
+			$18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34
+		) RETURNING id, created_at`
+
+	var diagnosisID string
+	var createdAt time.Time
+
+	err = h.pgPool.QueryRow(c.Context(), insertQuery,
+		diagnosisRequest.AppointmentID,
+		diagnosisRequest.PatientID,
+		diagnosisRequest.DoctorID,
+		diagnosisRequest.OrgID,
+		diagnosisRequest.PatientName,
+		diagnosisRequest.PatientAge,
+		diagnosisRequest.PatientGender,
+		diagnosisRequest.DoctorName,
+		diagnosisRequest.DoctorSpecialty,
+		diagnosisRequest.Vitals.Temperature,
+		diagnosisRequest.Vitals.BloodPressure,
+		diagnosisRequest.Vitals.HeartRate,
+		diagnosisRequest.Vitals.Weight,
+		diagnosisRequest.Vitals.Height,
+		diagnosisRequest.Vitals.BMI,
+		diagnosisRequest.ChiefComplaint,
+		symptomsJSON,
+		diagnosisRequest.PhysicalExam,
+		diagnosisRequest.PrimaryDiagnosis,
+		diagnosisRequest.SecondaryDiagnoses,
+		diagnosisRequest.ICDCodes,
+		medicationsJSON,
+		procedures,
+		recommendations,
+		diagnosisRequest.LabOrders,
+		testResultsJSON,
+		diagnosisRequest.Specialty,
+		diagnosisRequest.SpecialtyData,
+		diagnosisRequest.FollowUpDate,
+		diagnosisRequest.FollowUpNotes,
+		diagnosisRequest.Referrals,
+		diagnosisRequest.Status,
+		diagnosisRequest.ClinicalNotes,
+		attachmentsJSON,
+	).Scan(&diagnosisID, &createdAt)
 
 	if err != nil {
 		h.logger.Error("failed to insert diagnosis", zap.Error(err))
-		if mongo.IsDuplicateKeyError(err) {
-			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "Diagnosis with this ID already exists"})
+		if strings.Contains(err.Error(), "duplicate key") {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "Diagnosis with this appointment already exists"})
 		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create diagnosis"})
 	}
 
 	h.logger.Info("diagnosis created successfully",
-		zap.Any("insertedID", result.InsertedID),
 		zap.String("diagnosis_id", diagnosisID),
 		zap.String("appointment_id", diagnosisRequest.AppointmentID))
 
@@ -487,201 +501,49 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 	response := fiber.Map{
 		"message":      "Diagnosis created successfully",
 		"diagnosis_id": diagnosisID,
-		"created_at":   now,
+		"created_at":   createdAt,
 		"status":       diagnosisRequest.Status,
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(response)
 }
 
-// validateDiagnosisRequest performs custom validation
-func (h *DiagnosisHandler) validateDiagnosisRequest(req *DiagnosisRequest) error {
-	// Validate ID formats based on schema requirements
-	if !validatePatientID(req.PatientID) {
-		return fmt.Errorf("patient ID must be 8-digit alphanumeric format")
-	}
-
-	if !validateUUID(req.DoctorID) {
-		return fmt.Errorf("doctor ID must be in UUID format")
-	}
-
-	if !validateUUID(req.AppointmentID) {
-		return fmt.Errorf("appointment ID must be in UUID format")
-	}
-
-	if !validateOrgID(req.OrgID) {
-		return fmt.Errorf("organization ID must be in ULID format (org_[A-Z0-9]{26})")
-	}
-
-	// Validate vitals timestamp
-	if req.Vitals.Timestamp.IsZero() {
-		return fmt.Errorf("vitals timestamp is required")
-	}
-
-	// Validate temperature unit if temperature is provided
-	if req.Vitals.Temperature != nil && req.Vitals.TemperatureUnit == nil {
-		return fmt.Errorf("temperature unit is required when temperature is provided")
-	}
-
-	// Validate weight unit if weight is provided
-	if req.Vitals.Weight != nil && req.Vitals.WeightUnit == nil {
-		return fmt.Errorf("weight unit is required when weight is provided")
-	}
-
-	// Validate height unit if height is provided
-	if req.Vitals.Height != nil && req.Vitals.HeightUnit == nil {
-		return fmt.Errorf("height unit is required when height is provided")
-	}
-
-	// Validate blood glucose unit if blood glucose is provided
-	if req.Vitals.BloodGlucose != nil && req.Vitals.BloodGlucoseUnit == nil {
-		return fmt.Errorf("blood glucose unit is required when blood glucose is provided")
-	}
-
-	return nil
+// MedicalDiagnosis represents the medical diagnosis data structure
+type MedicalDiagnosis struct {
+	ID                 string   `json:"_id,omitempty" bson:"_id,omitempty"`
+	Condition          string   `json:"condition" bson:"condition"`
+	Specialization     string   `json:"specialization" bson:"specialization"`
+	Category           string   `json:"category" bson:"category"`
+	ICD                ICDCode  `json:"icd" bson:"icd"`
+	Synonyms           []string `json:"synonyms,omitempty" bson:"synonyms,omitempty"`
+	CommonPresentation string   `json:"commonPresentation" bson:"commonPresentation"`
+	Severity           string   `json:"severity" bson:"severity"`
+	Prevalence         string   `json:"prevalence" bson:"prevalence"`
+	AgeGroup           []string `json:"ageGroup" bson:"ageGroup"`
+	SearchKeywords     []string `json:"searchKeywords,omitempty" bson:"searchKeywords,omitempty"`
 }
 
-// validateAppointmentExists checks if appointment exists and belongs to org
-func (h *DiagnosisHandler) validateAppointmentExists(c *fiber.Ctx, appointmentID, orgID string) error {
-	appointmentsCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("appointments")
-
-	filter := bson.M{
-		"appointment_id": appointmentID,
-		"org_id":         orgID,
-	}
-
-	var appointment bson.M
-	err := appointmentsCollection.FindOne(c.Context(), filter).Decode(&appointment)
-	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			h.logger.Warn("appointment not found or doesn't belong to organization",
-				zap.String("appointment_id", appointmentID),
-				zap.String("org_id", orgID))
-			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Appointment not found"})
-		}
-		h.logger.Error("error checking appointment", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
-	}
-
-	return nil
+// ICDCode represents the ICD code structure
+type ICDCode struct {
+	Code        string `json:"code" bson:"code"`
+	Version     string `json:"version" bson:"version"`
+	Description string `json:"description" bson:"description"`
 }
 
-// checkExistingDiagnosis checks if diagnosis already exists for appointment
-func (h *DiagnosisHandler) checkExistingDiagnosis(c *fiber.Ctx, appointmentID string) (bool, error) {
-	diagnosisCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("diagnoses")
-
-	count, err := diagnosisCollection.CountDocuments(c.Context(), bson.M{"appointment_id": appointmentID})
-	if err != nil {
-		return false, err
-	}
-
-	return count > 0, nil
+// DiagnosisSearchParams represents search parameters
+type DiagnosisSearchParams struct {
+	Term           string   `json:"term"`
+	ICDCode        string   `json:"icd_code"`
+	Specialization string   `json:"specialization"`
+	Category       string   `json:"category"`
+	Severity       string   `json:"severity"`
+	Prevalence     string   `json:"prevalence"`
+	AgeGroups      []string `json:"age_groups"`
+	Limit          int      `json:"limit"`
+	Offset         int      `json:"offset"`
 }
 
-// formatValidationErrors formats validation errors for better response
-func formatValidationErrors(err error) interface{} {
-	var validationErrors []map[string]string
-
-	if ve, ok := err.(validator.ValidationErrors); ok {
-		for _, fe := range ve {
-			validationErrors = append(validationErrors, map[string]string{
-				"field":   fe.Field(),
-				"tag":     fe.Tag(),
-				"value":   fmt.Sprintf("%v", fe.Value()),
-				"message": getValidationMessage(fe),
-			})
-		}
-		return validationErrors
-	}
-
-	return err.Error()
-}
-
-// getValidationMessage returns user-friendly validation messages
-func getValidationMessage(fe validator.FieldError) string {
-	switch fe.Tag() {
-	case "required":
-		return fmt.Sprintf("%s is required", fe.Field())
-	case "min":
-		return fmt.Sprintf("%s must be at least %s characters long", fe.Field(), fe.Param())
-	case "max":
-		return fmt.Sprintf("%s must be at most %s characters long", fe.Field(), fe.Param())
-	case "email":
-		return fmt.Sprintf("%s must be a valid email address", fe.Field())
-	case "uuid":
-		return fmt.Sprintf("%s must be a valid UUID", fe.Field())
-	case "oneof":
-		return fmt.Sprintf("%s must be one of: %s", fe.Field(), fe.Param())
-	default:
-		return fmt.Sprintf("%s is invalid", fe.Field())
-	}
-}
-
-// DeleteDiagnosis deletes a diagnosis by ID
-func (h *DiagnosisHandler) DeleteDiagnosis(c *fiber.Ctx) error {
-	diagnosisID := c.Params("id")
-	if diagnosisID == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Diagnosis ID is required"})
-	}
-
-	// Validate diagnosis ID format
-	if !validateUUID(diagnosisID) {
-		h.logger.Warn("invalid diagnosis ID format", zap.String("diagnosis_id", diagnosisID))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Diagnosis ID must be in UUID format"})
-	}
-
-	// Get auth ID from context
-	authID, err := h.getAuthID(c)
-	if err != nil {
-		h.logger.Error("authID not found in context", zap.Error(err))
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "Authentication required"})
-	}
-	h.logger.Debug("Auth ID", zap.String("authID", authID))
-
-	// Check if diagnosis exists first
-	diagnosisCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("diagnoses")
-	var existingDiagnosis bson.M
-	err = diagnosisCollection.FindOne(c.Context(), bson.M{"diagnosis_id": diagnosisID}).Decode(&existingDiagnosis)
-	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Diagnosis not found"})
-		}
-		h.logger.Error("failed to find diagnosis", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
-	}
-
-	h.logger.Debug("found diagnosis to delete",
-		zap.String("diagnosis_id", diagnosisID),
-		zap.String("appointment_id", fmt.Sprintf("%v", existingDiagnosis["appointment_id"])))
-
-	// Perform the delete operation directly
-	result, err := diagnosisCollection.DeleteOne(c.Context(), bson.M{"diagnosis_id": diagnosisID})
-
-	if err != nil {
-		h.logger.Error("failed to delete diagnosis", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to delete diagnosis"})
-	}
-
-	if result.DeletedCount == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Diagnosis not found"})
-	}
-
-	h.logger.Info("diagnosis deleted successfully",
-		zap.String("diagnosis_id", diagnosisID),
-		zap.Int64("deleted_count", result.DeletedCount))
-
-	// Prepare response
-	response := fiber.Map{
-		"message":       "Diagnosis deleted successfully",
-		"diagnosis_id":  diagnosisID,
-		"deleted_count": result.DeletedCount,
-		"deleted_at":    time.Now(),
-	}
-
-	return c.Status(fiber.StatusOK).JSON(response)
-}
-
-// GetDiagnosis retrieves a diagnosis by ID
+// GetDiagnosis retrieves a specific diagnosis by ID
 func (h *DiagnosisHandler) GetDiagnosis(c *fiber.Ctx) error {
 	diagnosisID := c.Params("id")
 	if diagnosisID == "" {
@@ -702,19 +564,85 @@ func (h *DiagnosisHandler) GetDiagnosis(c *fiber.Ctx) error {
 	}
 	h.logger.Debug("Auth ID", zap.String("authID", authID))
 
-	// Retrieve diagnosis from MongoDB
-	diagnosisCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("diagnoses")
-	var diagnosis bson.M
-	err = diagnosisCollection.FindOne(c.Context(), bson.M{"diagnosis_id": diagnosisID}).Decode(&diagnosis)
+	// Query to get diagnosis details
+	query := `
+		SELECT 
+			id, appointment_id, patient_id, doctor_id, org_id, patient_name, patient_age, 
+			patient_gender, doctor_name, doctor_specialty, temperature, blood_pressure, 
+			heart_rate, weight, height, bmi, chief_complaint, symptoms, physical_exam, 
+			primary_diagnosis, secondary_diagnoses, icd_codes, medications, procedures, 
+			recommendations, lab_orders, test_results, specialty, specialty_data, 
+			follow_up_date, follow_up_notes, referrals, status, clinical_notes, 
+			attachments, created_at, updated_at
+		FROM medical_diagnoses 
+		WHERE id = $1`
+
+	var diagnosis DiagnosisResponse
+	var symptomsJSON, medicationsJSON, testResultsJSON, attachmentsJSON []byte
+
+	err = h.pgPool.QueryRow(c.Context(), query, diagnosisID).Scan(
+		&diagnosis.ID,
+		&diagnosis.AppointmentID,
+		&diagnosis.PatientID,
+		&diagnosis.DoctorID,
+		&diagnosis.OrgID,
+		&diagnosis.PatientName,
+		&diagnosis.PatientAge,
+		&diagnosis.PatientGender,
+		&diagnosis.DoctorName,
+		&diagnosis.DoctorSpecialty,
+		&diagnosis.Vitals.Temperature,
+		&diagnosis.Vitals.BloodPressure,
+		&diagnosis.Vitals.HeartRate,
+		&diagnosis.Vitals.Weight,
+		&diagnosis.Vitals.Height,
+		&diagnosis.Vitals.BMI,
+		&diagnosis.ChiefComplaint,
+		&symptomsJSON,
+		&diagnosis.PhysicalExam,
+		&diagnosis.PrimaryDiagnosis,
+		&diagnosis.SecondaryDiagnoses,
+		&diagnosis.ICDCodes,
+		&medicationsJSON,
+		&diagnosis.TreatmentPlan.Procedures,
+		&diagnosis.TreatmentPlan.Recommendations,
+		&diagnosis.LabOrders,
+		&testResultsJSON,
+		&diagnosis.Specialty,
+		&diagnosis.SpecialtyData,
+		&diagnosis.FollowUpDate,
+		&diagnosis.FollowUpNotes,
+		&diagnosis.Referrals,
+		&diagnosis.Status,
+		&diagnosis.ClinicalNotes,
+		&attachmentsJSON,
+		&diagnosis.CreatedAt,
+		&diagnosis.UpdatedAt,
+	)
+
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if err == pgx.ErrNoRows {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Diagnosis not found"})
 		}
 		h.logger.Error("failed to retrieve diagnosis", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve diagnosis"})
 	}
 
-	h.logger.Debug("diagnosis retrieved successfully", zap.String("diagnosis_id", diagnosisID))
+	// Parse JSON fields
+	if symptomsJSON != nil {
+		json.Unmarshal(symptomsJSON, &diagnosis.Symptoms)
+	}
+	if medicationsJSON != nil {
+		json.Unmarshal(medicationsJSON, &diagnosis.TreatmentPlan.Medications)
+	}
+	if testResultsJSON != nil {
+		json.Unmarshal(testResultsJSON, &diagnosis.TestResults)
+	}
+	if attachmentsJSON != nil {
+		json.Unmarshal(attachmentsJSON, &diagnosis.Attachments)
+	}
+
+	h.logger.Info("diagnosis retrieved successfully", zap.String("diagnosis_id", diagnosisID))
 
 	return c.Status(fiber.StatusOK).JSON(fiber.Map{
 		"message":   "Diagnosis retrieved successfully",
@@ -722,8 +650,13 @@ func (h *DiagnosisHandler) GetDiagnosis(c *fiber.Ctx) error {
 	})
 }
 
-// ListDiagnoses retrieves diagnoses with optional filtering
-func (h *DiagnosisHandler) ListDiagnoses(c *fiber.Ctx) error {
+// GetMedicalHistory retrieves comprehensive medical history for a patient
+func (h *DiagnosisHandler) GetMedicalHistory(c *fiber.Ctx) error {
+	patientID := c.Params("id")
+	if patientID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Patient ID is required"})
+	}
+
 	// Get auth ID from context
 	authID, err := h.getAuthID(c)
 	if err != nil {
@@ -732,251 +665,335 @@ func (h *DiagnosisHandler) ListDiagnoses(c *fiber.Ctx) error {
 	}
 	h.logger.Debug("Auth ID", zap.String("authID", authID))
 
-	// Parse query parameters
+	// Get query parameters for filtering
 	orgID := c.Query("org_id")
-	patientID := c.Query("patient_id")
-	doctorID := c.Query("doctor_id")
-	status := c.Query("status")
-	appointmentID := c.Query("appointment_id")
+	limit := c.QueryInt("limit", 50) // Default to 50 records
+	offset := c.QueryInt("offset", 0)
+	status := c.Query("status", "finalized") // Default to finalized diagnoses
 
-	// Pagination parameters
-	page, _ := strconv.Atoi(c.Query("page", "1"))
-	limit, _ := strconv.Atoi(c.Query("limit", "10"))
-	if page < 1 {
-		page = 1
-	}
-	if limit < 1 || limit > 100 {
-		limit = 10
-	}
-	skip := (page - 1) * limit
+	// Build query with filters
+	baseQuery := `
+			SELECT 
+				id, appointment_id, doctor_name, doctor_specialty, temperature, blood_pressure, 
+				heart_rate, weight, height, bmi, chief_complaint, symptoms, physical_exam, 
+				primary_diagnosis, secondary_diagnoses, icd_codes, medications, procedures, 
+				recommendations, lab_orders, test_results, specialty, specialty_data, 
+				follow_up_date, follow_up_notes, referrals, status, clinical_notes, 
+				attachments, created_at, updated_at
+			FROM medical_diagnoses 
+			WHERE patient_id = $1`
 
-	// Build filter
-	filter := bson.M{}
+	args := []interface{}{patientID}
+	argCount := 2
+
+	// Add org filter if provided
 	if orgID != "" {
-		filter["org_id"] = orgID
+		baseQuery += fmt.Sprintf(" AND org_id = $%d", argCount)
+		args = append(args, orgID)
+		argCount++
 	}
-	if patientID != "" {
-		filter["patient_id"] = patientID
-	}
-	if doctorID != "" {
-		filter["doctor_id"] = doctorID
-	}
+
+	// Add status filter
 	if status != "" {
-		filter["status"] = status
-	}
-	if appointmentID != "" {
-		filter["appointment_id"] = appointmentID
+		baseQuery += fmt.Sprintf(" AND status = $%d", argCount)
+		args = append(args, status)
+		argCount++
 	}
 
-	// Set up collection and options
-	diagnosisCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("diagnoses")
-	findOptions := options.Find()
-	findOptions.SetSkip(int64(skip))
-	findOptions.SetLimit(int64(limit))
-	findOptions.SetSort(bson.D{{Key: "created_at", Value: -1}}) // Sort by creation date, newest first
+	// Order by created_at descending and add pagination
+	baseQuery += fmt.Sprintf(" ORDER BY created_at DESC LIMIT $%d OFFSET $%d", argCount, argCount+1)
+	args = append(args, limit, offset)
 
-	// Execute query
-	cursor, err := diagnosisCollection.Find(c.Context(), filter, findOptions)
+	h.logger.Debug("executing medical history query", zap.String("query", baseQuery))
+
+	rows, err := h.pgPool.Query(c.Context(), baseQuery, args...)
 	if err != nil {
-		h.logger.Error("failed to retrieve diagnoses", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
+		h.logger.Error("failed to retrieve medical history", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve medical history"})
 	}
-	defer cursor.Close(c.Context())
+	defer rows.Close()
 
-	// Decode results
-	var diagnoses []bson.M
-	if err = cursor.All(c.Context(), &diagnoses); err != nil {
-		h.logger.Error("failed to decode diagnoses", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
-	}
+	var medicalHistory []MedicalHistoryRecord
+	var patientInfo PatientSummary
 
-	// Get total count for pagination
-	totalCount, err := diagnosisCollection.CountDocuments(c.Context(), filter)
-	if err != nil {
-		h.logger.Error("failed to count diagnoses", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
-	}
+	for rows.Next() {
+		var record MedicalHistoryRecord
+		var symptomsJSON, medicationsJSON, testResultsJSON, attachmentsJSON []byte
 
-	totalPages := int(math.Ceil(float64(totalCount) / float64(limit)))
+		err := rows.Scan(
+			&record.ID,
+			&record.AppointmentID,
+			&record.DoctorName,
+			&record.DoctorSpecialty,
+			&record.Vitals.Temperature,
+			&record.Vitals.BloodPressure,
+			&record.Vitals.HeartRate,
+			&record.Vitals.Weight,
+			&record.Vitals.Height,
+			&record.Vitals.BMI,
+			&record.ChiefComplaint,
+			&symptomsJSON,
+			&record.PhysicalExam,
+			&record.PrimaryDiagnosis,
+			&record.SecondaryDiagnoses,
+			&record.ICDCodes,
+			&medicationsJSON,
+			&record.TreatmentPlan.Procedures,
+			&record.TreatmentPlan.Recommendations,
+			&record.LabOrders,
+			&testResultsJSON,
+			&record.Specialty,
+			&record.SpecialtyData,
+			&record.FollowUpDate,
+			&record.FollowUpNotes,
+			&record.Referrals,
+			&record.Status,
+			&record.ClinicalNotes,
+			&attachmentsJSON,
+			&record.CreatedAt,
+			&record.UpdatedAt,
+		)
 
-	h.logger.Debug("diagnoses retrieved successfully",
-		zap.Int("count", len(diagnoses)),
-		zap.Int64("total", totalCount),
-		zap.Int("page", page))
+		if err != nil {
+			h.logger.Error("failed to scan medical history record", zap.Error(err))
+			continue
+		}
 
-	return c.Status(fiber.StatusOK).JSON(fiber.Map{
-		"message":   "Diagnoses retrieved successfully",
-		"diagnoses": diagnoses,
-		"pagination": fiber.Map{
-			"page":        page,
-			"limit":       limit,
-			"total":       totalCount,
-			"total_pages": totalPages,
-			"has_next":    page < totalPages,
-			"has_prev":    page > 1,
-		},
-	})
-}
+		// Parse JSON fields
+		if symptomsJSON != nil {
+			json.Unmarshal(symptomsJSON, &record.Symptoms)
+		}
+		if medicationsJSON != nil {
+			json.Unmarshal(medicationsJSON, &record.TreatmentPlan.Medications)
+		}
+		if testResultsJSON != nil {
+			json.Unmarshal(testResultsJSON, &record.TestResults)
+		}
+		if attachmentsJSON != nil {
+			json.Unmarshal(attachmentsJSON, &record.Attachments)
+		}
 
-// MedicalHistoryRecord represents a diagnosis record for medical history
-type MedicalHistoryRecord struct {
-	ID                 string                `json:"id" bson:"diagnosis_id"`
-	DiagnosisName      string                `json:"diagnosis_name" bson:"diagnosis_name"`
-	PrimaryDiagnosis   string                `json:"primary_diagnosis" bson:"primary_diagnosis"`
-	SecondaryDiagnoses []string              `json:"secondary_diagnoses,omitempty" bson:"secondary_diagnoses"`
-	Symptoms           []string              `json:"symptoms,omitempty" bson:"symptoms"`
-	Severity           string                `json:"severity,omitempty" bson:"severity"`
-	Status             string                `json:"status" bson:"status"`
-	DiagnosisDate      time.Time             `json:"diagnosis_date" bson:"diagnosis_date"`
-	Notes              string                `json:"notes,omitempty" bson:"notes"`
-	Prescriptions      []PrescriptionHistory `json:"prescriptions,omitempty" bson:"prescriptions"`
-	CreatedAt          time.Time             `json:"created_at" bson:"created_at"`
-	// Note: Deliberately excluding doctor_id, doctor_name, org_id for privacy
-}
-
-// PrescriptionHistory represents prescription data for medical history
-type PrescriptionHistory struct {
-	MedicationName string `json:"medication_name" bson:"medication_name"`
-	Dosage         string `json:"dosage" bson:"dosage"`
-	Frequency      string `json:"frequency" bson:"frequency"`
-	Duration       string `json:"duration,omitempty" bson:"duration"`
-	Instructions   string `json:"instructions,omitempty" bson:"instructions"`
-}
-
-// MedicalHistoryResponse represents the response structure
-type MedicalHistoryResponse struct {
-	PatientID string                 `json:"patient_id"`
-	History   []MedicalHistoryRecord `json:"history"`
-	Total     int64                  `json:"total"`
-}
-
-// GetPatientMedicalHistory fetches comprehensive medical history for a patient
-func (h *DiagnosisHandler) GetPatientMedicalHistory(c *fiber.Ctx) error {
-	// Get organization ID from headers (required for authentication)
-	orgID := c.Get("X-Organization-ID")
-	if orgID == "" {
-		h.logger.Warn("missing organization ID in request headers")
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-			"error": "Organization ID is required",
-		})
+		medicalHistory = append(medicalHistory, record)
 	}
 
-	// Get user role from headers for authorization
-	userRole := c.Get("X-User-Role")
-	userID := c.Get("X-User-ID")
+	// Get patient summary information from the first record or a separate query
+	if len(medicalHistory) > 0 {
+		// Get patient basic info from the most recent record
+		patientQuery := `
+				SELECT DISTINCT patient_name, patient_age, patient_gender
+				FROM medical_diagnoses 
+				WHERE patient_id = $1 
+				ORDER BY created_at DESC 
+				LIMIT 1`
 
-	// Log the authenticated request
-	h.logger.Info("Received medical history request",
-		zap.String("orgID", orgID),
-		zap.String("userRole", userRole),
-		zap.String("userID", userID))
+		err = h.pgPool.QueryRow(c.Context(), patientQuery, patientID).Scan(
+			&patientInfo.PatientName,
+			&patientInfo.PatientAge,
+			&patientInfo.PatientGender,
+		)
 
-	// Get patient ID from URL params
-	patientID := c.Params("id")
-	if patientID == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Patient ID is required",
-		})
-	}
-
-	// Validate patient ID format (8-digit alphanumeric)
-	if !isValidPatientID(patientID) {
-		h.logger.Error("invalid patient ID format", zap.String("patient_id", patientID))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid patient ID format",
-		})
-	}
-
-	// Get optional query parameters
-	limit := c.QueryInt("limit", 50)
-	if limit > 100 {
-		limit = 100 // Cap at 100 records
-	}
-	includeActive := c.QueryBool("include_active", true)
-
-	// Build MongoDB query
-	filter := bson.M{"patient_id": patientID}
-
-	// Add organization filter if not cross-org request
-	crossOrg := c.QueryBool("cross_org", false)
-	if !crossOrg {
-		filter["organization_id"] = orgID
-	}
-
-	// Optionally exclude active/draft diagnoses
-	if !includeActive {
-		filter["status"] = bson.M{"$ne": "draft"}
-	}
-
-	// Get diagnoses collection
-	diagnosesCollection := h.mongoClient.Database(h.config.MongoDBName).Collection("diagnoses")
-
-	// Set up options for sorting and limiting
-	// FIXED: Use bson.D instead of bson.M for ordered sort parameters
-	opts := options.Find().
-		SetSort(bson.D{
-			{"diagnosis_date", -1},
-			{"created_at", -1},
-		}). // Most recent first
-		SetLimit(int64(limit))
-
-	// Execute query
-	cursor, err := diagnosesCollection.Find(c.Context(), filter, opts)
-	if err != nil {
-		h.logger.Error("failed to fetch medical history",
-			zap.Error(err),
-			zap.String("patient_id", patientID),
-			zap.String("organization_id", orgID))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to fetch medical history",
-		})
-	}
-	defer cursor.Close(c.Context())
-
-	// Decode results
-	var diagnoses []MedicalHistoryRecord
-	if err = cursor.All(c.Context(), &diagnoses); err != nil {
-		h.logger.Error("failed to decode medical history",
-			zap.Error(err),
-			zap.String("patient_id", patientID))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to process medical history",
-		})
-	}
-
-	// Get total count for pagination info
-	totalCount, err := diagnosesCollection.CountDocuments(c.Context(), filter)
-	if err != nil {
-		h.logger.Warn("failed to get total count", zap.Error(err))
-		totalCount = int64(len(diagnoses))
-	}
-
-	// Log successful response
-	h.logger.Info("Successfully retrieved medical history",
-		zap.String("patient_id", patientID),
-		zap.String("organization_id", orgID),
-		zap.Int("record_count", len(diagnoses)),
-		zap.Int64("total_count", totalCount))
-
-	// Format response
-	response := MedicalHistoryResponse{
-		PatientID: patientID,
-		History:   diagnoses,
-		Total:     totalCount,
-	}
-
-	return c.JSON(response)
-}
-
-// Helper function to validate patient ID format (8-digit alphanumeric)
-func isValidPatientID(patientID string) bool {
-	if len(patientID) != 8 {
-		return false
-	}
-	for _, char := range patientID {
-		if !((char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9')) {
-			return false
+		if err != nil && err != pgx.ErrNoRows {
+			h.logger.Error("failed to get patient info", zap.Error(err))
 		}
 	}
-	return true
+
+	// Get summary statistics
+	summary := h.generateMedicalSummary(medicalHistory)
+
+	h.logger.Info("medical history retrieved successfully",
+		zap.String("patient_id", patientID),
+		zap.Int("record_count", len(medicalHistory)))
+
+	response := fiber.Map{
+		"message": "Medical history retrieved successfully",
+		"patient_info": fiber.Map{
+			"patient_id":     patientID,
+			"patient_name":   patientInfo.PatientName,
+			"patient_age":    patientInfo.PatientAge,
+			"patient_gender": patientInfo.PatientGender,
+		},
+		"summary": summary,
+		"records": medicalHistory,
+		"pagination": fiber.Map{
+			"limit":        limit,
+			"offset":       offset,
+			"record_count": len(medicalHistory),
+		},
+	}
+
+	return c.Status(fiber.StatusOK).JSON(response)
+}
+
+// Helper function to generate medical summary
+func (h *DiagnosisHandler) generateMedicalSummary(records []MedicalHistoryRecord) MedicalSummary {
+	summary := MedicalSummary{
+		TotalVisits: len(records),
+		Diagnoses:   make(map[string]int),
+		Medications: make(map[string]int),
+		Allergies:   []string{},
+	}
+
+	if len(records) == 0 {
+		return summary
+	}
+
+	// Get date range
+	if len(records) > 0 {
+		summary.FirstVisit = &records[len(records)-1].CreatedAt
+		summary.LastVisit = &records[0].CreatedAt
+	}
+
+	// Aggregate diagnoses and medications
+	for _, record := range records {
+		// Count primary diagnoses
+		if record.PrimaryDiagnosis != "" {
+			summary.Diagnoses[record.PrimaryDiagnosis]++
+		}
+
+		// Count secondary diagnoses
+		for _, diagnosis := range record.SecondaryDiagnoses {
+			summary.Diagnoses[diagnosis]++
+		}
+
+		// Count medications
+		for _, medication := range record.TreatmentPlan.Medications {
+			if medication.Name != "" {
+				summary.Medications[medication.Name]++
+			}
+		}
+
+		// Collect chronic conditions (appearing in multiple visits)
+		// This is a simplified approach - you might want more sophisticated logic
+	}
+
+	// Identify chronic conditions (diagnoses appearing multiple times)
+	for diagnosis, count := range summary.Diagnoses {
+		if count >= 2 { // Appeared in 2 or more visits
+			summary.ChronicConditions = append(summary.ChronicConditions, diagnosis)
+		}
+	}
+
+	return summary
+}
+
+// Supporting structs for the response
+type DiagnosisResponse struct {
+	ID                 string         `json:"id"`
+	AppointmentID      string         `json:"appointment_id"`
+	PatientID          string         `json:"patient_id"`
+	DoctorID           string         `json:"doctor_id"`
+	OrgID              string         `json:"org_id"`
+	PatientName        *string        `json:"patient_name"`
+	PatientAge         *int           `json:"patient_age"`
+	PatientGender      *string        `json:"patient_gender"`
+	DoctorName         *string        `json:"doctor_name"`
+	DoctorSpecialty    *string        `json:"doctor_specialty"`
+	Vitals             VitalsResponse `json:"vitals"`
+	ChiefComplaint     *string        `json:"chief_complaint"`
+	Symptoms           []Symptom      `json:"symptoms"`
+	PhysicalExam       *string        `json:"physical_exam"`
+	PrimaryDiagnosis   string         `json:"primary_diagnosis"`
+	SecondaryDiagnoses []string       `json:"secondary_diagnoses"`
+	ICDCodes           []string       `json:"icd_codes"`
+	TreatmentPlan      TreatmentPlan  `json:"treatment_plan"`
+	LabOrders          []string       `json:"lab_orders"`
+	TestResults        []TestResult   `json:"test_results"`
+	Specialty          *string        `json:"specialty"`
+	SpecialtyData      interface{}    `json:"specialty_data"`
+	FollowUpDate       *time.Time     `json:"follow_up_date"`
+	FollowUpNotes      *string        `json:"follow_up_notes"`
+	Referrals          []string       `json:"referrals"`
+	Status             string         `json:"status"`
+	ClinicalNotes      *string        `json:"clinical_notes"`
+	Attachments        []Attachment   `json:"attachments"`
+	CreatedAt          time.Time      `json:"created_at"`
+	UpdatedAt          time.Time      `json:"updated_at"`
+}
+
+type VitalsResponse struct {
+	Temperature   *float64 `json:"temperature"`
+	BloodPressure *string  `json:"blood_pressure"`
+	HeartRate     *int     `json:"heart_rate"`
+	Weight        *float64 `json:"weight"`
+	Height        *float64 `json:"height"`
+	BMI           *float64 `json:"bmi"`
+}
+
+type MedicalHistoryRecord struct {
+	ID                 string         `json:"id"`
+	AppointmentID      string         `json:"appointment_id"`
+	DoctorName         *string        `json:"doctor_name"`
+	DoctorSpecialty    *string        `json:"doctor_specialty"`
+	Vitals             VitalsResponse `json:"vitals"`
+	ChiefComplaint     *string        `json:"chief_complaint"`
+	Symptoms           []Symptom      `json:"symptoms"`
+	PhysicalExam       *string        `json:"physical_exam"`
+	PrimaryDiagnosis   string         `json:"primary_diagnosis"`
+	SecondaryDiagnoses []string       `json:"secondary_diagnoses"`
+	ICDCodes           []string       `json:"icd_codes"`
+	TreatmentPlan      TreatmentPlan  `json:"treatment_plan"`
+	LabOrders          []string       `json:"lab_orders"`
+	TestResults        []TestResult   `json:"test_results"`
+	Specialty          *string        `json:"specialty"`
+	SpecialtyData      interface{}    `json:"specialty_data"`
+	FollowUpDate       *time.Time     `json:"follow_up_date"`
+	FollowUpNotes      *string        `json:"follow_up_notes"`
+	Referrals          []string       `json:"referrals"`
+	Status             string         `json:"status"`
+	ClinicalNotes      *string        `json:"clinical_notes"`
+	Attachments        []Attachment   `json:"attachments"`
+	CreatedAt          time.Time      `json:"created_at"`
+	UpdatedAt          time.Time      `json:"updated_at"`
+}
+
+type PatientSummary struct {
+	PatientName   *string `json:"patient_name"`
+	PatientAge    *int    `json:"patient_age"`
+	PatientGender *string `json:"patient_gender"`
+}
+
+type MedicalSummary struct {
+	TotalVisits       int            `json:"total_visits"`
+	FirstVisit        *time.Time     `json:"first_visit"`
+	LastVisit         *time.Time     `json:"last_visit"`
+	ChronicConditions []string       `json:"chronic_conditions"`
+	Diagnoses         map[string]int `json:"diagnoses"`
+	Medications       map[string]int `json:"medications"`
+	Allergies         []string       `json:"allergies"`
+}
+
+// You'll need these supporting structs if they don't exist
+type Symptom struct {
+	Name        string `json:"name"`
+	Severity    string `json:"severity"`
+	Duration    string `json:"duration"`
+	Description string `json:"description"`
+}
+
+type Medication struct {
+	Name         string `json:"name"`
+	Dosage       string `json:"dosage"`
+	Frequency    string `json:"frequency"`
+	Duration     string `json:"duration"`
+	Instructions string `json:"instructions"`
+}
+
+type TreatmentPlan struct {
+	Medications     []Medication `json:"medications"`
+	Procedures      []string     `json:"procedures"`
+	Recommendations *string      `json:"recommendations"`
+}
+
+type TestResult struct {
+	TestName string    `json:"test_name"`
+	Result   string    `json:"result"`
+	Date     time.Time `json:"date"`
+	Notes    string    `json:"notes"`
+}
+
+type Attachment struct {
+	FileName string `json:"file_name"`
+	FileType string `json:"file_type"`
+	FileSize int64  `json:"file_size"`
+	URL      string `json:"url"`
 }

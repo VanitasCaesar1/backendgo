@@ -50,28 +50,30 @@ func (h *MedicineHandler) SearchMedicines(c *fiber.Ctx) error {
 		h.logger.Error("search term is required")
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Search term is required"})
 	}
-
 	h.logger.Info("searching medicines", zap.String("searchTerm", searchTerm))
 
 	// Create context with timeout
 	ctx, cancel := context.WithTimeout(c.Context(), 5*time.Second)
 	defer cancel()
 
-	// Prepare the SQL query with pattern matching
+	// Prepare the SQL query with COALESCE to handle NULL values
 	query := `
-		SELECT id, code, name, unit, company 
-		FROM public.medicines 
-		WHERE 
-			name ILIKE $1 OR 
-			code ILIKE $1 OR 
-			company ILIKE $1
+		SELECT id, 
+		       COALESCE(code, '') as code,
+		       COALESCE(name, '') as name, 
+		       COALESCE(unit, '') as unit,
+		       COALESCE(company, '') as company
+		FROM public.medicines
+		WHERE
+			COALESCE(name, '') ILIKE $1 OR
+			COALESCE(code, '') ILIKE $1 OR
+			COALESCE(company, '') ILIKE $1
 		ORDER BY name ASC
 		LIMIT 50
 	`
 
 	// Add wildcard pattern for LIKE search
 	pattern := fmt.Sprintf("%%%s%%", searchTerm)
-
 	h.logger.Debug("executing database query",
 		zap.String("query", query),
 		zap.String("pattern", pattern))
@@ -83,7 +85,6 @@ func (h *MedicineHandler) SearchMedicines(c *fiber.Ctx) error {
 			zap.String("searchTerm", searchTerm),
 			zap.Error(err),
 			zap.String("errorType", "database_error"))
-
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to search medicines",
 		})
@@ -94,6 +95,7 @@ func (h *MedicineHandler) SearchMedicines(c *fiber.Ctx) error {
 	var medicines []Medicine
 	for rows.Next() {
 		var med Medicine
+		// Now scanning should work since COALESCE ensures no NULL values
 		if err := rows.Scan(&med.ID, &med.Code, &med.Name, &med.Unit, &med.Company); err != nil {
 			h.logger.Error("failed to scan medicine row",
 				zap.Error(err),
@@ -117,7 +119,6 @@ func (h *MedicineHandler) SearchMedicines(c *fiber.Ctx) error {
 	if len(medicines) == 0 {
 		h.logger.Info("no medicines found matching search term",
 			zap.String("searchTerm", searchTerm))
-
 		// Get total count of medicines for debugging
 		var count int
 		countErr := h.pgPool.QueryRow(ctx, "SELECT COUNT(*) FROM public.medicines").Scan(&count)
@@ -126,7 +127,6 @@ func (h *MedicineHandler) SearchMedicines(c *fiber.Ctx) error {
 		} else {
 			h.logger.Error("failed to count medicines", zap.Error(countErr))
 		}
-
 		return c.Status(fiber.StatusOK).JSON(fiber.Map{
 			"message":   "No medicines found matching the search term",
 			"medicines": []Medicine{},

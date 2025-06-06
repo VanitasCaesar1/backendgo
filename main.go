@@ -412,11 +412,10 @@ func (a *App) setupRoutes() error {
 		return fmt.Errorf("failed to initialize appointment handler: %v", err)
 	}
 
-	diagnosisHandler, err := handlers.NewDiagnosisHandler(a.Config, a.Redis, a.Logger, a.Postgres, a.MongoDB)
+	diagnosisHandler, err := handlers.NewDiagnosisHandler(a.Postgres, a.MongoDB, a.Logger)
 	if err != nil {
-		return fmt.Errorf("failed to initialize appointment handler: %v", err)
+		return fmt.Errorf("failed to initialize diagnosis handler: %v", err)
 	}
-
 	medicinesHandler := handlers.NewMedicineHandler(a.Postgres, a.Logger, a.Config, a.Redis, a.MongoDB)
 	// Initialize the WorkOS webhook handler with better error handling
 	workosWebhookHandler, err := handlers.NewWorkOSWebhookHandler(a.Config, a.Redis, a.Logger, a.Postgres)
@@ -541,22 +540,17 @@ func (a *App) setupRoutes() error {
 
 	// Appointments routes - protected
 	appointmentsGroup := a.Fiber.Group("/api/appointments", authMiddleware.Handler())
-	appointmentsGroup.Post("/create", appointmentHandler.CreateAppointment)
+	appointmentsGroup.Get("/org", appointmentHandler.GetAppointmentsByOrgID)
 	appointmentsGroup.Get("/:id", appointmentHandler.GetAppointment)
 	appointmentsGroup.Get("/doctor/:id", appointmentHandler.GetDoctorAppointments)
-	appointmentsGroup.Get("/", appointmentHandler.GetAppointmentsByOrgID) // Changed from "/organization/:orgID"
 	appointmentsGroup.Put("/:id", appointmentHandler.UpdateAppointment)
 	appointmentsGroup.Delete("/:id", appointmentHandler.DeleteAppointment)
 	appointmentsGroup.Post("/", appointmentHandler.CreateAppointment)
-	appointmentsGroup.Get("/:id", appointmentHandler.GetAppointment)
-	appointmentsGroup.Put("/:id", appointmentHandler.UpdateAppointment)
-	appointmentsGroup.Delete("/:id", appointmentHandler.DeleteAppointment)
 
 	diagnosisGroup := a.Fiber.Group("/api/diagnosis", authMiddleware.Handler())
 	diagnosisGroup.Get("/", diagnosisHandler.GetDiagnosis)
 	diagnosisGroup.Post("/create", diagnosisHandler.CreateDiagnosis)
 	diagnosisGroup.Put("/:id", diagnosisHandler.UpdateDiagnosis)
-	diagnosisGroup.Delete("/:id", diagnosisHandler.DeleteDiagnosis)
 
 	patientsGroup := a.Fiber.Group("/api/patients", authMiddleware.Handler())
 	patientsGroup.Get("/", appointmentHandler.GetAllPatients) // Add this line for listing all patients
@@ -566,7 +560,7 @@ func (a *App) setupRoutes() error {
 	patientsGroup.Post("/:id", appointmentHandler.PatientHandler)
 	patientsGroup.Delete("/:id", appointmentHandler.PatientHandler)
 	patientsGroup.Get("/search", appointmentHandler.SearchPatients)
-	patientsGroup.Get("/medical-history/:id", diagnosisHandler.GetPatientMedicalHistory)
+	patientsGroup.Get("/medical-history/:id", diagnosisHandler.GetMedicalHistory)
 
 	medicinesGroup := a.Fiber.Group("/api/medicines", authMiddleware.Handler())
 	medicinesGroup.Get("/search", medicinesHandler.SearchMedicines)
