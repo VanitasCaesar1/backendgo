@@ -412,7 +412,7 @@ func (a *App) setupRoutes() error {
 		return fmt.Errorf("failed to initialize appointment handler: %v", err)
 	}
 
-	diagnosisHandler, err := handlers.NewDiagnosisHandler(a.Postgres, a.MongoDB, a.Logger)
+	diagnosisHandler, err := handlers.NewDiagnosisHandler(a.Postgres, a.MongoDB, a.Logger, a.Config)
 	if err != nil {
 		return fmt.Errorf("failed to initialize diagnosis handler: %v", err)
 	}
@@ -548,9 +548,8 @@ func (a *App) setupRoutes() error {
 	appointmentsGroup.Post("/", appointmentHandler.CreateAppointment)
 
 	diagnosisGroup := a.Fiber.Group("/api/diagnosis", authMiddleware.Handler())
-	diagnosisGroup.Get("/", diagnosisHandler.GetDiagnosis)
+	diagnosisGroup.Get("/:id", diagnosisHandler.GetDiagnosis)
 	diagnosisGroup.Post("/create", diagnosisHandler.CreateDiagnosis)
-	diagnosisGroup.Put("/:id", diagnosisHandler.UpdateDiagnosis)
 
 	patientsGroup := a.Fiber.Group("/api/patients", authMiddleware.Handler())
 	patientsGroup.Get("/", appointmentHandler.GetAllPatients) // Add this line for listing all patients
