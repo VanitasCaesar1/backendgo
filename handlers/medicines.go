@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/VanitasCaesar1/backend/config"
@@ -42,7 +43,7 @@ func NewMedicineHandler(pgPool *pgxpool.Pool, logger *zap.Logger, cfg *config.Co
 	}
 }
 
-// SearchMedicines searches for medicines based on the provided search term
+// Enhanced SearchMedicines with comprehensive debugging - matches from first character
 func (h *MedicineHandler) SearchMedicines(c *fiber.Ctx) error {
 	// Get search term from query parameter
 	searchTerm := c.Query("term")
@@ -50,36 +51,100 @@ func (h *MedicineHandler) SearchMedicines(c *fiber.Ctx) error {
 		h.logger.Error("search term is required")
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Search term is required"})
 	}
-	h.logger.Info("searching medicines", zap.String("searchTerm", searchTerm))
+
+	// Log the exact search term received
+	h.logger.Info("searching medicines",
+		zap.String("searchTerm", searchTerm),
+		zap.String("searchTermLength", fmt.Sprintf("%d", len(searchTerm))),
+		zap.String("searchTermBytes", fmt.Sprintf("%x", []byte(searchTerm))))
+
+	// Get additional filters
+	company := c.Query("company")
+	unit := c.Query("unit")
+	limitStr := c.Query("limit", "50")
+
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 {
+		limit = 50
+	}
+
+	h.logger.Info("search parameters",
+		zap.String("company", company),
+		zap.String("unit", unit),
+		zap.Int("limit", limit))
 
 	// Create context with timeout
-	ctx, cancel := context.WithTimeout(c.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(c.Context(), 10*time.Second)
 	defer cancel()
 
-	// Prepare the SQL query with COALESCE to handle NULL values
-	query := `
-		SELECT id, 
-		       COALESCE(code, '') as code,
-		       COALESCE(name, '') as name, 
-		       COALESCE(unit, '') as unit,
-		       COALESCE(company, '') as company
+	// Build dynamic query based on filters
+	baseQuery := `
+		SELECT id,
+			COALESCE(code, '') as code,
+			COALESCE(name, '') as name,
+			COALESCE(unit, '') as unit,
+			COALESCE(company, '') as company
 		FROM public.medicines
-		WHERE
+		WHERE (
 			COALESCE(name, '') ILIKE $1 OR
 			COALESCE(code, '') ILIKE $1 OR
 			COALESCE(company, '') ILIKE $1
-		ORDER BY name ASC
-		LIMIT 50
-	`
+		)`
 
-	// Add wildcard pattern for LIKE search
-	pattern := fmt.Sprintf("%%%s%%", searchTerm)
+	var args []interface{}
+	argIndex := 2
+
+	// Add wildcard pattern for LIKE search - matches from first character
+	pattern := fmt.Sprintf("%s%%", searchTerm) // Changed from %%%s%% to %s%%
+	args = append(args, pattern)
+
+	// Add company filter if provided
+	if company != "" {
+		baseQuery += fmt.Sprintf(" AND COALESCE(company, '') ILIKE $%d", argIndex)
+		args = append(args, fmt.Sprintf("%s%%", company)) // Also changed for consistency
+		argIndex++
+	}
+
+	// Add unit filter if provided
+	if unit != "" {
+		baseQuery += fmt.Sprintf(" AND COALESCE(unit, '') ILIKE $%d", argIndex)
+		args = append(args, fmt.Sprintf("%s%%", unit)) // Also changed for consistency
+		argIndex++
+	}
+
+	// Add ordering and limit
+	baseQuery += fmt.Sprintf(" ORDER BY name ASC LIMIT $%d", argIndex)
+	args = append(args, limit)
+
 	h.logger.Debug("executing database query",
-		zap.String("query", query),
-		zap.String("pattern", pattern))
+		zap.String("query", baseQuery),
+		zap.String("pattern", pattern),
+		zap.Any("args", args))
 
-	// Execute the query
-	rows, err := h.pgPool.Query(ctx, query, pattern)
+	// First, let's test if the table has data and our connection works
+	var totalCount int
+	countQuery := "SELECT COUNT(*) FROM public.medicines"
+	if err := h.pgPool.QueryRow(ctx, countQuery).Scan(&totalCount); err != nil {
+		h.logger.Error("failed to count total medicines", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Database connection issue",
+		})
+	}
+	h.logger.Info("total medicines in database", zap.Int("totalCount", totalCount))
+
+	// Test a simple query to see if basic search works
+	testQuery := `SELECT COUNT(*) FROM public.medicines WHERE COALESCE(name, '') ILIKE $1`
+	var matchCount int
+	if err := h.pgPool.QueryRow(ctx, testQuery, pattern).Scan(&matchCount); err != nil {
+		h.logger.Error("failed to test pattern matching", zap.Error(err))
+	} else {
+		h.logger.Info("pattern match test",
+			zap.String("pattern", pattern),
+			zap.Int("matchCount", matchCount))
+	}
+
+	// Execute the main query
+	rows, err := h.pgPool.Query(ctx, baseQuery, args...)
 	if err != nil {
 		h.logger.Error("failed to search medicines",
 			zap.String("searchTerm", searchTerm),
@@ -93,9 +158,9 @@ func (h *MedicineHandler) SearchMedicines(c *fiber.Ctx) error {
 
 	// Parse the results
 	var medicines []Medicine
+	rowCount := 0
 	for rows.Next() {
 		var med Medicine
-		// Now scanning should work since COALESCE ensures no NULL values
 		if err := rows.Scan(&med.ID, &med.Code, &med.Name, &med.Unit, &med.Company); err != nil {
 			h.logger.Error("failed to scan medicine row",
 				zap.Error(err),
@@ -103,6 +168,16 @@ func (h *MedicineHandler) SearchMedicines(c *fiber.Ctx) error {
 			continue
 		}
 		medicines = append(medicines, med)
+		rowCount++
+
+		// Log first few results for debugging
+		if rowCount <= 3 {
+			h.logger.Debug("found medicine",
+				zap.Int("id", med.ID),
+				zap.String("name", med.Name),
+				zap.String("code", med.Code),
+				zap.String("company", med.Company))
+		}
 	}
 
 	// Check for errors during iteration
@@ -115,30 +190,20 @@ func (h *MedicineHandler) SearchMedicines(c *fiber.Ctx) error {
 		})
 	}
 
-	// Check if no medicines were found
-	if len(medicines) == 0 {
-		h.logger.Info("no medicines found matching search term",
-			zap.String("searchTerm", searchTerm))
-		// Get total count of medicines for debugging
-		var count int
-		countErr := h.pgPool.QueryRow(ctx, "SELECT COUNT(*) FROM public.medicines").Scan(&count)
-		if countErr == nil {
-			h.logger.Info("total medicines in table", zap.Int("count", count))
-		} else {
-			h.logger.Error("failed to count medicines", zap.Error(countErr))
-		}
-		return c.Status(fiber.StatusOK).JSON(fiber.Map{
-			"message":   "No medicines found matching the search term",
-			"medicines": []Medicine{},
-		})
-	}
-
-	h.logger.Info("medicines retrieved successfully",
+	h.logger.Info("search completed",
 		zap.String("searchTerm", searchTerm),
-		zap.Int("count", len(medicines)))
+		zap.Int("resultsFound", len(medicines)),
+		zap.Int("totalInDatabase", totalCount))
 
+	// Return results (even if empty)
 	return c.Status(fiber.StatusOK).JSON(fiber.Map{
-		"message":   "Medicines retrieved successfully",
+		"message":   fmt.Sprintf("Found %d medicines matching '%s'", len(medicines), searchTerm),
 		"medicines": medicines,
+		"debug": fiber.Map{
+			"searchTerm":      searchTerm,
+			"pattern":         pattern,
+			"totalInDatabase": totalCount,
+			"resultsFound":    len(medicines),
+		},
 	})
 }

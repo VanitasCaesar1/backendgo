@@ -540,6 +540,8 @@ func (a *App) setupRoutes() error {
 
 	// Appointments routes - protected
 	appointmentsGroup := a.Fiber.Group("/api/appointments", authMiddleware.Handler())
+	appointmentsGroup.Post("/create", appointmentHandler.CreateAppointment)
+
 	appointmentsGroup.Get("/org", appointmentHandler.GetAppointmentsByOrgID)
 	appointmentsGroup.Get("/:id", appointmentHandler.GetAppointment)
 	appointmentsGroup.Get("/doctor/:id", appointmentHandler.GetDoctorAppointments)

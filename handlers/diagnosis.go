@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +27,12 @@ type DiagnosisHandler struct {
 	logger      *zap.Logger
 }
 
+type Treatment struct {
+	Medications     []Medication `json:"medications"`
+	Procedures      []string     `json:"procedures"`
+	Recommendations *string      `json:"recommendations"`
+}
+
 type DiagnosisRequest struct {
 	AppointmentID   string  `json:"appointment_id" validate:"required,uuid"`
 	PatientID       string  `json:"patient_id" validate:"required"`
@@ -36,20 +43,34 @@ type DiagnosisRequest struct {
 	PatientGender   *string `json:"patient_gender,omitempty" validate:"omitempty,oneof=male female other"`
 	DoctorName      *string `json:"doctor_name,omitempty"`
 	DoctorSpecialty *string `json:"doctor_specialty,omitempty"`
-	// Vitals - directly in the struct, not nested
-	Temperature      *float64 `json:"temperature,string"`
-	BloodPressure    string   `json:"blood_pressure"`
-	HeartRate        *int     `json:"heart_rate,string"`
-	Weight           *float64 `json:"weight,string"`
-	Height           *float64 `json:"height"`
-	BMI              *float64 `json:"bmi"`
-	RespiratoryRate  *int     `json:"respiratory_rate,string"`
-	OxygenSaturation *int     `json:"oxygen_saturation,string"`
 
-	ChiefComplaint     *string          `json:"chief_complaint,omitempty"`
-	Symptoms           []Symptom        `json:"symptoms" validate:"required,min=1,dive"`
+	// Vitals as strings to match frontend input
+	Temperature      string `json:"temperature"`
+	BloodPressure    string `json:"blood_pressure"`
+	HeartRate        string `json:"heart_rate"`
+	Weight           string `json:"weight"`
+	Height           string `json:"height"`
+	BMI              string `json:"bmi"`
+	RespiratoryRate  string `json:"respiratory_rate"`
+	OxygenSaturation string `json:"oxygen_saturation"`
+
+	// Main complaint and symptoms
+	ChiefComplaint   *string   `json:"chief_complaint,omitempty"`
+	PrimaryComplaint *string   `json:"primary_complaint,omitempty"` // New field
+	Symptoms         []Symptom `json:"symptoms"`
+
+	// New symptom-related fields
+	SymptomTimeline          *json.RawMessage `json:"symptom_timeline,omitempty"`
+	SymptomSummary           *json.RawMessage `json:"symptom_summary,omitempty"`
+	SymptomCategories        []string         `json:"symptom_categories,omitempty"`
+	SymptomTriggers          *json.RawMessage `json:"symptom_triggers,omitempty"`
+	SymptomRelievingFactors  *json.RawMessage `json:"symptom_relieving_factors,omitempty"`
+	SymptomQualityDetails    *json.RawMessage `json:"symptom_quality_details,omitempty"`
+	SymptomProgression       *json.RawMessage `json:"symptom_progression,omitempty"`
+	SymptomRadiationPatterns *json.RawMessage `json:"symptom_radiation_patterns,omitempty"`
+
 	PhysicalExam       *string          `json:"physical_exam,omitempty"`
-	PrimaryDiagnosis   string           `json:"primary_diagnosis" validate:"required"`
+	PrimaryDiagnosis   string           `json:"primary_diagnosis"`
 	SecondaryDiagnoses []string         `json:"secondary_diagnoses,omitempty"`
 	ICDCodes           []string         `json:"icd_codes,omitempty"`
 	Status             string           `json:"status" validate:"required,oneof=draft finalized amended"`
@@ -66,28 +87,6 @@ type DiagnosisRequest struct {
 	Referrals          []string         `json:"referrals,omitempty"`
 	ClinicalNotes      *string          `json:"clinical_notes,omitempty"`
 	Attachments        []Attachment     `json:"attachments,omitempty"`
-}
-
-// VitalsData represents vital signs data
-type VitalsData struct {
-	Temperature   *float64 `json:"temperature,omitempty"`
-	BloodPressure *string  `json:"blood_pressure,omitempty"`
-	HeartRate     *int     `json:"heart_rate,omitempty"`
-	Weight        *float64 `json:"weight,omitempty"`
-	Height        *float64 `json:"height,omitempty"`
-	BMI           *float64 `json:"bmi,omitempty"`
-}
-
-// Treatment represents treatment plan
-type Treatment struct {
-	Medications     []Medication `json:"medications,omitempty"`
-	Procedures      []string     `json:"procedures,omitempty"`
-	Recommendations *string      `json:"recommendations,omitempty"`
-}
-
-// Implement Valuer interface for PostgreSQL JSON fields
-func (s Symptom) Value() (driver.Value, error) {
-	return json.Marshal(s)
 }
 
 func (t Treatment) Value() (driver.Value, error) {
@@ -152,15 +151,106 @@ func (h *DiagnosisHandler) validateDiagnosisRequest(req *DiagnosisRequest) error
 		return errors.New("invalid doctor ID format")
 	}
 
-	// Validate vitals ranges
-	if req.Temperature != nil && (*req.Temperature < 35.0 || *req.Temperature > 43.0) {
-		return errors.New("temperature must be between 95.0 and 110.0")
+	// Validate vitals ranges (now handling string fields)
+	if req.Temperature != "" {
+		temp, err := strconv.ParseFloat(req.Temperature, 64)
+		if err != nil {
+			return errors.New("invalid temperature format")
+		}
+		if temp < 35.0 || temp > 43.0 {
+			return errors.New("temperature must be between 35.0 and 43.0 degrees Celsius")
+		}
 	}
-	if req.HeartRate != nil && (*req.HeartRate < 30 || *req.HeartRate > 250) {
-		return errors.New("heart rate must be between 30 and 250")
+
+	if req.HeartRate != "" {
+		hr, err := strconv.Atoi(req.HeartRate)
+		if err != nil {
+			return errors.New("invalid heart rate format")
+		}
+		if hr < 30 || hr > 250 {
+			return errors.New("heart rate must be between 30 and 250 bpm")
+		}
 	}
-	if req.BMI != nil && (*req.BMI < 10.0 || *req.BMI > 60.0) {
-		return errors.New("BMI must be between 10.0 and 60.0")
+
+	if req.BMI != "" {
+		bmi, err := strconv.ParseFloat(req.BMI, 64)
+		if err != nil {
+			return errors.New("invalid BMI format")
+		}
+		if bmi < 10.0 || bmi > 60.0 {
+			return errors.New("BMI must be between 10.0 and 60.0")
+		}
+	}
+
+	// Additional validations for other vitals
+	if req.Weight != "" {
+		weight, err := strconv.ParseFloat(req.Weight, 64)
+		if err != nil {
+			return errors.New("invalid weight format")
+		}
+		if weight < 0.5 || weight > 1000.0 {
+			return errors.New("weight must be between 0.5 and 1000.0 kg")
+		}
+	}
+
+	if req.Height != "" {
+		height, err := strconv.ParseFloat(req.Height, 64)
+		if err != nil {
+			return errors.New("invalid height format")
+		}
+		if height < 30.0 || height > 300.0 {
+			return errors.New("height must be between 30.0 and 300.0 cm")
+		}
+	}
+
+	if req.RespiratoryRate != "" {
+		rr, err := strconv.Atoi(req.RespiratoryRate)
+		if err != nil {
+			return errors.New("invalid respiratory rate format")
+		}
+		if rr < 5 || rr > 60 {
+			return errors.New("respiratory rate must be between 5 and 60 breaths per minute")
+		}
+	}
+
+	if req.OxygenSaturation != "" {
+		os, err := strconv.ParseFloat(req.OxygenSaturation, 64)
+		if err != nil {
+			return errors.New("invalid oxygen saturation format")
+		}
+		if os < 70.0 || os > 100.0 {
+			return errors.New("oxygen saturation must be between 70.0 and 100.0 percent")
+		}
+	}
+
+	// Validate blood pressure format (e.g., "120/80")
+	if req.BloodPressure != "" {
+		parts := strings.Split(req.BloodPressure, "/")
+		if len(parts) != 2 {
+			return errors.New("blood pressure must be in format 'systolic/diastolic' (e.g., '120/80')")
+		}
+
+		systolic, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+		if err != nil {
+			return errors.New("invalid systolic blood pressure format")
+		}
+
+		diastolic, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if err != nil {
+			return errors.New("invalid diastolic blood pressure format")
+		}
+
+		if systolic < 70 || systolic > 250 {
+			return errors.New("systolic blood pressure must be between 70 and 250 mmHg")
+		}
+
+		if diastolic < 40 || diastolic > 150 {
+			return errors.New("diastolic blood pressure must be between 40 and 150 mmHg")
+		}
+
+		if systolic <= diastolic {
+			return errors.New("systolic blood pressure must be greater than diastolic")
+		}
 	}
 
 	return nil
@@ -208,7 +298,27 @@ func (h *DiagnosisHandler) validateAppointmentExists(c *fiber.Ctx, appointmentID
 	return nil
 }
 
-// Fixed CreateDiagnosis function
+// Helper function to safely convert string to float64 pointer
+func stringToFloat64Ptr(s string) *float64 {
+	if s == "" {
+		return nil
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return &f
+	}
+	return nil
+}
+
+// Helper function to safely convert string to int pointer
+func stringToIntPtr(s string) *int {
+	if s == "" {
+		return nil
+	}
+	if i, err := strconv.Atoi(s); err == nil {
+		return &i
+	}
+	return nil
+}
 func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 	// Get auth ID from context
 	authID, err := h.getAuthID(c)
@@ -218,29 +328,65 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 	}
 	h.logger.Debug("Auth ID", zap.String("authID", authID))
 
+	// Log raw request body for debugging
+	rawBody := c.Body()
+	h.logger.Debug("raw request body", zap.String("body", string(rawBody)))
+
 	// Parse diagnosis data from request body
 	var diagnosisRequest DiagnosisRequest
 	if err := c.BodyParser(&diagnosisRequest); err != nil {
-		h.logger.Error("failed to parse diagnosis data", zap.Error(err))
+		h.logger.Error("failed to parse diagnosis data",
+			zap.Error(err),
+			zap.String("raw_body", string(rawBody)))
+
+		// Check if symptoms field is a string instead of array
+		var rawRequest map[string]interface{}
+		if jsonErr := json.Unmarshal(rawBody, &rawRequest); jsonErr == nil {
+			if symptoms, exists := rawRequest["symptoms"]; exists {
+				h.logger.Error("symptoms field type mismatch",
+					zap.Any("symptoms_type", fmt.Sprintf("%T", symptoms)),
+					zap.Any("symptoms_value", symptoms))
+			}
+		}
+
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error":   "Invalid request format",
 			"details": err.Error(),
 		})
 	}
 
-	// Log the parsed request for debugging
+	// Log the parsed request for debugging INCLUDING clinical_notes
 	h.logger.Debug("parsed diagnosis request",
 		zap.String("appointment_id", diagnosisRequest.AppointmentID),
 		zap.String("patient_id", diagnosisRequest.PatientID),
 		zap.String("doctor_id", diagnosisRequest.DoctorID),
 		zap.String("org_id", diagnosisRequest.OrgID),
-		zap.String("status", diagnosisRequest.Status))
+		zap.String("status", diagnosisRequest.Status),
+		zap.Int("symptoms_count", len(diagnosisRequest.Symptoms)),
+		zap.Any("clinical_notes", diagnosisRequest.ClinicalNotes))
 
 	// Additional custom validations
 	if err := h.validateDiagnosisRequest(&diagnosisRequest); err != nil {
 		h.logger.Error("custom validation failed", zap.Error(err))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
+
+	// Convert string vitals to proper database types with better validation
+	temperature := stringToFloat64Ptr(diagnosisRequest.Temperature)
+	heartRate := stringToIntPtr(diagnosisRequest.HeartRate)
+	weight := stringToFloat64Ptr(diagnosisRequest.Weight)
+	height := stringToFloat64Ptr(diagnosisRequest.Height)
+	bmi := stringToFloat64Ptr(diagnosisRequest.BMI)
+	respiratoryRate := stringToIntPtr(diagnosisRequest.RespiratoryRate)
+	oxygenSaturation := stringToIntPtr(diagnosisRequest.OxygenSaturation)
+
+	// Log vital signs conversion for debugging
+	h.logger.Debug("vital signs converted",
+		zap.Any("temperature", temperature),
+		zap.Any("heart_rate", heartRate),
+		zap.Any("weight", weight),
+		zap.Any("height", height),
+		zap.Any("bmi", bmi))
 
 	// Check if appointment exists and belongs to the organization
 	if err := h.validateAppointmentExists(c, diagnosisRequest.AppointmentID, diagnosisRequest.OrgID); err != nil {
@@ -254,41 +400,188 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Internal server error"})
 	}
 
-	// Prepare JSON fields - FIX: Handle medications properly
+	// Prepare JSON fields with better error handling
 	var symptomsJSON, medicationsJSON, testResultsJSON, attachmentsJSON []byte
+	var symptomTimelineJSON, symptomSummaryJSON, symptomTriggersJSON []byte
+	var symptomRelievingFactorsJSON, symptomQualityDetailsJSON []byte
+	var symptomProgressionJSON, symptomRadiationPatternsJSON []byte
+	var specialtyDataJSON []byte
+
+	// Handle symptoms - ensure we always have valid JSON
 	if len(diagnosisRequest.Symptoms) > 0 {
-		symptomsJSON, _ = json.Marshal(diagnosisRequest.Symptoms)
+		symptomsJSON, err = json.Marshal(diagnosisRequest.Symptoms)
+		if err != nil {
+			h.logger.Error("failed to marshal symptoms", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid symptoms data"})
+		}
+		h.logger.Debug("symptoms marshaled successfully", zap.String("json", string(symptomsJSON)))
+	} else {
+		symptomsJSON = []byte("[]") // Default to empty array
+		h.logger.Debug("using empty symptoms array")
 	}
 
-	// FIX: Check for medications directly in request, not nested in TreatmentPlan
+	// Handle medications from request or TreatmentPlan
 	if len(diagnosisRequest.Medications) > 0 {
-		medicationsJSON, _ = json.Marshal(diagnosisRequest.Medications)
+		medicationsJSON, err = json.Marshal(diagnosisRequest.Medications)
+		if err != nil {
+			h.logger.Error("failed to marshal medications", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid medications data"})
+		}
 	} else if diagnosisRequest.TreatmentPlan != nil && len(diagnosisRequest.TreatmentPlan.Medications) > 0 {
-		// Fallback to TreatmentPlan if medications are nested there
-		medicationsJSON, _ = json.Marshal(diagnosisRequest.TreatmentPlan.Medications)
+		medicationsJSON, err = json.Marshal(diagnosisRequest.TreatmentPlan.Medications)
+		if err != nil {
+			h.logger.Error("failed to marshal treatment plan medications", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid treatment plan medications data"})
+		}
+	} else {
+		medicationsJSON = []byte("[]") // Default to empty array
 	}
 
+	// Handle test results
 	if len(diagnosisRequest.TestResults) > 0 {
-		testResultsJSON, _ = json.Marshal(diagnosisRequest.TestResults)
+		testResultsJSON, err = json.Marshal(diagnosisRequest.TestResults)
+		if err != nil {
+			h.logger.Error("failed to marshal test results", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid test results data"})
+		}
+	} else {
+		testResultsJSON = []byte("[]") // Default to empty array
 	}
+
+	// Handle attachments
 	if len(diagnosisRequest.Attachments) > 0 {
-		attachmentsJSON, _ = json.Marshal(diagnosisRequest.Attachments)
+		attachmentsJSON, err = json.Marshal(diagnosisRequest.Attachments)
+		if err != nil {
+			h.logger.Error("failed to marshal attachments", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid attachments data"})
+		}
+	} else {
+		attachmentsJSON = []byte("[]") // Default to empty array
 	}
+
+	// Handle symptom-related JSON fields with proper validation
+	if diagnosisRequest.SymptomTimeline != nil {
+		// Validate JSON
+		var temp interface{}
+		if err := json.Unmarshal(*diagnosisRequest.SymptomTimeline, &temp); err != nil {
+			h.logger.Error("invalid symptom timeline JSON", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid symptom timeline data"})
+		}
+		symptomTimelineJSON = *diagnosisRequest.SymptomTimeline
+	} else {
+		symptomTimelineJSON = nil // Use NULL instead of empty JSON
+	}
+
+	if diagnosisRequest.SymptomSummary != nil {
+		// Validate JSON
+		var temp interface{}
+		if err := json.Unmarshal(*diagnosisRequest.SymptomSummary, &temp); err != nil {
+			h.logger.Error("invalid symptom summary JSON", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid symptom summary data"})
+		}
+		symptomSummaryJSON = *diagnosisRequest.SymptomSummary
+	} else {
+		symptomSummaryJSON = nil
+	}
+
+	if diagnosisRequest.SymptomTriggers != nil {
+		// Validate JSON
+		var temp interface{}
+		if err := json.Unmarshal(*diagnosisRequest.SymptomTriggers, &temp); err != nil {
+			h.logger.Error("invalid symptom triggers JSON", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid symptom triggers data"})
+		}
+		symptomTriggersJSON = *diagnosisRequest.SymptomTriggers
+	} else {
+		symptomTriggersJSON = nil
+	}
+
+	if diagnosisRequest.SymptomRelievingFactors != nil {
+		// Validate JSON
+		var temp interface{}
+		if err := json.Unmarshal(*diagnosisRequest.SymptomRelievingFactors, &temp); err != nil {
+			h.logger.Error("invalid symptom relieving factors JSON", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid symptom relieving factors data"})
+		}
+		symptomRelievingFactorsJSON = *diagnosisRequest.SymptomRelievingFactors
+	} else {
+		symptomRelievingFactorsJSON = nil
+	}
+
+	if diagnosisRequest.SymptomQualityDetails != nil {
+		// Validate JSON
+		var temp interface{}
+		if err := json.Unmarshal(*diagnosisRequest.SymptomQualityDetails, &temp); err != nil {
+			h.logger.Error("invalid symptom quality details JSON", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid symptom quality details data"})
+		}
+		symptomQualityDetailsJSON = *diagnosisRequest.SymptomQualityDetails
+	} else {
+		symptomQualityDetailsJSON = nil
+	}
+
+	if diagnosisRequest.SymptomProgression != nil {
+		// Validate JSON
+		var temp interface{}
+		if err := json.Unmarshal(*diagnosisRequest.SymptomProgression, &temp); err != nil {
+			h.logger.Error("invalid symptom progression JSON", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid symptom progression data"})
+		}
+		symptomProgressionJSON = *diagnosisRequest.SymptomProgression
+	} else {
+		symptomProgressionJSON = nil
+	}
+
+	if diagnosisRequest.SymptomRadiationPatterns != nil {
+		// Validate JSON
+		var temp interface{}
+		if err := json.Unmarshal(*diagnosisRequest.SymptomRadiationPatterns, &temp); err != nil {
+			h.logger.Error("invalid symptom radiation patterns JSON", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid symptom radiation patterns data"})
+		}
+		symptomRadiationPatternsJSON = *diagnosisRequest.SymptomRadiationPatterns
+	} else {
+		symptomRadiationPatternsJSON = nil
+	}
+
+	// Handle specialty data
+	if diagnosisRequest.SpecialtyData != nil {
+		// Validate JSON
+		var temp interface{}
+		if err := json.Unmarshal(*diagnosisRequest.SpecialtyData, &temp); err != nil {
+			h.logger.Error("invalid specialty data JSON", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid specialty data"})
+		}
+		specialtyDataJSON = *diagnosisRequest.SpecialtyData
+	} else {
+		specialtyDataJSON = nil
+	}
+
+	// Add debug logging to see what we're actually inserting
+	h.logger.Debug("JSON data being processed",
+		zap.String("symptoms", string(symptomsJSON)),
+		zap.Bool("symptom_timeline_present", symptomTimelineJSON != nil),
+		zap.Bool("symptom_summary_present", symptomSummaryJSON != nil),
+		zap.Int("symptom_categories_count", len(diagnosisRequest.SymptomCategories)),
+		zap.Any("clinical_notes_value", diagnosisRequest.ClinicalNotes))
 
 	// Get procedures and recommendations from treatment plan OR direct fields
 	var procedures []string
 	var recommendations *string
 
-	// Check if procedures/recommendations are in TreatmentPlan or direct fields
 	if diagnosisRequest.TreatmentPlan != nil {
 		procedures = diagnosisRequest.TreatmentPlan.Procedures
 		recommendations = diagnosisRequest.TreatmentPlan.Recommendations
 	} else {
-		// If not in TreatmentPlan, check direct fields
 		procedures = diagnosisRequest.Procedures
 		if diagnosisRequest.Recommendations != "" {
 			recommendations = &diagnosisRequest.Recommendations
 		}
+	}
+
+	// Ensure procedures is not nil
+	if procedures == nil {
+		procedures = []string{}
 	}
 
 	var diagnosisID string
@@ -297,7 +590,8 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 
 	if exists {
 		// Update existing diagnosis
-		isUpdate = true
+		h.logger.Info("updating existing diagnosis", zap.String("diagnosis_id", existingDiagnosisID))
+
 		updateQuery := `
 			UPDATE medical_diagnoses SET
 				patient_id = $2,
@@ -327,64 +621,85 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 				test_results = $26,
 				specialty = $27,
 				specialty_data = $28,
-				follow_up_date = $29,
-				follow_up_notes = $30,
-				referrals = $31,
-				status = $32,
-				clinical_notes = $33,
-				attachments = $34,
+				referrals = $29,
+				status = $30,
+				clinical_notes = $31,
+				attachments = $32,
+				respiratory_rate = $33,
+				oxygen_saturation = $34,
+				symptom_timeline = $35,
+				symptom_summary = $36,
+				primary_complaint = $37,
+				symptom_categories = $38,
+				symptom_triggers = $39,
+				symptom_relieving_factors = $40,
+				symptom_quality_details = $41,
+				symptom_progression = $42,
+				symptom_radiation_patterns = $43,
 				updated_at = CURRENT_TIMESTAMP
 			WHERE id = $1
 			RETURNING id, created_at, updated_at`
 
-		err = h.pgPool.QueryRow(c.Context(), updateQuery,
-			existingDiagnosisID,
-			diagnosisRequest.PatientID,
-			diagnosisRequest.DoctorID,
-			diagnosisRequest.OrgID,
-			diagnosisRequest.PatientName,
-			diagnosisRequest.PatientAge,
-			diagnosisRequest.PatientGender,
-			diagnosisRequest.DoctorName,
-			diagnosisRequest.DoctorSpecialty,
-			// FIX: Access vitals directly from diagnosisRequest, not nested Vitals struct
-			diagnosisRequest.Temperature,
-			diagnosisRequest.BloodPressure,
-			diagnosisRequest.HeartRate,
-			diagnosisRequest.Weight,
-			diagnosisRequest.Height,
-			diagnosisRequest.BMI,
-			diagnosisRequest.ChiefComplaint,
-			symptomsJSON,
-			diagnosisRequest.PhysicalExam,
-			diagnosisRequest.PrimaryDiagnosis,
-			pq.Array(diagnosisRequest.SecondaryDiagnoses),
-			pq.Array(diagnosisRequest.ICDCodes),
-			medicationsJSON,
-			pq.Array(procedures),
-			recommendations,
-			pq.Array(diagnosisRequest.LabOrders),
-			testResultsJSON,
-			diagnosisRequest.Specialty,
-			diagnosisRequest.SpecialtyData,
-			diagnosisRequest.FollowUpDate,
-			diagnosisRequest.FollowUpNotes,
-			pq.Array(diagnosisRequest.Referrals),
-			diagnosisRequest.Status,
-			diagnosisRequest.ClinicalNotes,
-			attachmentsJSON,
-		).Scan(&diagnosisID, &createdAt, &updatedAt)
-
-		if err != nil {
-			h.logger.Error("failed to update diagnosis", zap.Error(err))
+		if err = h.pgPool.QueryRow(c.Context(), updateQuery,
+			existingDiagnosisID,               // $1
+			diagnosisRequest.PatientID,        // $2
+			diagnosisRequest.DoctorID,         // $3
+			diagnosisRequest.OrgID,            // $4
+			diagnosisRequest.PatientName,      // $5
+			diagnosisRequest.PatientAge,       // $6
+			diagnosisRequest.PatientGender,    // $7
+			diagnosisRequest.DoctorName,       // $8
+			diagnosisRequest.DoctorSpecialty,  // $9
+			temperature,                       // $10
+			diagnosisRequest.BloodPressure,    // $11
+			heartRate,                         // $12
+			weight,                            // $13
+			height,                            // $14
+			bmi,                               // $15
+			diagnosisRequest.ChiefComplaint,   // $16
+			symptomsJSON,                      // $17
+			diagnosisRequest.PhysicalExam,     // $18
+			diagnosisRequest.PrimaryDiagnosis, // $19
+			pq.Array(diagnosisRequest.SecondaryDiagnoses), // $20
+			pq.Array(diagnosisRequest.ICDCodes),           // $21
+			medicationsJSON,                               // $22
+			pq.Array(procedures),                          // $23
+			recommendations,                               // $24
+			pq.Array(diagnosisRequest.LabOrders),          // $25
+			testResultsJSON,                               // $26
+			diagnosisRequest.Specialty,                    // $27
+			specialtyDataJSON,                             // $28
+			pq.Array(diagnosisRequest.Referrals),          // $29
+			diagnosisRequest.Status,                       // $30
+			diagnosisRequest.ClinicalNotes,                // $31
+			attachmentsJSON,                               // $32
+			respiratoryRate,                               // $33
+			oxygenSaturation,                              // $34
+			symptomTimelineJSON,                           // $35
+			symptomSummaryJSON,                            // $36
+			diagnosisRequest.PrimaryComplaint,             // $37
+			pq.Array(diagnosisRequest.SymptomCategories),  // $38
+			symptomTriggersJSON,                           // $39
+			symptomRelievingFactorsJSON,                   // $40
+			symptomQualityDetailsJSON,                     // $41
+			symptomProgressionJSON,                        // $42
+			symptomRadiationPatternsJSON,                  // $43
+		).Scan(&diagnosisID, &createdAt, &updatedAt); err != nil {
+			h.logger.Error("failed to update diagnosis",
+				zap.Error(err),
+				zap.String("diagnosis_id", existingDiagnosisID),
+				zap.String("appointment_id", diagnosisRequest.AppointmentID))
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update diagnosis"})
 		}
-
+		isUpdate = true
 		h.logger.Info("diagnosis updated successfully",
 			zap.String("diagnosis_id", diagnosisID),
 			zap.String("appointment_id", diagnosisRequest.AppointmentID))
+
 	} else {
-		// Create new diagnosis - FIX: Use consistent array handling
+		// Create new diagnosis
+		h.logger.Info("creating new diagnosis", zap.String("appointment_id", diagnosisRequest.AppointmentID))
+
 		insertQuery := `
 			INSERT INTO medical_diagnoses (
 				appointment_id, patient_id, doctor_id, org_id, patient_name, patient_age, 
@@ -392,48 +707,60 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 				heart_rate, weight, height, bmi, chief_complaint, symptoms, physical_exam, 
 				primary_diagnosis, secondary_diagnoses, icd_codes, medications, procedures, 
 				recommendations, lab_orders, test_results, specialty, specialty_data, 
-				follow_up_date, follow_up_notes, referrals, status, clinical_notes, attachments
+				referrals, status, clinical_notes, attachments,
+				respiratory_rate, oxygen_saturation, symptom_timeline, symptom_summary, 
+				primary_complaint, symptom_categories, symptom_triggers, symptom_relieving_factors,
+				symptom_quality_details, symptom_progression, symptom_radiation_patterns
 			) VALUES (
 				$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 
-				$18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34
+				$18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, 
+				$33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43
 			) RETURNING id, created_at`
 
 		err = h.pgPool.QueryRow(c.Context(), insertQuery,
-			diagnosisRequest.AppointmentID,
-			diagnosisRequest.PatientID,
-			diagnosisRequest.DoctorID,
-			diagnosisRequest.OrgID,
-			diagnosisRequest.PatientName,
-			diagnosisRequest.PatientAge,
-			diagnosisRequest.PatientGender,
-			diagnosisRequest.DoctorName,
-			diagnosisRequest.DoctorSpecialty,
-			// FIX: Access vitals directly from diagnosisRequest, not nested Vitals struct
-			diagnosisRequest.Temperature,
-			diagnosisRequest.BloodPressure,
-			diagnosisRequest.HeartRate,
-			diagnosisRequest.Weight,
-			diagnosisRequest.Height,
-			diagnosisRequest.BMI,
-			diagnosisRequest.ChiefComplaint,
-			symptomsJSON,
-			diagnosisRequest.PhysicalExam,
-			diagnosisRequest.PrimaryDiagnosis,
-			pq.Array(diagnosisRequest.SecondaryDiagnoses), // FIX: Use pq.Array consistently
-			pq.Array(diagnosisRequest.ICDCodes),           // FIX: Use pq.Array consistently
-			medicationsJSON,
-			pq.Array(procedures),
-			recommendations,
-			pq.Array(diagnosisRequest.LabOrders), // FIX: Use pq.Array consistently
-			testResultsJSON,
-			diagnosisRequest.Specialty,
-			diagnosisRequest.SpecialtyData,
-			diagnosisRequest.FollowUpDate,
-			diagnosisRequest.FollowUpNotes,
-			pq.Array(diagnosisRequest.Referrals), // FIX: Use pq.Array consistently
-			diagnosisRequest.Status,
-			diagnosisRequest.ClinicalNotes,
-			attachmentsJSON,
+			diagnosisRequest.AppointmentID,                // $1
+			diagnosisRequest.PatientID,                    // $2
+			diagnosisRequest.DoctorID,                     // $3
+			diagnosisRequest.OrgID,                        // $4
+			diagnosisRequest.PatientName,                  // $5
+			diagnosisRequest.PatientAge,                   // $6
+			diagnosisRequest.PatientGender,                // $7
+			diagnosisRequest.DoctorName,                   // $8
+			diagnosisRequest.DoctorSpecialty,              // $9
+			temperature,                                   // $10
+			diagnosisRequest.BloodPressure,                // $11
+			heartRate,                                     // $12
+			weight,                                        // $13
+			height,                                        // $14
+			bmi,                                           // $15
+			diagnosisRequest.ChiefComplaint,               // $16
+			symptomsJSON,                                  // $17
+			diagnosisRequest.PhysicalExam,                 // $18
+			diagnosisRequest.PrimaryDiagnosis,             // $19
+			pq.Array(diagnosisRequest.SecondaryDiagnoses), // $20
+			pq.Array(diagnosisRequest.ICDCodes),           // $21
+			medicationsJSON,                               // $22
+			pq.Array(procedures),                          // $23
+			recommendations,                               // $24
+			pq.Array(diagnosisRequest.LabOrders),          // $25
+			testResultsJSON,                               // $26
+			diagnosisRequest.Specialty,                    // $27
+			specialtyDataJSON,                             // $28
+			pq.Array(diagnosisRequest.Referrals),          // $29
+			diagnosisRequest.Status,                       // $30
+			diagnosisRequest.ClinicalNotes,                // $31
+			attachmentsJSON,                               // $32
+			respiratoryRate,                               // $33
+			oxygenSaturation,                              // $34
+			symptomTimelineJSON,                           // $35
+			symptomSummaryJSON,                            // $36
+			diagnosisRequest.PrimaryComplaint,             // $37
+			pq.Array(diagnosisRequest.SymptomCategories),  // $38
+			symptomTriggersJSON,                           // $39
+			symptomRelievingFactorsJSON,                   // $40
+			symptomQualityDetailsJSON,                     // $41
+			symptomProgressionJSON,                        // $42
+			symptomRadiationPatternsJSON,                  // $43
 		).Scan(&diagnosisID, &createdAt)
 
 		if err != nil {
@@ -444,7 +771,7 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create diagnosis"})
 		}
 
-		updatedAt = createdAt // For new records, updated_at equals created_at
+		updatedAt = createdAt
 		h.logger.Info("diagnosis created successfully",
 			zap.String("diagnosis_id", diagnosisID),
 			zap.String("appointment_id", diagnosisRequest.AppointmentID))
