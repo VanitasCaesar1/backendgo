@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -43,11 +44,14 @@ type DoctorRegistrationRequest struct {
 	AadhaarID  string `json:"aadhaar_id"`
 
 	// Doctor-specific details
-	IMRNumber      string `json:"imrNumber"`
-	Age            int    `json:"age"`
-	Specialization string `json:"specialization"`
-	Qualification  string `json:"qualification"`
-	SlotDuration   int    `json:"slotDuration"`
+	IMRNumber         string   `json:"imrNumber"`
+	Age               int      `json:"age"`
+	Specialization    string   `json:"specialization"`
+	Qualification     string   `json:"qualification"`
+	SlotDuration      int      `json:"slotDuration"`
+	LanguagesSpoken   []string `json:"languagesSpoken"`
+	YearsOfExperience int      `json:"yearsOfExperience"`
+	Bio               string   `json:"bio"`
 }
 
 type DoctorLoginRequest struct {
@@ -82,7 +86,6 @@ func (h *DoctorAuthHandler) tryDeleteWorkOSUser(ctx context.Context, workosUserI
 			zap.String("workos_id", workosUserID))
 	}
 }
-
 func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 	var req DoctorRegistrationRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -92,6 +95,7 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 		})
 	}
 
+	// Validate Aadhaar ID format
 	if req.AadhaarID != "" {
 		aadhaarRegex := regexp.MustCompile(`^\d{12}$`)
 		if !aadhaarRegex.MatchString(req.AadhaarID) {
@@ -101,13 +105,30 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 		}
 	}
 
+	// Validate mobile number format
+	if req.Mobile != "" {
+		mobileRegex := regexp.MustCompile(`^\d{10}$`)
+		if !mobileRegex.MatchString(req.Mobile) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Invalid mobile number format. Must be exactly 10 digits.",
+			})
+		}
+	}
+
+	// Validate age
+	if req.Age < 18 || req.Age > 120 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Age must be between 18 and 120",
+		})
+	}
+
 	// Check if user already exists with this email, username, or Aadhaar ID
 	var emailExists, usernameExists, aadhaarExists bool
 	err := h.pgPool.QueryRow(c.Context(),
 		`SELECT
             EXISTS(SELECT 1 FROM users WHERE email = $1),
             EXISTS(SELECT 1 FROM users WHERE username = $2),
-            EXISTS(SELECT 1 FROM users WHERE aadhaar_id = $3)`,
+            EXISTS(SELECT 1 FROM users WHERE aadhaar_id = $3 AND aadhaar_id != '')`,
 		req.Email, req.Username, req.AadhaarID).Scan(&emailExists, &usernameExists, &aadhaarExists)
 	if err != nil {
 		h.logger.Error("failed to check user existence", zap.Error(err))
@@ -126,7 +147,7 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 			"error": "This username is already taken",
 		})
 	}
-	if aadhaarExists {
+	if aadhaarExists && req.AadhaarID != "" {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 			"error": "This Aadhaar ID is already registered",
 		})
@@ -135,14 +156,22 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 	// Create user ID first so we can use it as ExternalID in WorkOS
 	userID := uuid.New()
 
+	// Parse name for WorkOS
+	nameParts := strings.Split(strings.TrimSpace(req.Name), " ")
+	firstName := nameParts[0]
+	lastName := ""
+	if len(nameParts) > 1 {
+		lastName = strings.Join(nameParts[1:], " ")
+	}
+
 	// Create user in WorkOS with the userID as ExternalID
 	workosUser, err := usermanagement.CreateUser(
 		c.Context(),
 		usermanagement.CreateUserOpts{
 			Email:      req.Email,
 			Password:   req.Password,
-			FirstName:  strings.Split(req.Name, " ")[0],
-			LastName:   strings.Join(strings.Split(req.Name, " ")[1:], " "),
+			FirstName:  firstName,
+			LastName:   lastName,
 			ExternalID: userID.String(),
 		},
 	)
@@ -165,14 +194,27 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 		})
 	}
 
-	// Assuming req.Specialization is a string or struct that needs to be converted to JSON
-	// Convert string value to JSON object
+	// Prepare specialization JSON
 	var specializationJSON string
 	if req.Specialization != "" {
 		// Create a simple JSON object with a "name" field
-		specializationJSON = fmt.Sprintf(`{"name":"%s"}`, req.Specialization)
+		specializationJSON = fmt.Sprintf(`{"name":"%s"}`, strings.ReplaceAll(req.Specialization, `"`, `\"`))
 	} else {
 		specializationJSON = "{}"
+	}
+
+	// Prepare languages spoken JSON
+	var languagesJSON string
+	if len(req.LanguagesSpoken) > 0 {
+		languagesBytes, err := json.Marshal(req.LanguagesSpoken)
+		if err != nil {
+			h.logger.Error("failed to marshal languages", zap.Error(err))
+			languagesJSON = "[]"
+		} else {
+			languagesJSON = string(languagesBytes)
+		}
+	} else {
+		languagesJSON = "[]"
 	}
 
 	// Create a transaction
@@ -188,13 +230,15 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 
 	// Parse mobile number
 	var mobile int64
-	_, err = fmt.Sscanf(req.Mobile, "%d", &mobile)
-	if err != nil {
-		h.logger.Error("failed to parse mobile number", zap.Error(err))
-		h.tryDeleteWorkOSUser(c.Context(), workosUser.ID, "mobile parsing failure")
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid mobile number format",
-		})
+	if req.Mobile != "" {
+		_, err = fmt.Sscanf(req.Mobile, "%d", &mobile)
+		if err != nil {
+			h.logger.Error("failed to parse mobile number", zap.Error(err))
+			h.tryDeleteWorkOSUser(c.Context(), workosUser.ID, "mobile parsing failure")
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Invalid mobile number format",
+			})
+		}
 	}
 
 	// Insert into users table
@@ -233,12 +277,54 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 			zap.Error(err),
 			zap.String("email", req.Email))
 		h.tryDeleteWorkOSUser(c.Context(), workosUser.ID, "database failure")
+
+		// Check for constraint violations
+		if strings.Contains(err.Error(), "duplicate key") {
+			if strings.Contains(err.Error(), "email") {
+				return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+					"error": "This email is already registered",
+				})
+			}
+			if strings.Contains(err.Error(), "username") {
+				return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+					"error": "This username is already taken",
+				})
+			}
+			if strings.Contains(err.Error(), "aadhaar_id") {
+				return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+					"error": "This Aadhaar ID is already registered",
+				})
+			}
+		}
+
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to create user profile",
 		})
 	}
 
-	// Then use insertedUserID for the doctors table insertion
+	// Set default values for doctor fields
+	imrNumber := req.IMRNumber
+	if imrNumber == "" {
+		imrNumber = "PENDING" // Default value for pending verification
+	}
+
+	qualification := req.Qualification
+	if qualification == "" {
+		qualification = "Not specified"
+	}
+
+	slotDuration := req.SlotDuration
+	if slotDuration == 0 {
+		slotDuration = 30 // Default 30 minutes
+	}
+
+	yearsOfExperience := req.YearsOfExperience
+	bio := req.Bio
+	if bio == "" {
+		bio = ""
+	}
+
+	// Insert into doctors table
 	_, err = tx.Exec(c.Context(),
 		`INSERT INTO doctors (
             doctor_id,
@@ -248,16 +334,22 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
             specialization,
             qualification,
             slot_duration,
-            is_active
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            is_active,
+            years_of_experience,
+            bio,
+            languages_spoken
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		insertedUserID, // Use the ID generated by the database
 		req.Name,
-		req.IMRNumber,
+		imrNumber,
 		req.Age,
 		specializationJSON,
-		req.Qualification,
-		req.SlotDuration,
+		qualification,
+		slotDuration,
 		false, // is_active defaults to false until verified
+		yearsOfExperience,
+		bio,
+		languagesJSON,
 	)
 	if err != nil {
 		h.logger.Error("failed to create doctor in database",
