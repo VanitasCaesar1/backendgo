@@ -386,15 +386,24 @@ func (h *DoctorAuthHandler) GetDoctorProfile(c *fiber.Ctx) error {
 
 	// Convert NullXXX types to pointer types for JSON marshaling
 	response := fiber.Map{
-		"user_id":    doctorProfile.UserID,
-		"doctor_id":  doctorProfile.DoctorID,
-		"auth_id":    doctorProfile.AuthID,
-		"name":       doctorProfile.Name,
-		"email":      doctorProfile.Email,
-		"mobile":     doctorProfile.Mobile,
-		"username":   doctorProfile.Username,
-		"aadhaar_id": doctorProfile.AadhaarID,
-		"is_active":  doctorProfile.IsActive,
+		"user_id":        doctorProfile.UserID,
+		"doctor_id":      doctorProfile.DoctorID,
+		"auth_id":        doctorProfile.AuthID,
+		"name":           doctorProfile.Name,
+		"specialization": doctorProfile.Specialization,
+		"qualification":  doctorProfile.Qualification,
+		"profile_pic":    doctorProfile.ProfilePic,
+		"imr_number":     doctorProfile.IMRNumber,
+		"age":            doctorProfile.Age,
+		"slot_duration":  doctorProfile.SlotDuration,
+		"blood_group":    doctorProfile.BloodGroup,
+		"location":       doctorProfile.Location,
+		"address":        doctorProfile.Address,
+		"email":          doctorProfile.Email,
+		"mobile":         doctorProfile.Mobile,
+		"username":       doctorProfile.Username,
+		"aadhaar_id":     doctorProfile.AadhaarID,
+		"is_active":      doctorProfile.IsActive,
 	}
 
 	// Conditionally add fields that might be NULL
