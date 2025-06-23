@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -29,25 +30,34 @@ type DoctorAuthHandler struct {
 }
 
 type DoctorRegistrationRequest struct {
-	// User details
-	Email      string `json:"email"`
-	Password   string `json:"password"`
-	Name       string `json:"name"`
-	Mobile     string `json:"mobile"`
-	BloodGroup string `json:"bloodGroup"`
-	Location   string `json:"location"`
-	Address    string `json:"address"`
-	Username   string `json:"username"`
+	// User fields
+	Email      string `json:"email" validate:"required,email"`
+	Password   string `json:"password" validate:"required,min=8"`
+	Name       string `json:"name" validate:"required"`
+	Username   string `json:"username" validate:"required,min=3"`
+	Mobile     string `json:"mobile" validate:"required"`
+	BloodGroup string `json:"bloodGroup" validate:"required"`
+	Location   string `json:"location" validate:"required"`
+	Address    string `json:"address" validate:"required"`
+	AadhaarID  string `json:"aadhaarID" validate:"required,len=12"`
+	Age        int    `json:"age" validate:"required,min=18,max=120"`
 	ProfilePic string `json:"profilePic"`
-	HospitalID string `json:"hospitalId"`
-	AadhaarID  string `json:"aadhaar_id"`
 
-	// Doctor-specific details
-	IMRNumber      string `json:"imrNumber"`
-	Age            int    `json:"age"`
-	Specialization string `json:"specialization"`
-	Qualification  string `json:"qualification"`
-	SlotDuration   int    `json:"slotDuration"`
+	// Doctor-specific fields
+	IMRNumber      string `json:"imrNumber" validate:"required"`
+	Specialization string `json:"specialization" validate:"required"`
+	Qualification  string `json:"qualification" validate:"required"`
+	SlotDuration   int    `json:"slotDuration" validate:"required,min=15,max=120"`
+
+	// Additional optional fields
+	YearsOfExperience    int      `json:"yearsOfExperience"`
+	ConsultationFee      float64  `json:"consultationFee"`
+	MedicalLicenseNumber string   `json:"medicalLicenseNumber"`
+	HospitalAffiliation  string   `json:"hospitalAffiliation"`
+	Bio                  string   `json:"bio"`
+	LanguagesSpoken      []string `json:"languagesSpoken"`
+	AvailableDays        []string `json:"availableDays"`
+	ConsultationType     string   `json:"consultationType"`
 }
 
 type DoctorLoginRequest struct {
@@ -92,6 +102,14 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 		})
 	}
 
+	// Validate required fields
+	if req.Email == "" || req.Password == "" || req.Name == "" || req.Username == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Missing required fields",
+		})
+	}
+
+	// Validate Aadhaar ID
 	if req.AadhaarID != "" {
 		aadhaarRegex := regexp.MustCompile(`^\d{12}$`)
 		if !aadhaarRegex.MatchString(req.AadhaarID) {
@@ -101,14 +119,25 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 		}
 	}
 
-	// Check if user already exists with this email, username, or Aadhaar ID
-	var emailExists, usernameExists, aadhaarExists bool
+	// Validate IMR Number (assuming it should be alphanumeric)
+	if req.IMRNumber != "" {
+		imrRegex := regexp.MustCompile(`^[A-Za-z0-9]+$`)
+		if !imrRegex.MatchString(req.IMRNumber) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Invalid IMR number format",
+			})
+		}
+	}
+
+	// Check if user already exists with this email, username, Aadhaar ID, or IMR number
+	var emailExists, usernameExists, aadhaarExists, imrExists bool
 	err := h.pgPool.QueryRow(c.Context(),
 		`SELECT
             EXISTS(SELECT 1 FROM users WHERE email = $1),
             EXISTS(SELECT 1 FROM users WHERE username = $2),
-            EXISTS(SELECT 1 FROM users WHERE aadhaar_id = $3)`,
-		req.Email, req.Username, req.AadhaarID).Scan(&emailExists, &usernameExists, &aadhaarExists)
+            EXISTS(SELECT 1 FROM users WHERE aadhaar_id = $3),
+            EXISTS(SELECT 1 FROM doctors WHERE imr_number = $4)`,
+		req.Email, req.Username, req.AadhaarID, req.IMRNumber).Scan(&emailExists, &usernameExists, &aadhaarExists, &imrExists)
 	if err != nil {
 		h.logger.Error("failed to check user existence", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
@@ -129,6 +158,11 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 	if aadhaarExists {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
 			"error": "This Aadhaar ID is already registered",
+		})
+	}
+	if imrExists {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error": "This IMR number is already registered",
 		})
 	}
 
@@ -165,15 +199,17 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 		})
 	}
 
-	// Assuming req.Specialization is a string or struct that needs to be converted to JSON
-	// Convert string value to JSON object
+	// Convert specialization to JSON
 	var specializationJSON string
 	if req.Specialization != "" {
-		// Create a simple JSON object with a "name" field
 		specializationJSON = fmt.Sprintf(`{"name":"%s"}`, req.Specialization)
 	} else {
 		specializationJSON = "{}"
 	}
+
+	// Convert arrays to JSON for database storage
+	languagesJSON, _ := json.Marshal(req.LanguagesSpoken)
+	availableDaysJSON, _ := json.Marshal(req.AvailableDays)
 
 	// Create a transaction
 	tx, err := h.pgPool.Begin(c.Context())
@@ -215,7 +251,7 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
             auth_id
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         RETURNING user_id`,
-		userID, // Use the pre-generated UUID
+		userID,
 		req.ProfilePic,
 		req.Name,
 		mobile,
@@ -238,7 +274,7 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 		})
 	}
 
-	// Then use insertedUserID for the doctors table insertion
+	// Insert into doctors table with additional fields
 	_, err = tx.Exec(c.Context(),
 		`INSERT INTO doctors (
             doctor_id,
@@ -248,9 +284,17 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
             specialization,
             qualification,
             slot_duration,
-            is_active
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		insertedUserID, // Use the ID generated by the database
+            is_active,
+            years_of_experience,
+            consultation_fee,
+            medical_license_number,
+            hospital_affiliation,
+            bio,
+            languages_spoken,
+            available_days,
+            consultation_type
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+		insertedUserID,
 		req.Name,
 		req.IMRNumber,
 		req.Age,
@@ -258,6 +302,14 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 		req.Qualification,
 		req.SlotDuration,
 		false, // is_active defaults to false until verified
+		req.YearsOfExperience,
+		req.ConsultationFee,
+		req.MedicalLicenseNumber,
+		req.HospitalAffiliation,
+		req.Bio,
+		string(languagesJSON),
+		string(availableDaysJSON),
+		req.ConsultationType,
 	)
 	if err != nil {
 		h.logger.Error("failed to create doctor in database",
@@ -405,7 +457,7 @@ func (h *DoctorAuthHandler) GetDoctorProfile(c *fiber.Ctx) error {
 		"aadhaar_id":     doctorProfile.AadhaarID,
 		"is_active":      doctorProfile.IsActive,
 	}
-
+	fmt.Println("Doctor Profile Response:", response)
 	// Conditionally add fields that might be NULL
 	if doctorProfile.BloodGroup.Valid {
 		response["blood_group"] = doctorProfile.BloodGroup.String

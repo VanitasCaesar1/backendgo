@@ -82,6 +82,9 @@ type DoctorProfile struct {
 	HospitalID        uuid.UUID      `json:"hospital_id,omitempty"`
 	CreatedAt         string         `json:"created_at,omitempty"`
 	UpdatedAt         string         `json:"updated_at,omitempty"`
+	YearsOfExperience int            `json:"years_of_experience,omitempty"`
+	Bio               string         `json:"bio,omitempty"`
+	LanguagesSpoken   []string       `json:"languages_spoken,omitempty"`
 }
 
 // DoctorSchedule struct with ID field
@@ -448,20 +451,64 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid doctor ID format"})
 	}
 
-	var updateData DoctorProfile
+	// Updated DoctorProfileUpdate struct to include all fields
+	type DoctorProfileUpdate struct {
+		Username          string         `json:"username"`
+		Name              string         `json:"name"`
+		Mobile            string         `json:"mobile"`
+		BloodGroup        string         `json:"blood_group"`
+		Location          string         `json:"location"`
+		Address           string         `json:"address"`
+		IMRNumber         *string        `json:"imr_number"` // pointer to allow null
+		Age               int            `json:"age"`
+		Specialization    Specialization `json:"specialization"`
+		IsActive          bool           `json:"is_active"`
+		Qualification     string         `json:"qualification"`
+		SlotDuration      int            `json:"slot_duration"`
+		YearsOfExperience int            `json:"years_of_experience"`
+		Bio               string         `json:"bio"`
+		LanguagesSpoken   []string       `json:"languages_spoken"`
+	}
+
+	var updateData DoctorProfileUpdate
 	if err := c.BodyParser(&updateData); err != nil {
 		h.logger.Error("failed to parse update data", zap.Error(err))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request data"})
 	}
 
-	// DEBUG: Log the received data
+	// DEBUG: Log the received data with more details
 	h.logger.Info("Received update data",
 		zap.String("username", updateData.Username),
 		zap.String("name", updateData.Name),
 		zap.Int("age", updateData.Age),
-		zap.Any("specialization", updateData.Specialization))
+		zap.Any("specialization", updateData.Specialization),
+		zap.Any("imr_number", updateData.IMRNumber),
+		zap.Int("years_of_experience", updateData.YearsOfExperience),
+		zap.String("bio", updateData.Bio),
+		zap.Strings("languages_spoken", updateData.LanguagesSpoken))
 
-	if err := h.validateDoctorProfileUpdate(&updateData); err != nil {
+	// Convert DoctorProfileUpdate to DoctorProfile for validation
+	profileForValidation := DoctorProfile{
+		Username:          updateData.Username,
+		Name:              updateData.Name,
+		Mobile:            updateData.Mobile,
+		BloodGroup:        updateData.BloodGroup,
+		Location:          updateData.Location,
+		Address:           updateData.Address,
+		IMRNumber:         "",
+		Age:               updateData.Age,
+		Specialization:    updateData.Specialization,
+		IsActive:          updateData.IsActive,
+		Qualification:     updateData.Qualification,
+		SlotDuration:      updateData.SlotDuration,
+		YearsOfExperience: updateData.YearsOfExperience,
+		Bio:               updateData.Bio,
+		LanguagesSpoken:   updateData.LanguagesSpoken,
+	}
+	if updateData.IMRNumber != nil {
+		profileForValidation.IMRNumber = *updateData.IMRNumber
+	}
+	if err := h.validateDoctorProfileUpdate(&profileForValidation); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
@@ -480,10 +527,7 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		}
 	}()
 
-	// Optional: Add authorization check to ensure the authenticated user can update this doctor
-	// You might want to check if the authenticated user is the same doctor or has admin privileges
-
-	// Use the doctor ID from URL parameter instead of getting it from auth
+	// Use the doctor ID from URL parameter
 	userID := doctorUUID
 
 	// Check if username is being changed and if it conflicts with existing usernames
@@ -497,7 +541,7 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 	}
 
 	// If username is changing, check if the new username already exists (case-insensitive)
-	if strings.ToLower(updateData.Username) != strings.ToLower(currentUsername) {
+	if !strings.EqualFold(updateData.Username, currentUsername) {
 		var usernameExists bool
 		err = tx.QueryRow(c.Context(),
 			"SELECT EXISTS(SELECT 1 FROM users WHERE LOWER(username) = LOWER($1) AND user_id != $2)",
@@ -534,8 +578,17 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process specialization data"})
 	}
 
-	// DEBUG: Log specialization JSON
-	h.logger.Info("Specialization JSON", zap.String("json", string(specializationJSON)))
+	// Convert languages_spoken to JSON
+	languagesJSON, err := json.Marshal(updateData.LanguagesSpoken)
+	if err != nil {
+		h.logger.Error("failed to marshal languages to JSON", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process languages data"})
+	}
+
+	// DEBUG: Log JSON data
+	h.logger.Info("JSON data",
+		zap.String("specialization_json", string(specializationJSON)),
+		zap.String("languages_json", string(languagesJSON)))
 
 	// Update users table first
 	userResult, err := tx.Exec(c.Context(),
@@ -562,16 +615,30 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "User not found"})
 	}
 
-	// Handle doctor table update/insert
+	// Handle doctor table update/insert with all fields
 	var doctorResult pgconn.CommandTag
 	if !doctorExists {
 		// INSERT new doctor record
 		h.logger.Info("Inserting new doctor record", zap.String("userID", userID.String()))
-		doctorResult, err = tx.Exec(c.Context(),
-			`INSERT INTO doctors (doctor_id, name, imr_number, age, specialization, is_active, qualification, slot_duration)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-			userID, updateData.Name, updateData.IMRNumber, updateData.Age,
-			specializationJSON, updateData.IsActive, updateData.Qualification, updateData.SlotDuration)
+
+		if updateData.IMRNumber != nil {
+			// IMR number was provided (could be empty string or actual value)
+			doctorResult, err = tx.Exec(c.Context(),
+				`INSERT INTO doctors (doctor_id, name, imr_number, age, specialization, is_active, qualification, slot_duration, years_of_experience, bio, languages_spoken)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+				userID, updateData.Name, *updateData.IMRNumber, updateData.Age,
+				specializationJSON, updateData.IsActive, updateData.Qualification, updateData.SlotDuration,
+				updateData.YearsOfExperience, updateData.Bio, languagesJSON)
+		} else {
+			// IMR number was not provided, insert without it (will be NULL)
+			doctorResult, err = tx.Exec(c.Context(),
+				`INSERT INTO doctors (doctor_id, name, age, specialization, is_active, qualification, slot_duration, years_of_experience, bio, languages_spoken)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+				userID, updateData.Name, updateData.Age,
+				specializationJSON, updateData.IsActive, updateData.Qualification, updateData.SlotDuration,
+				updateData.YearsOfExperience, updateData.Bio, languagesJSON)
+		}
+
 		if err != nil {
 			h.logger.Error("failed to insert doctor profile", zap.Error(err), zap.String("user_id", userID.String()))
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create doctor profile"})
@@ -580,11 +647,27 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 	} else {
 		// UPDATE existing doctor record
 		h.logger.Info("Updating existing doctor record", zap.String("userID", userID.String()))
-		doctorResult, err = tx.Exec(c.Context(),
-			`UPDATE doctors SET name = $1, imr_number = $2, age = $3, specialization = $4, is_active = $5, qualification = $6, slot_duration = $7
-             WHERE doctor_id = $8`,
-			updateData.Name, updateData.IMRNumber, updateData.Age, specializationJSON,
-			updateData.IsActive, updateData.Qualification, updateData.SlotDuration, userID)
+
+		if updateData.IMRNumber != nil {
+			// IMR number was provided (could be empty string or actual value)
+			h.logger.Info("Updating with IMR number", zap.String("imr", *updateData.IMRNumber))
+			doctorResult, err = tx.Exec(c.Context(),
+				`UPDATE doctors SET name = $1, imr_number = $2, age = $3, specialization = $4, is_active = $5, qualification = $6, slot_duration = $7, years_of_experience = $8, bio = $9, languages_spoken = $10
+                 WHERE doctor_id = $11`,
+				updateData.Name, *updateData.IMRNumber, updateData.Age, specializationJSON,
+				updateData.IsActive, updateData.Qualification, updateData.SlotDuration,
+				updateData.YearsOfExperience, updateData.Bio, languagesJSON, userID)
+		} else {
+			// IMR number was not provided, don't update it (keep existing value)
+			h.logger.Info("Updating without IMR number (keeping existing)")
+			doctorResult, err = tx.Exec(c.Context(),
+				`UPDATE doctors SET name = $1, age = $2, specialization = $3, is_active = $4, qualification = $5, slot_duration = $6, years_of_experience = $7, bio = $8, languages_spoken = $9
+                 WHERE doctor_id = $10`,
+				updateData.Name, updateData.Age, specializationJSON,
+				updateData.IsActive, updateData.Qualification, updateData.SlotDuration,
+				updateData.YearsOfExperience, updateData.Bio, languagesJSON, userID)
+		}
+
 		if err != nil {
 			h.logger.Error("failed to update doctor profile", zap.Error(err), zap.String("user_id", userID.String()))
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update doctor profile"})
