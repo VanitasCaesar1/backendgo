@@ -454,3 +454,5 @@ func SetupSessionMiddleware(app *fiber.App, logger *zap.Logger, redis *redis.Cli
 		zap.Bool("dev_mode", authMiddleware.devMode),
 		zap.String("workos_client_id", config.WorkOSClientId))
 }
+
+// dd
