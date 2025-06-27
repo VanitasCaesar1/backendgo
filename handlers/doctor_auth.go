@@ -43,11 +43,9 @@ type DoctorRegistrationRequest struct {
 	Age        int    `json:"age" validate:"required,min=18,max=120"`
 	ProfilePic string `json:"profilePic"`
 	HospitalID string `json:"hospitalId"`
-	AadhaarID  string `json:"aadhaar_id"`
 
 	// Doctor-specific details
 	IMRNumber         string   `json:"imrNumber"`
-	Age               int      `json:"age"`
 	Specialization    string   `json:"specialization"`
 	Qualification     string   `json:"qualification"`
 	SlotDuration      int      `json:"slotDuration"`
@@ -154,10 +152,24 @@ func (h *DoctorAuthHandler) RegisterDoctor(c *fiber.Ctx) error {
 			"error": "This Aadhaar ID is already registered",
 		})
 	}
-	if imrExists {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
-			"error": "This IMR number is already registered",
-		})
+
+	// Check if IMR number already exists (if provided)
+	var imrExists bool
+	if req.IMRNumber != "" {
+		err := h.pgPool.QueryRow(c.Context(),
+			`SELECT EXISTS(SELECT 1 FROM doctors WHERE imr_number = $1 AND imr_number != '')`,
+			req.IMRNumber).Scan(&imrExists)
+		if err != nil {
+			h.logger.Error("failed to check IMR number existence", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Database error",
+			})
+		}
+		if imrExists {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error": "This IMR number is already registered",
+			})
+		}
 	}
 
 	// Create user ID first so we can use it as ExternalID in WorkOS

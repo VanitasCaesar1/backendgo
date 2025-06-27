@@ -34,15 +34,16 @@ type Treatment struct {
 }
 
 type DiagnosisRequest struct {
-	AppointmentID   string  `json:"appointment_id" validate:"required,uuid"`
-	PatientID       string  `json:"patient_id" validate:"required"`
-	DoctorID        string  `json:"doctor_id" validate:"required,uuid"`
-	OrgID           string  `json:"org_id" validate:"required"`
-	PatientName     *string `json:"patient_name,omitempty"`
-	PatientAge      *int    `json:"patient_age,omitempty"`
-	PatientGender   *string `json:"patient_gender,omitempty" validate:"omitempty,oneof=male female other"`
-	DoctorName      *string `json:"doctor_name,omitempty"`
-	DoctorSpecialty *string `json:"doctor_specialty,omitempty"`
+	AppointmentID   string           `json:"appointment_id" validate:"required,uuid"`
+	PatientID       string           `json:"patient_id" validate:"required"`
+	DoctorID        string           `json:"doctor_id" validate:"required,uuid"`
+	OrgID           string           `json:"org_id" validate:"required"`
+	PatientName     *string          `json:"patient_name,omitempty"`
+	PatientAge      *int             `json:"patient_age,omitempty"`
+	PatientGender   *string          `json:"patient_gender,omitempty" validate:"omitempty,oneof=male female other"`
+	DoctorName      *string          `json:"doctor_name,omitempty"`
+	DoctorSpecialty *string          `json:"doctor_specialty,omitempty"`
+	Specializations *json.RawMessage `json:"specializations,omitempty"`
 
 	// Vitals as strings to match frontend input
 	Temperature      string `json:"temperature"`
@@ -157,8 +158,8 @@ func (h *DiagnosisHandler) validateDiagnosisRequest(req *DiagnosisRequest) error
 		if err != nil {
 			return errors.New("invalid temperature format")
 		}
-		if temp < 35.0 || temp > 43.0 {
-			return errors.New("temperature must be between 35.0 and 43.0 degrees Celsius")
+		if temp < 20.0 || temp > 50.0 {
+			return errors.New("temperature must be between 20.0 and 50.0 degrees Celsius")
 		}
 	}
 
@@ -319,6 +320,7 @@ func stringToIntPtr(s string) *int {
 	}
 	return nil
 }
+
 func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 	// Get auth ID from context
 	authID, err := h.getAuthID(c)
@@ -363,7 +365,8 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 		zap.String("org_id", diagnosisRequest.OrgID),
 		zap.String("status", diagnosisRequest.Status),
 		zap.Int("symptoms_count", len(diagnosisRequest.Symptoms)),
-		zap.Any("clinical_notes", diagnosisRequest.ClinicalNotes))
+		zap.Any("clinical_notes", diagnosisRequest.ClinicalNotes),
+		zap.Any("specializations", diagnosisRequest.Specializations))
 
 	// Additional custom validations
 	if err := h.validateDiagnosisRequest(&diagnosisRequest); err != nil {
@@ -405,7 +408,7 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 	var symptomTimelineJSON, symptomSummaryJSON, symptomTriggersJSON []byte
 	var symptomRelievingFactorsJSON, symptomQualityDetailsJSON []byte
 	var symptomProgressionJSON, symptomRadiationPatternsJSON []byte
-	var specialtyDataJSON []byte
+	var specialtyDataJSON, specializationsJSON []byte
 
 	// Handle symptoms - ensure we always have valid JSON
 	if len(diagnosisRequest.Symptoms) > 0 {
@@ -557,13 +560,29 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 		specialtyDataJSON = nil
 	}
 
+	// ✅ FIXED: Handle specializations data
+	if diagnosisRequest.Specializations != nil {
+		// Validate JSON
+		var temp interface{}
+		if err := json.Unmarshal(*diagnosisRequest.Specializations, &temp); err != nil {
+			h.logger.Error("invalid specializations JSON", zap.Error(err))
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid specializations data"})
+		}
+		specializationsJSON = *diagnosisRequest.Specializations
+		h.logger.Debug("specializations data processed", zap.String("json", string(specializationsJSON)))
+	} else {
+		specializationsJSON = nil
+		h.logger.Debug("no specializations data provided")
+	}
+
 	// Add debug logging to see what we're actually inserting
 	h.logger.Debug("JSON data being processed",
 		zap.String("symptoms", string(symptomsJSON)),
 		zap.Bool("symptom_timeline_present", symptomTimelineJSON != nil),
 		zap.Bool("symptom_summary_present", symptomSummaryJSON != nil),
 		zap.Int("symptom_categories_count", len(diagnosisRequest.SymptomCategories)),
-		zap.Any("clinical_notes_value", diagnosisRequest.ClinicalNotes))
+		zap.Any("clinical_notes_value", diagnosisRequest.ClinicalNotes),
+		zap.Bool("specializations_present", specializationsJSON != nil))
 
 	// Get procedures and recommendations from treatment plan OR direct fields
 	var procedures []string
@@ -636,6 +655,7 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 				symptom_quality_details = $41,
 				symptom_progression = $42,
 				symptom_radiation_patterns = $43,
+				specializations = $44,
 				updated_at = CURRENT_TIMESTAMP
 			WHERE id = $1
 			RETURNING id, created_at, updated_at`
@@ -684,6 +704,7 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 			symptomQualityDetailsJSON,                     // $41
 			symptomProgressionJSON,                        // $42
 			symptomRadiationPatternsJSON,                  // $43
+			specializationsJSON,                           // $44 ✅ ADDED
 		).Scan(&diagnosisID, &createdAt, &updatedAt); err != nil {
 			h.logger.Error("failed to update diagnosis",
 				zap.Error(err),
@@ -710,11 +731,11 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 				referrals, status, clinical_notes, attachments,
 				respiratory_rate, oxygen_saturation, symptom_timeline, symptom_summary, 
 				primary_complaint, symptom_categories, symptom_triggers, symptom_relieving_factors,
-				symptom_quality_details, symptom_progression, symptom_radiation_patterns
+				symptom_quality_details, symptom_progression, symptom_radiation_patterns, specializations
 			) VALUES (
 				$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 
 				$18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, 
-				$33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43
+				$33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44
 			) RETURNING id, created_at`
 
 		err = h.pgPool.QueryRow(c.Context(), insertQuery,
@@ -761,6 +782,7 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 			symptomQualityDetailsJSON,                     // $41
 			symptomProgressionJSON,                        // $42
 			symptomRadiationPatternsJSON,                  // $43
+			specializationsJSON,                           // $44 ✅ ADDED
 		).Scan(&diagnosisID, &createdAt)
 
 		if err != nil {
@@ -777,20 +799,24 @@ func (h *DiagnosisHandler) CreateDiagnosis(c *fiber.Ctx) error {
 			zap.String("appointment_id", diagnosisRequest.AppointmentID))
 	}
 
-	// Prepare response
-	response := fiber.Map{
-		"diagnosis_id": diagnosisID,
-		"created_at":   createdAt,
-		"updated_at":   updatedAt,
-		"status":       diagnosisRequest.Status,
-	}
-
 	if isUpdate {
-		response["message"] = "Diagnosis updated successfully"
-		return c.Status(fiber.StatusOK).JSON(response)
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"message":          "Diagnosis updated successfully",
+			"diagnosis_id":     diagnosisID,
+			"created_at":       createdAt,
+			"updated_at":       updatedAt,
+			"diagnosis_status": diagnosisRequest.Status, // Renamed to avoid confusion
+			"success":          true,
+		})
 	} else {
-		response["message"] = "Diagnosis created successfully"
-		return c.Status(fiber.StatusCreated).JSON(response)
+		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+			"message":          "Diagnosis created successfully",
+			"diagnosis_id":     diagnosisID,
+			"created_at":       createdAt,
+			"updated_at":       updatedAt,
+			"diagnosis_status": diagnosisRequest.Status, // Renamed to avoid confusion
+			"success":          true,
+		})
 	}
 }
 
@@ -845,10 +871,9 @@ type DiagnosisSearchParams struct {
 	Offset         int      `json:"offset"`
 }
 
-// GetDiagnosis retrieves diagnosis by appointment_id from URL path
+// GetDiagnosis retrieves the latest diagnosis by appointment_id from URL path
 func (h *DiagnosisHandler) GetDiagnosis(c *fiber.Ctx) error {
 	// Get appointment_id from URL path parameters
-	// Changed from "appointment_id" to "id" to match the route parameter
 	appointmentID := c.Params("id")
 
 	// Debug logging
@@ -877,121 +902,143 @@ func (h *DiagnosisHandler) GetDiagnosis(c *fiber.Ctx) error {
 
 	fmt.Println("Auth ID:", authID)
 
-	// Query to get all diagnoses for the appointment
+	// Query to get the latest diagnosis for the appointment (more efficient than getting all and sorting)
 	query := `
 		SELECT
 			id, appointment_id, patient_id, doctor_id, org_id, patient_name, patient_age,
 			patient_gender, doctor_name, doctor_specialty, temperature, blood_pressure,
-			heart_rate, weight, height, bmi, chief_complaint, symptoms, physical_exam,
+			heart_rate, weight, height, bmi, respiratory_rate, oxygen_saturation,
+			chief_complaint, primary_complaint, symptoms, physical_exam,
 			primary_diagnosis, secondary_diagnoses, icd_codes, medications, procedures,
 			recommendations, lab_orders, test_results, specialty, specialty_data,
 			follow_up_date, follow_up_notes, referrals, status, clinical_notes,
-			attachments, created_at, updated_at
+			attachments, created_at, updated_at, symptom_timeline, symptom_summary,
+			symptom_categories, symptom_triggers, symptom_relieving_factors,
+			symptom_quality_details, symptom_progression, symptom_radiation_patterns,
+			primary_symptoms, symptom_locations, symptom_severities, symptom_durations,
+			symptom_frequencies, symptom_pain_scales, symptom_onset_dates, specializations
 		FROM medical_diagnoses
 		WHERE appointment_id = $1
-		ORDER BY created_at DESC`
+		ORDER BY created_at DESC
+		LIMIT 1`
 
-	rows, err := h.pgPool.Query(c.Context(), query, appointmentID)
+	var diagnosis DiagnosisResponse
+	var symptomsJSON, medicationsJSON, testResultsJSON, attachmentsJSON []byte
+	var symptomTimelineJSON, symptomSummaryJSON, symptomTriggersJSON, symptomRelievingFactorsJSON []byte
+	var symptomQualityDetailsJSON, symptomProgressionJSON, symptomRadiationPatternsJSON []byte
+	var primarySymptomsJSON, symptomLocationsJSON, symptomSeveritiesJSON, symptomDurationsJSON []byte
+	var symptomFrequenciesJSON, symptomPainScalesJSON, symptomOnsetDatesJSON, specializationsJSON []byte
+
+	err = h.pgPool.QueryRow(c.Context(), query, appointmentID).Scan(
+		&diagnosis.ID,
+		&diagnosis.AppointmentID,
+		&diagnosis.PatientID,
+		&diagnosis.DoctorID,
+		&diagnosis.OrgID,
+		&diagnosis.PatientName,
+		&diagnosis.PatientAge,
+		&diagnosis.PatientGender,
+		&diagnosis.DoctorName,
+		&diagnosis.DoctorSpecialty,
+		&diagnosis.Vitals.Temperature,
+		&diagnosis.Vitals.BloodPressure,
+		&diagnosis.Vitals.HeartRate,
+		&diagnosis.Vitals.Weight,
+		&diagnosis.Vitals.Height,
+		&diagnosis.Vitals.BMI,
+		&diagnosis.Vitals.RespiratoryRate,
+		&diagnosis.Vitals.OxygenSaturation,
+		&diagnosis.ChiefComplaint,
+		&diagnosis.PrimaryComplaint,
+		&symptomsJSON,
+		&diagnosis.PhysicalExam,
+		&diagnosis.PrimaryDiagnosis,
+		&diagnosis.SecondaryDiagnoses,
+		&diagnosis.ICDCodes,
+		&medicationsJSON,
+		&diagnosis.TreatmentPlan.Procedures,
+		&diagnosis.TreatmentPlan.Recommendations,
+		&diagnosis.LabOrders,
+		&testResultsJSON,
+		&diagnosis.Specialty,
+		&diagnosis.SpecialtyData,
+		&diagnosis.FollowUpDate,
+		&diagnosis.FollowUpNotes,
+		&diagnosis.Referrals,
+		&diagnosis.Status,
+		&diagnosis.ClinicalNotes,
+		&attachmentsJSON,
+		&diagnosis.CreatedAt,
+		&diagnosis.UpdatedAt,
+		&symptomTimelineJSON,
+		&symptomSummaryJSON,
+		&diagnosis.SymptomCategories,
+		&symptomTriggersJSON,
+		&symptomRelievingFactorsJSON,
+		&symptomQualityDetailsJSON,
+		&symptomProgressionJSON,
+		&symptomRadiationPatternsJSON,
+		&primarySymptomsJSON,
+		&symptomLocationsJSON,
+		&symptomSeveritiesJSON,
+		&symptomDurationsJSON,
+		&symptomFrequenciesJSON,
+		&symptomPainScalesJSON,
+		&symptomOnsetDatesJSON,
+		&specializationsJSON,
+	)
+
 	if err != nil {
-		h.logger.Error("failed to retrieve diagnoses", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve diagnoses"})
-	}
-	defer rows.Close()
-
-	var diagnoses []DiagnosisResponse
-
-	for rows.Next() {
-		var diagnosis DiagnosisResponse
-		var symptomsJSON, medicationsJSON, testResultsJSON, attachmentsJSON []byte
-
-		err := rows.Scan(
-			&diagnosis.ID,
-			&diagnosis.AppointmentID,
-			&diagnosis.PatientID,
-			&diagnosis.DoctorID,
-			&diagnosis.OrgID,
-			&diagnosis.PatientName,
-			&diagnosis.PatientAge,
-			&diagnosis.PatientGender,
-			&diagnosis.DoctorName,
-			&diagnosis.DoctorSpecialty,
-			&diagnosis.Vitals.Temperature,
-			&diagnosis.Vitals.BloodPressure,
-			&diagnosis.Vitals.HeartRate,
-			&diagnosis.Vitals.Weight,
-			&diagnosis.Vitals.Height,
-			&diagnosis.Vitals.BMI,
-			&diagnosis.ChiefComplaint,
-			&symptomsJSON,
-			&diagnosis.PhysicalExam,
-			&diagnosis.PrimaryDiagnosis,
-			&diagnosis.SecondaryDiagnoses,
-			&diagnosis.ICDCodes,
-			&medicationsJSON,
-			&diagnosis.TreatmentPlan.Procedures,
-			&diagnosis.TreatmentPlan.Recommendations,
-			&diagnosis.LabOrders,
-			&testResultsJSON,
-			&diagnosis.Specialty,
-			&diagnosis.SpecialtyData,
-			&diagnosis.FollowUpDate,
-			&diagnosis.FollowUpNotes,
-			&diagnosis.Referrals,
-			&diagnosis.Status,
-			&diagnosis.ClinicalNotes,
-			&attachmentsJSON,
-			&diagnosis.CreatedAt,
-			&diagnosis.UpdatedAt,
-		)
-
-		if err != nil {
-			h.logger.Error("failed to scan diagnosis row", zap.Error(err))
-			continue
+		if err == pgx.ErrNoRows {
+			h.logger.Info("no diagnosis found for appointment", zap.String("appointment_id", appointmentID))
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"error":   "No diagnosis found",
+				"message": "No diagnosis found for the specified appointment",
+			})
 		}
-
-		// Parse JSON fields
-		if symptomsJSON != nil {
-			json.Unmarshal(symptomsJSON, &diagnosis.Symptoms)
-		}
-		if medicationsJSON != nil {
-			json.Unmarshal(medicationsJSON, &diagnosis.TreatmentPlan.Medications)
-		}
-		if testResultsJSON != nil {
-			json.Unmarshal(testResultsJSON, &diagnosis.TestResults)
-		}
-		if attachmentsJSON != nil {
-			json.Unmarshal(attachmentsJSON, &diagnosis.Attachments)
-		}
-
-		diagnoses = append(diagnoses, diagnosis)
+		h.logger.Error("failed to retrieve diagnosis", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve diagnosis"})
 	}
 
-	if err := rows.Err(); err != nil {
-		h.logger.Error("error iterating over diagnosis rows", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to retrieve diagnoses"})
+	// Parse JSON fields with error handling
+	parseJSONField := func(data []byte, target interface{}, fieldName string) {
+		if data != nil {
+			if err := json.Unmarshal(data, target); err != nil {
+				h.logger.Warn("failed to parse JSON field",
+					zap.String("field", fieldName),
+					zap.Error(err))
+			}
+		}
 	}
 
-	// Check if no diagnoses found
-	if len(diagnoses) == 0 {
-		h.logger.Info("no diagnoses found for appointment", zap.String("appointment_id", appointmentID))
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-			"error":   "No diagnosis found",
-			"message": "No diagnosis found for the specified appointment",
-		})
-	}
-
-	// Return the first (most recent) diagnosis in the format expected by frontend
-	// Frontend expects { diagnosis: {...} } not { diagnoses: [...] }
-	latestDiagnosis := diagnoses[0]
+	// Parse all JSON fields
+	parseJSONField(symptomsJSON, &diagnosis.Symptoms, "symptoms")
+	parseJSONField(medicationsJSON, &diagnosis.TreatmentPlan.Medications, "medications")
+	parseJSONField(testResultsJSON, &diagnosis.TestResults, "test_results")
+	parseJSONField(attachmentsJSON, &diagnosis.Attachments, "attachments")
+	parseJSONField(symptomTimelineJSON, &diagnosis.SymptomTimeline, "symptom_timeline")
+	parseJSONField(symptomSummaryJSON, &diagnosis.SymptomSummary, "symptom_summary")
+	parseJSONField(symptomTriggersJSON, &diagnosis.SymptomTriggers, "symptom_triggers")
+	parseJSONField(symptomRelievingFactorsJSON, &diagnosis.SymptomRelievingFactors, "symptom_relieving_factors")
+	parseJSONField(symptomQualityDetailsJSON, &diagnosis.SymptomQualityDetails, "symptom_quality_details")
+	parseJSONField(symptomProgressionJSON, &diagnosis.SymptomProgression, "symptom_progression")
+	parseJSONField(symptomRadiationPatternsJSON, &diagnosis.SymptomRadiationPatterns, "symptom_radiation_patterns")
+	parseJSONField(primarySymptomsJSON, &diagnosis.PrimarySymptoms, "primary_symptoms")
+	parseJSONField(symptomLocationsJSON, &diagnosis.SymptomLocations, "symptom_locations")
+	parseJSONField(symptomSeveritiesJSON, &diagnosis.SymptomSeverities, "symptom_severities")
+	parseJSONField(symptomDurationsJSON, &diagnosis.SymptomDurations, "symptom_durations")
+	parseJSONField(symptomFrequenciesJSON, &diagnosis.SymptomFrequencies, "symptom_frequencies")
+	parseJSONField(symptomPainScalesJSON, &diagnosis.SymptomPainScales, "symptom_pain_scales")
+	parseJSONField(symptomOnsetDatesJSON, &diagnosis.SymptomOnsetDates, "symptom_onset_dates")
+	parseJSONField(specializationsJSON, &diagnosis.Specializations, "specializations")
 
 	h.logger.Info("diagnosis retrieved successfully",
 		zap.String("appointment_id", appointmentID),
-		zap.String("diagnosis_id", latestDiagnosis.ID))
+		zap.String("diagnosis_id", diagnosis.ID))
 
 	return c.Status(fiber.StatusOK).JSON(fiber.Map{
 		"message":   "Diagnosis retrieved successfully",
-		"diagnosis": latestDiagnosis, // Changed from "diagnoses" to "diagnosis"
-		"count":     len(diagnoses),  // Still include count for debugging
+		"diagnosis": diagnosis,
 	})
 }
 
@@ -1223,45 +1270,64 @@ func (h *DiagnosisHandler) generateMedicalSummary(records []MedicalHistoryRecord
 
 // Supporting structs for the response
 type DiagnosisResponse struct {
-	ID                 string         `json:"id"`
-	AppointmentID      string         `json:"appointment_id"`
-	PatientID          string         `json:"patient_id"`
-	DoctorID           string         `json:"doctor_id"`
-	OrgID              string         `json:"org_id"`
-	PatientName        *string        `json:"patient_name"`
-	PatientAge         *int           `json:"patient_age"`
-	PatientGender      *string        `json:"patient_gender"`
-	DoctorName         *string        `json:"doctor_name"`
-	DoctorSpecialty    *string        `json:"doctor_specialty"`
-	Vitals             VitalsResponse `json:"vitals"`
-	ChiefComplaint     *string        `json:"chief_complaint"`
-	Symptoms           []Symptom      `json:"symptoms"`
-	PhysicalExam       *string        `json:"physical_exam"`
-	PrimaryDiagnosis   string         `json:"primary_diagnosis"`
-	SecondaryDiagnoses []string       `json:"secondary_diagnoses"`
-	ICDCodes           []string       `json:"icd_codes"`
-	TreatmentPlan      TreatmentPlan  `json:"treatment_plan"`
-	LabOrders          []string       `json:"lab_orders"`
-	TestResults        []TestResult   `json:"test_results"`
-	Specialty          *string        `json:"specialty"`
-	SpecialtyData      interface{}    `json:"specialty_data"`
-	FollowUpDate       *time.Time     `json:"follow_up_date"`
-	FollowUpNotes      *string        `json:"follow_up_notes"`
-	Referrals          []string       `json:"referrals"`
-	Status             string         `json:"status"`
-	ClinicalNotes      *string        `json:"clinical_notes"`
-	Attachments        []Attachment   `json:"attachments"`
-	CreatedAt          time.Time      `json:"created_at"`
-	UpdatedAt          time.Time      `json:"updated_at"`
+	ID                       string         `json:"id"`
+	AppointmentID            string         `json:"appointment_id"`
+	PatientID                string         `json:"patient_id"`
+	DoctorID                 string         `json:"doctor_id"`
+	OrgID                    string         `json:"org_id"`
+	PatientName              *string        `json:"patient_name"`
+	PatientAge               *int           `json:"patient_age"`
+	PatientGender            *string        `json:"patient_gender"`
+	DoctorName               *string        `json:"doctor_name"`
+	DoctorSpecialty          *string        `json:"doctor_specialty"`
+	Specializations          interface{}    `json:"specializations"` // Added type for specializations
+	Vitals                   VitalsResponse `json:"vitals"`
+	ChiefComplaint           *string        `json:"chief_complaint"`
+	PrimaryComplaint         *string        `json:"primary_complaint"`
+	Symptoms                 []Symptom      `json:"symptoms"`
+	SymptomTimeline          interface{}    `json:"symptom_timeline"`
+	SymptomSummary           interface{}    `json:"symptom_summary"`
+	SymptomCategories        []string       `json:"symptom_categories"`
+	SymptomTriggers          interface{}    `json:"symptom_triggers"`
+	SymptomRelievingFactors  interface{}    `json:"symptom_relieving_factors"`
+	SymptomQualityDetails    interface{}    `json:"symptom_quality_details"`
+	SymptomProgression       interface{}    `json:"symptom_progression"`
+	SymptomRadiationPatterns interface{}    `json:"symptom_radiation_patterns"`
+	PrimarySymptoms          interface{}    `json:"primary_symptoms"`
+	SymptomLocations         interface{}    `json:"symptom_locations"`
+	SymptomSeverities        interface{}    `json:"symptom_severities"`
+	SymptomDurations         interface{}    `json:"symptom_durations"`
+	SymptomFrequencies       interface{}    `json:"symptom_frequencies"`
+	SymptomPainScales        interface{}    `json:"symptom_pain_scales"`
+	SymptomOnsetDates        interface{}    `json:"symptom_onset_dates"`
+	PhysicalExam             *string        `json:"physical_exam"`
+	PrimaryDiagnosis         string         `json:"primary_diagnosis"`
+	SecondaryDiagnoses       []string       `json:"secondary_diagnoses"`
+	ICDCodes                 []string       `json:"icd_codes"`
+	TreatmentPlan            TreatmentPlan  `json:"treatment_plan"`
+	LabOrders                []string       `json:"lab_orders"`
+	TestResults              []TestResult   `json:"test_results"`
+	Specialty                *string        `json:"specialty"`
+	SpecialtyData            interface{}    `json:"specialty_data"`
+	FollowUpDate             *time.Time     `json:"follow_up_date"`
+	FollowUpNotes            *string        `json:"follow_up_notes"`
+	Referrals                []string       `json:"referrals"`
+	Status                   string         `json:"status"`
+	ClinicalNotes            *string        `json:"clinical_notes"`
+	Attachments              []Attachment   `json:"attachments"`
+	CreatedAt                time.Time      `json:"created_at"`
+	UpdatedAt                time.Time      `json:"updated_at"`
 }
 
 type VitalsResponse struct {
-	Temperature   *float64 `json:"temperature"`
-	BloodPressure *string  `json:"blood_pressure"`
-	HeartRate     *int     `json:"heart_rate"`
-	Weight        *float64 `json:"weight"`
-	Height        *float64 `json:"height"`
-	BMI           *float64 `json:"bmi"`
+	Temperature      *float64 `json:"temperature"`
+	BloodPressure    *string  `json:"blood_pressure"`
+	HeartRate        *int     `json:"heart_rate"`
+	Weight           *float64 `json:"weight"`
+	Height           *float64 `json:"height"`
+	BMI              *float64 `json:"bmi"`
+	RespiratoryRate  *int     `json:"respiratory_rate"`
+	OxygenSaturation *int     `json:"oxygen_saturation"`
 }
 
 type MedicalHistoryRecord struct {

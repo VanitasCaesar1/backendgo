@@ -145,7 +145,8 @@ func (h *DoctorHandler) GetDoctorProfile(c *fiber.Ctx) error {
 	}
 
 	// Validate UUID format
-	if _, err := uuid.Parse(doctorID); err != nil {
+	doctorUUID, err := uuid.Parse(doctorID)
+	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Invalid doctor ID format",
 		})
@@ -154,16 +155,11 @@ func (h *DoctorHandler) GetDoctorProfile(c *fiber.Ctx) error {
 	h.logger.Info("processing doctor profile request",
 		zap.String("doctorID", doctorID))
 
-	// Parse the doctor ID to UUID
-	doctorUUID, err := uuid.Parse(doctorID)
-	if err != nil {
-		h.logger.Error("invalid doctor ID format", zap.Error(err))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid doctor ID format"})
-	}
-	fmt.Println(doctorUUID)
-	// Get basic user info and doctor-specific data in one query
+	// Get complete user info and doctor-specific data in one query
 	var profile DoctorProfile
 	var specializationJSON []byte
+	var languagesJSON []byte
+
 	err = h.pgPool.QueryRow(c.Context(),
 		`SELECT
 			u.user_id,
@@ -182,11 +178,14 @@ func (h *DoctorHandler) GetDoctorProfile(c *fiber.Ctx) error {
 			d.specialization,
 			d.is_active,
 			COALESCE(d.qualification, '') as qualification,
-			COALESCE(d.slot_duration, 30) as slot_duration
+			COALESCE(d.slot_duration, 30) as slot_duration,
+			COALESCE(d.years_of_experience, 0) as years_of_experience,
+			COALESCE(d.bio, '') as bio,
+			COALESCE(d.languages_spoken, '[]'::jsonb) as languages_spoken
 		FROM users u
 		JOIN doctors d ON u.user_id = d.doctor_id
 		WHERE d.doctor_id = $1`,
-		doctorID).Scan(
+		doctorUUID).Scan(
 		&profile.UserID,
 		&profile.AuthID,
 		&profile.Username,
@@ -204,26 +203,130 @@ func (h *DoctorHandler) GetDoctorProfile(c *fiber.Ctx) error {
 		&profile.IsActive,
 		&profile.Qualification,
 		&profile.SlotDuration,
+		&profile.YearsOfExperience,
+		&profile.Bio,
+		&languagesJSON,
 	)
+
 	if err != nil {
 		if err == pgx.ErrNoRows {
+			h.logger.Info("doctor profile not found", zap.String("doctorID", doctorID))
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Doctor profile not found"})
 		}
 		h.logger.Error("failed to fetch doctor profile", zap.Error(err))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to fetch doctor profile"})
 	}
 
-	// Parse the JSONB specialization field
+	// Debug logging for specialization
+	h.logger.Info("raw specialization from database",
+		zap.String("doctorID", doctorID),
+		zap.ByteString("specializationJSON", specializationJSON),
+		zap.Int("length", len(specializationJSON)))
+
+	// FIXED: Simplified specialization parsing
 	if len(specializationJSON) > 0 {
-		if err := json.Unmarshal(specializationJSON, &profile.Specialization); err != nil {
-			h.logger.Error("failed to parse specialization JSON", zap.Error(err))
-			// Continue without specialization rather than failing the whole request
-			profile.Specialization = Specialization{Primary: "Unknown"}
+		specializationStr := string(specializationJSON)
+		h.logger.Info("specialization string from database",
+			zap.String("doctorID", doctorID),
+			zap.String("specializationStr", specializationStr))
+
+		// Initialize with empty values
+		profile.Specialization = Specialization{Primary: "", Secondary: []string{}}
+
+		// Try to parse as JSON object first
+		var tempSpec map[string]interface{}
+		if err := json.Unmarshal(specializationJSON, &tempSpec); err == nil {
+			// Successfully parsed as object
+			h.logger.Info("parsed specialization as object",
+				zap.String("doctorID", doctorID),
+				zap.Any("tempSpec", tempSpec))
+
+			// Extract primary specialization
+			if primary, exists := tempSpec["primary"]; exists {
+				if primaryStr, ok := primary.(string); ok && strings.TrimSpace(primaryStr) != "" {
+					profile.Specialization.Primary = strings.TrimSpace(primaryStr)
+				}
+			}
+
+			// Extract secondary specializations
+			if secondary, exists := tempSpec["secondary"]; exists {
+				if secondarySlice, ok := secondary.([]interface{}); ok {
+					for _, item := range secondarySlice {
+						if itemStr, ok := item.(string); ok && strings.TrimSpace(itemStr) != "" {
+							profile.Specialization.Secondary = append(profile.Specialization.Secondary, strings.TrimSpace(itemStr))
+						}
+					}
+				}
+			}
+
+			// FIXED: If primary is missing, null, or empty, look for any other string value in the object
+			if profile.Specialization.Primary == "" {
+				for key, value := range tempSpec {
+					if key == "secondary" {
+						continue // Skip secondary array
+					}
+					if valueStr, ok := value.(string); ok && strings.TrimSpace(valueStr) != "" {
+						profile.Specialization.Primary = strings.TrimSpace(valueStr)
+						h.logger.Info("used fallback primary specialization",
+							zap.String("doctorID", doctorID),
+							zap.String("key", key),
+							zap.String("value", profile.Specialization.Primary))
+						break
+					}
+				}
+			}
+		} else {
+			// Try parsing as string
+			var specializationString string
+			if err := json.Unmarshal(specializationJSON, &specializationString); err == nil {
+				if strings.TrimSpace(specializationString) != "" {
+					profile.Specialization.Primary = strings.TrimSpace(specializationString)
+					h.logger.Info("parsed specialization as string",
+						zap.String("doctorID", doctorID),
+						zap.String("value", profile.Specialization.Primary))
+				}
+			} else {
+				// If both fail, treat the raw string as primary
+				if strings.TrimSpace(specializationStr) != "" &&
+					specializationStr != "null" &&
+					specializationStr != "{}" {
+					profile.Specialization.Primary = strings.TrimSpace(specializationStr)
+					h.logger.Info("used raw string as primary specialization",
+						zap.String("doctorID", doctorID),
+						zap.String("value", profile.Specialization.Primary))
+				}
+			}
 		}
 	} else {
-		// Set default value if JSONB is null
-		profile.Specialization = Specialization{Primary: ""}
+		h.logger.Warn("specialization JSON is empty - this shouldn't happen with NOT NULL constraint",
+			zap.String("doctorID", doctorID))
+		profile.Specialization = Specialization{Primary: "", Secondary: []string{}}
 	}
+
+	// Parse languages (keep existing logic)
+	if len(languagesJSON) > 0 {
+		if string(languagesJSON) == "null" {
+			profile.LanguagesSpoken = []string{}
+		} else {
+			if err := json.Unmarshal(languagesJSON, &profile.LanguagesSpoken); err != nil {
+				h.logger.Error("failed to parse languages JSON",
+					zap.Error(err),
+					zap.String("doctorID", doctorID),
+					zap.ByteString("rawJSON", languagesJSON))
+				profile.LanguagesSpoken = []string{}
+			}
+		}
+	} else {
+		profile.LanguagesSpoken = []string{}
+	}
+
+	// Final debug log
+	h.logger.Info("doctor profile retrieved successfully",
+		zap.String("doctorID", doctorID),
+		zap.String("doctorName", profile.Name),
+		zap.String("finalSpecializationPrimary", profile.Specialization.Primary),
+		zap.Strings("finalSpecializationSecondary", profile.Specialization.Secondary),
+		zap.Strings("finalLanguages", profile.LanguagesSpoken))
 
 	return c.JSON(profile)
 }
@@ -432,12 +535,25 @@ func (h *DoctorHandler) GetDoctorFees(c *fiber.Ctx) error {
 	return c.JSON(feesStructures)
 }
 
+type DoctorProfileUpdate struct {
+	Username          *string         `json:"username,omitempty"`
+	Name              *string         `json:"name,omitempty"`
+	Mobile            *string         `json:"mobile,omitempty"`
+	BloodGroup        *string         `json:"blood_group,omitempty"`
+	Location          *string         `json:"location,omitempty"`
+	Address           *string         `json:"address,omitempty"`
+	IMRNumber         *string         `json:"imr_number,omitempty"`
+	Age               *int            `json:"age,omitempty"`
+	Specialization    *Specialization `json:"specialization,omitempty"`
+	IsActive          *bool           `json:"is_active,omitempty"`
+	Qualification     *string         `json:"qualification,omitempty"`
+	SlotDuration      *int            `json:"slot_duration,omitempty"`
+	YearsOfExperience *int            `json:"years_of_experience,omitempty"`
+	Bio               *string         `json:"bio,omitempty"`
+	LanguagesSpoken   []string        `json:"languages_spoken,omitempty"`
+}
+
 func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
-	authID, err := h.getAuthID(c)
-	if err != nil {
-		h.logger.Error("authID not found in context")
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": err.Error()})
-	}
 
 	// Get the doctor ID from URL parameter
 	doctorID := c.Params("id")
@@ -451,64 +567,23 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid doctor ID format"})
 	}
 
-	// Updated DoctorProfileUpdate struct to include all fields
-	type DoctorProfileUpdate struct {
-		Username          string         `json:"username"`
-		Name              string         `json:"name"`
-		Mobile            string         `json:"mobile"`
-		BloodGroup        string         `json:"blood_group"`
-		Location          string         `json:"location"`
-		Address           string         `json:"address"`
-		IMRNumber         *string        `json:"imr_number"` // pointer to allow null
-		Age               int            `json:"age"`
-		Specialization    Specialization `json:"specialization"`
-		IsActive          bool           `json:"is_active"`
-		Qualification     string         `json:"qualification"`
-		SlotDuration      int            `json:"slot_duration"`
-		YearsOfExperience int            `json:"years_of_experience"`
-		Bio               string         `json:"bio"`
-		LanguagesSpoken   []string       `json:"languages_spoken"`
-	}
-
 	var updateData DoctorProfileUpdate
 	if err := c.BodyParser(&updateData); err != nil {
 		h.logger.Error("failed to parse update data", zap.Error(err))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid request data"})
 	}
 
-	// DEBUG: Log the received data with more details
-	h.logger.Info("Received update data",
-		zap.String("username", updateData.Username),
-		zap.String("name", updateData.Name),
-		zap.Int("age", updateData.Age),
-		zap.Any("specialization", updateData.Specialization),
-		zap.Any("imr_number", updateData.IMRNumber),
-		zap.Int("years_of_experience", updateData.YearsOfExperience),
-		zap.String("bio", updateData.Bio),
-		zap.Strings("languages_spoken", updateData.LanguagesSpoken))
+	// Check if any fields are provided
+	if updateData.Username == nil && updateData.Name == nil && updateData.Mobile == nil &&
+		updateData.BloodGroup == nil && updateData.Location == nil && updateData.Address == nil &&
+		updateData.IMRNumber == nil && updateData.Age == nil && updateData.Specialization == nil &&
+		updateData.IsActive == nil && updateData.Qualification == nil && updateData.SlotDuration == nil &&
+		updateData.YearsOfExperience == nil && updateData.Bio == nil && len(updateData.LanguagesSpoken) == 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "No fields provided for update"})
+	}
 
-	// Convert DoctorProfileUpdate to DoctorProfile for validation
-	profileForValidation := DoctorProfile{
-		Username:          updateData.Username,
-		Name:              updateData.Name,
-		Mobile:            updateData.Mobile,
-		BloodGroup:        updateData.BloodGroup,
-		Location:          updateData.Location,
-		Address:           updateData.Address,
-		IMRNumber:         "",
-		Age:               updateData.Age,
-		Specialization:    updateData.Specialization,
-		IsActive:          updateData.IsActive,
-		Qualification:     updateData.Qualification,
-		SlotDuration:      updateData.SlotDuration,
-		YearsOfExperience: updateData.YearsOfExperience,
-		Bio:               updateData.Bio,
-		LanguagesSpoken:   updateData.LanguagesSpoken,
-	}
-	if updateData.IMRNumber != nil {
-		profileForValidation.IMRNumber = *updateData.IMRNumber
-	}
-	if err := h.validateDoctorProfileUpdate(&profileForValidation); err != nil {
+	// Validate provided fields
+	if err := h.validateDoctorProfileUpdateFields(&updateData); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
 
@@ -527,32 +602,33 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		}
 	}()
 
-	// Use the doctor ID from URL parameter
 	userID := doctorUUID
 
-	// Check if username is being changed and if it conflicts with existing usernames
-	var currentUsername string
-	err = tx.QueryRow(c.Context(),
-		"SELECT username FROM users WHERE user_id = $1",
-		userID).Scan(&currentUsername)
-	if err != nil {
-		h.logger.Error("failed to get current username", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
-	}
-
-	// If username is changing, check if the new username already exists (case-insensitive)
-	if !strings.EqualFold(updateData.Username, currentUsername) {
-		var usernameExists bool
+	// Handle username uniqueness check if username is being updated
+	if updateData.Username != nil {
+		var currentUsername string
 		err = tx.QueryRow(c.Context(),
-			"SELECT EXISTS(SELECT 1 FROM users WHERE LOWER(username) = LOWER($1) AND user_id != $2)",
-			updateData.Username, userID).Scan(&usernameExists)
+			"SELECT username FROM users WHERE user_id = $1",
+			userID).Scan(&currentUsername)
 		if err != nil {
-			h.logger.Error("failed to check username uniqueness", zap.Error(err))
+			h.logger.Error("failed to get current username", zap.Error(err))
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 		}
 
-		if usernameExists {
-			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "Username already exists"})
+		// If username is changing, check if the new username already exists (case-insensitive)
+		if !strings.EqualFold(*updateData.Username, currentUsername) {
+			var usernameExists bool
+			err = tx.QueryRow(c.Context(),
+				"SELECT EXISTS(SELECT 1 FROM users WHERE LOWER(username) = LOWER($1) AND user_id != $2)",
+				*updateData.Username, userID).Scan(&usernameExists)
+			if err != nil {
+				h.logger.Error("failed to check username uniqueness", zap.Error(err))
+				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
+			}
+
+			if usernameExists {
+				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "Username already exists"})
+			}
 		}
 	}
 
@@ -566,120 +642,54 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Database error"})
 	}
 
-	// DEBUG: Log doctor existence
-	h.logger.Info("Doctor existence check",
-		zap.Bool("exists", doctorExists),
-		zap.String("userID", userID.String()))
-
-	// Convert specialization struct to JSON
-	specializationJSON, err := json.Marshal(updateData.Specialization)
-	if err != nil {
-		h.logger.Error("failed to marshal specialization to JSON", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process specialization data"})
-	}
-
-	// Convert languages_spoken to JSON
-	languagesJSON, err := json.Marshal(updateData.LanguagesSpoken)
-	if err != nil {
-		h.logger.Error("failed to marshal languages to JSON", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to process languages data"})
-	}
-
-	// DEBUG: Log JSON data
-	h.logger.Info("JSON data",
-		zap.String("specialization_json", string(specializationJSON)),
-		zap.String("languages_json", string(languagesJSON)))
-
-	// Update users table first
-	userResult, err := tx.Exec(c.Context(),
-		`UPDATE users SET username = $1, name = $2, mobile = $3, blood_group = $4, location = $5, address = $6
-         WHERE user_id = $7`,
-		updateData.Username, updateData.Name, updateData.Mobile, updateData.BloodGroup,
-		updateData.Location, updateData.Address, userID)
-	if err != nil {
-		// Check for constraint violations
-		if strings.Contains(err.Error(), "users_username_key") || strings.Contains(err.Error(), "duplicate key") {
-			h.logger.Error("username already exists", zap.Error(err), zap.String("username", updateData.Username))
-			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "Username already exists"})
+	// Update users table with dynamic SQL
+	if hasUserFields(&updateData) {
+		userSQL, userArgs := buildUserUpdateSQL(&updateData, userID)
+		userResult, err := tx.Exec(c.Context(), userSQL, userArgs...)
+		if err != nil {
+			// Check for constraint violations
+			if strings.Contains(err.Error(), "users_username_key") || strings.Contains(err.Error(), "duplicate key") {
+				h.logger.Error("username already exists", zap.Error(err))
+				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "Username already exists"})
+			}
+			h.logger.Error("failed to update user profile", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update profile"})
 		}
-		h.logger.Error("failed to update user profile", zap.Error(err), zap.String("auth_id", authID))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update profile"})
+
+		userRowsAffected := userResult.RowsAffected()
+		h.logger.Info("Users table update", zap.Int64("rowsAffected", userRowsAffected))
+
+		if userRowsAffected == 0 {
+			h.logger.Error("no user rows affected - user might not exist", zap.String("user_id", userID.String()))
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "User not found"})
+		}
 	}
 
-	// DEBUG: Check how many rows were affected in users table
-	userRowsAffected := userResult.RowsAffected()
-	h.logger.Info("Users table update", zap.Int64("rowsAffected", userRowsAffected))
-
-	if userRowsAffected == 0 {
-		h.logger.Error("no user rows affected - user might not exist", zap.String("user_id", userID.String()))
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "User not found"})
-	}
-
-	// Handle doctor table update/insert with all fields
-	var doctorResult pgconn.CommandTag
-	if !doctorExists {
-		// INSERT new doctor record
-		h.logger.Info("Inserting new doctor record", zap.String("userID", userID.String()))
-
-		if updateData.IMRNumber != nil {
-			// IMR number was provided (could be empty string or actual value)
-			doctorResult, err = tx.Exec(c.Context(),
-				`INSERT INTO doctors (doctor_id, name, imr_number, age, specialization, is_active, qualification, slot_duration, years_of_experience, bio, languages_spoken)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-				userID, updateData.Name, *updateData.IMRNumber, updateData.Age,
-				specializationJSON, updateData.IsActive, updateData.Qualification, updateData.SlotDuration,
-				updateData.YearsOfExperience, updateData.Bio, languagesJSON)
+	// Handle doctor table update/insert with dynamic SQL
+	if hasDoctorFields(&updateData) {
+		var doctorResult pgconn.CommandTag
+		if !doctorExists {
+			// For new doctor records, we need all required fields
+			if !hasRequiredDoctorFields(&updateData) {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+					"error": "Missing required fields for new doctor profile",
+				})
+			}
+			doctorSQL, doctorArgs := buildDoctorInsertSQL(&updateData, userID)
+			doctorResult, err = tx.Exec(c.Context(), doctorSQL, doctorArgs...)
 		} else {
-			// IMR number was not provided, insert without it (will be NULL)
-			doctorResult, err = tx.Exec(c.Context(),
-				`INSERT INTO doctors (doctor_id, name, age, specialization, is_active, qualification, slot_duration, years_of_experience, bio, languages_spoken)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-				userID, updateData.Name, updateData.Age,
-				specializationJSON, updateData.IsActive, updateData.Qualification, updateData.SlotDuration,
-				updateData.YearsOfExperience, updateData.Bio, languagesJSON)
+			// Update existing doctor record
+			doctorSQL, doctorArgs := buildDoctorUpdateSQL(&updateData, userID)
+			doctorResult, err = tx.Exec(c.Context(), doctorSQL, doctorArgs...)
 		}
 
 		if err != nil {
-			h.logger.Error("failed to insert doctor profile", zap.Error(err), zap.String("user_id", userID.String()))
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to create doctor profile"})
-		}
-		h.logger.Info("Doctor profile inserted", zap.Int64("rowsAffected", doctorResult.RowsAffected()))
-	} else {
-		// UPDATE existing doctor record
-		h.logger.Info("Updating existing doctor record", zap.String("userID", userID.String()))
-
-		if updateData.IMRNumber != nil {
-			// IMR number was provided (could be empty string or actual value)
-			h.logger.Info("Updating with IMR number", zap.String("imr", *updateData.IMRNumber))
-			doctorResult, err = tx.Exec(c.Context(),
-				`UPDATE doctors SET name = $1, imr_number = $2, age = $3, specialization = $4, is_active = $5, qualification = $6, slot_duration = $7, years_of_experience = $8, bio = $9, languages_spoken = $10
-                 WHERE doctor_id = $11`,
-				updateData.Name, *updateData.IMRNumber, updateData.Age, specializationJSON,
-				updateData.IsActive, updateData.Qualification, updateData.SlotDuration,
-				updateData.YearsOfExperience, updateData.Bio, languagesJSON, userID)
-		} else {
-			// IMR number was not provided, don't update it (keep existing value)
-			h.logger.Info("Updating without IMR number (keeping existing)")
-			doctorResult, err = tx.Exec(c.Context(),
-				`UPDATE doctors SET name = $1, age = $2, specialization = $3, is_active = $4, qualification = $5, slot_duration = $6, years_of_experience = $7, bio = $8, languages_spoken = $9
-                 WHERE doctor_id = $10`,
-				updateData.Name, updateData.Age, specializationJSON,
-				updateData.IsActive, updateData.Qualification, updateData.SlotDuration,
-				updateData.YearsOfExperience, updateData.Bio, languagesJSON, userID)
-		}
-
-		if err != nil {
-			h.logger.Error("failed to update doctor profile", zap.Error(err), zap.String("user_id", userID.String()))
+			h.logger.Error("failed to update/insert doctor profile", zap.Error(err))
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update doctor profile"})
 		}
 
 		doctorRowsAffected := doctorResult.RowsAffected()
-		h.logger.Info("Doctor profile updated", zap.Int64("rowsAffected", doctorRowsAffected))
-
-		if doctorRowsAffected == 0 {
-			h.logger.Error("no doctor rows affected - doctor might not exist", zap.String("user_id", userID.String()))
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "Failed to update doctor profile - doctor record not found"})
-		}
+		h.logger.Info("Doctor profile updated/inserted", zap.Int64("rowsAffected", doctorRowsAffected))
 	}
 
 	// Commit the transaction
@@ -689,14 +699,248 @@ func (h *DoctorHandler) UpdateDoctorProfile(c *fiber.Ctx) error {
 	}
 	committed = true
 
-	h.logger.Info("Profile update completed successfully",
-		zap.String("userID", userID.String()),
-		zap.Bool("doctorExisted", doctorExists))
+	h.logger.Info("Profile update completed successfully", zap.String("userID", userID.String()))
 
 	return c.JSON(fiber.Map{
 		"message":   "Doctor profile updated successfully",
 		"doctor_id": userID.String(),
 	})
+}
+
+// Helper functions for building dynamic SQL queries
+
+func hasUserFields(updateData *DoctorProfileUpdate) bool {
+	return updateData.Username != nil || updateData.Name != nil || updateData.Mobile != nil ||
+		updateData.BloodGroup != nil || updateData.Location != nil || updateData.Address != nil
+}
+
+func hasDoctorFields(updateData *DoctorProfileUpdate) bool {
+	return updateData.Name != nil || updateData.IMRNumber != nil || updateData.Age != nil ||
+		updateData.Specialization != nil || updateData.IsActive != nil || updateData.Qualification != nil ||
+		updateData.SlotDuration != nil || updateData.YearsOfExperience != nil || updateData.Bio != nil ||
+		len(updateData.LanguagesSpoken) > 0
+}
+
+func hasRequiredDoctorFields(updateData *DoctorProfileUpdate) bool {
+	// Define which fields are required for a new doctor record
+	return updateData.Name != nil && updateData.Age != nil && updateData.Specialization != nil
+}
+
+func buildUserUpdateSQL(updateData *DoctorProfileUpdate, userID uuid.UUID) (string, []interface{}) {
+	var setParts []string
+	var args []interface{}
+	argIndex := 1
+
+	if updateData.Username != nil {
+		setParts = append(setParts, fmt.Sprintf("username = $%d", argIndex))
+		args = append(args, *updateData.Username)
+		argIndex++
+	}
+	if updateData.Name != nil {
+		setParts = append(setParts, fmt.Sprintf("name = $%d", argIndex))
+		args = append(args, *updateData.Name)
+		argIndex++
+	}
+	if updateData.Mobile != nil {
+		setParts = append(setParts, fmt.Sprintf("mobile = $%d", argIndex))
+		args = append(args, *updateData.Mobile)
+		argIndex++
+	}
+	if updateData.BloodGroup != nil {
+		setParts = append(setParts, fmt.Sprintf("blood_group = $%d", argIndex))
+		args = append(args, *updateData.BloodGroup)
+		argIndex++
+	}
+	if updateData.Location != nil {
+		setParts = append(setParts, fmt.Sprintf("location = $%d", argIndex))
+		args = append(args, *updateData.Location)
+		argIndex++
+	}
+	if updateData.Address != nil {
+		setParts = append(setParts, fmt.Sprintf("address = $%d", argIndex))
+		args = append(args, *updateData.Address)
+		argIndex++
+	}
+
+	sql := fmt.Sprintf("UPDATE users SET %s WHERE user_id = $%d", strings.Join(setParts, ", "), argIndex)
+	args = append(args, userID)
+
+	return sql, args
+}
+
+func buildDoctorUpdateSQL(updateData *DoctorProfileUpdate, userID uuid.UUID) (string, []interface{}) {
+	var setParts []string
+	var args []interface{}
+	argIndex := 1
+
+	if updateData.Name != nil {
+		setParts = append(setParts, fmt.Sprintf("name = $%d", argIndex))
+		args = append(args, *updateData.Name)
+		argIndex++
+	}
+	if updateData.IMRNumber != nil {
+		setParts = append(setParts, fmt.Sprintf("imr_number = $%d", argIndex))
+		args = append(args, *updateData.IMRNumber)
+		argIndex++
+	}
+	if updateData.Age != nil {
+		setParts = append(setParts, fmt.Sprintf("age = $%d", argIndex))
+		args = append(args, *updateData.Age)
+		argIndex++
+	}
+	if updateData.Specialization != nil {
+		specializationJSON, _ := json.Marshal(*updateData.Specialization)
+		setParts = append(setParts, fmt.Sprintf("specialization = $%d", argIndex))
+		args = append(args, specializationJSON)
+		argIndex++
+	}
+	if updateData.IsActive != nil {
+		setParts = append(setParts, fmt.Sprintf("is_active = $%d", argIndex))
+		args = append(args, *updateData.IsActive)
+		argIndex++
+	}
+	if updateData.Qualification != nil {
+		setParts = append(setParts, fmt.Sprintf("qualification = $%d", argIndex))
+		args = append(args, *updateData.Qualification)
+		argIndex++
+	}
+	if updateData.SlotDuration != nil {
+		setParts = append(setParts, fmt.Sprintf("slot_duration = $%d", argIndex))
+		args = append(args, *updateData.SlotDuration)
+		argIndex++
+	}
+	if updateData.YearsOfExperience != nil {
+		setParts = append(setParts, fmt.Sprintf("years_of_experience = $%d", argIndex))
+		args = append(args, *updateData.YearsOfExperience)
+		argIndex++
+	}
+	if updateData.Bio != nil {
+		setParts = append(setParts, fmt.Sprintf("bio = $%d", argIndex))
+		args = append(args, *updateData.Bio)
+		argIndex++
+	}
+	if len(updateData.LanguagesSpoken) > 0 {
+		languagesJSON, _ := json.Marshal(updateData.LanguagesSpoken)
+		setParts = append(setParts, fmt.Sprintf("languages_spoken = $%d", argIndex))
+		args = append(args, languagesJSON)
+		argIndex++
+	}
+
+	sql := fmt.Sprintf("UPDATE doctors SET %s WHERE doctor_id = $%d", strings.Join(setParts, ", "), argIndex)
+	args = append(args, userID)
+
+	return sql, args
+}
+
+func buildDoctorInsertSQL(updateData *DoctorProfileUpdate, userID uuid.UUID) (string, []interface{}) {
+	var columns []string
+	var placeholders []string
+	var args []interface{}
+	argIndex := 1
+
+	// Always include doctor_id
+	columns = append(columns, "doctor_id")
+	placeholders = append(placeholders, fmt.Sprintf("$%d", argIndex))
+	args = append(args, userID)
+	argIndex++
+
+	// Add fields that are provided
+	if updateData.Name != nil {
+		columns = append(columns, "name")
+		placeholders = append(placeholders, fmt.Sprintf("$%d", argIndex))
+		args = append(args, *updateData.Name)
+		argIndex++
+	}
+	if updateData.IMRNumber != nil {
+		columns = append(columns, "imr_number")
+		placeholders = append(placeholders, fmt.Sprintf("$%d", argIndex))
+		args = append(args, *updateData.IMRNumber)
+		argIndex++
+	}
+	if updateData.Age != nil {
+		columns = append(columns, "age")
+		placeholders = append(placeholders, fmt.Sprintf("$%d", argIndex))
+		args = append(args, *updateData.Age)
+		argIndex++
+	}
+	if updateData.Specialization != nil {
+		specializationJSON, _ := json.Marshal(*updateData.Specialization)
+		columns = append(columns, "specialization")
+		placeholders = append(placeholders, fmt.Sprintf("$%d", argIndex))
+		args = append(args, specializationJSON)
+		argIndex++
+	}
+	if updateData.IsActive != nil {
+		columns = append(columns, "is_active")
+		placeholders = append(placeholders, fmt.Sprintf("$%d", argIndex))
+		args = append(args, *updateData.IsActive)
+		argIndex++
+	}
+	if updateData.Qualification != nil {
+		columns = append(columns, "qualification")
+		placeholders = append(placeholders, fmt.Sprintf("$%d", argIndex))
+		args = append(args, *updateData.Qualification)
+		argIndex++
+	}
+	if updateData.SlotDuration != nil {
+		columns = append(columns, "slot_duration")
+		placeholders = append(placeholders, fmt.Sprintf("$%d", argIndex))
+		args = append(args, *updateData.SlotDuration)
+		argIndex++
+	}
+	if updateData.YearsOfExperience != nil {
+		columns = append(columns, "years_of_experience")
+		placeholders = append(placeholders, fmt.Sprintf("$%d", argIndex))
+		args = append(args, *updateData.YearsOfExperience)
+		argIndex++
+	}
+	if updateData.Bio != nil {
+		columns = append(columns, "bio")
+		placeholders = append(placeholders, fmt.Sprintf("$%d", argIndex))
+		args = append(args, *updateData.Bio)
+		argIndex++
+	}
+	if len(updateData.LanguagesSpoken) > 0 {
+		languagesJSON, _ := json.Marshal(updateData.LanguagesSpoken)
+		columns = append(columns, "languages_spoken")
+		placeholders = append(placeholders, fmt.Sprintf("$%d", argIndex))
+		args = append(args, languagesJSON)
+		argIndex++
+	}
+
+	sql := fmt.Sprintf("INSERT INTO doctors (%s) VALUES (%s)",
+		strings.Join(columns, ", "), strings.Join(placeholders, ", "))
+
+	return sql, args
+}
+
+// You'll also need to implement this validation function
+func (h *DoctorHandler) validateDoctorProfileUpdateFields(updateData *DoctorProfileUpdate) error {
+	// Add your validation logic here for individual fields
+	// Example validations:
+
+	if updateData.Username != nil && *updateData.Username == "" {
+		return errors.New("username cannot be empty")
+	}
+
+	if updateData.Name != nil && *updateData.Name == "" {
+		return errors.New("name cannot be empty")
+	}
+
+	if updateData.Age != nil && (*updateData.Age < 18 || *updateData.Age > 100) {
+		return errors.New("age must be between 18 and 100")
+	}
+
+	if updateData.SlotDuration != nil && *updateData.SlotDuration <= 0 {
+		return errors.New("slot duration must be positive")
+	}
+
+	if updateData.YearsOfExperience != nil && *updateData.YearsOfExperience < 0 {
+		return errors.New("years of experience cannot be negative")
+	}
+
+	// Add more validation as needed
+	return nil
 }
 
 // Helper function to validate schedule data
