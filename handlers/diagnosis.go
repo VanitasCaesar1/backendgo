@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"mime/multipart"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,7 +19,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/lib/pq"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.uber.org/zap"
 )
 
@@ -88,6 +93,57 @@ type DiagnosisRequest struct {
 	Referrals          []string         `json:"referrals,omitempty"`
 	ClinicalNotes      *string          `json:"clinical_notes,omitempty"`
 	Attachments        []Attachment     `json:"attachments,omitempty"`
+}
+
+type DermatologyAssessment struct {
+	ID            primitive.ObjectID `bson:"_id,omitempty" json:"id,omitempty"`
+	AppointmentID string             `bson:"appointment_id" json:"appointment_id" validate:"required"`
+	PatientID     *string            `bson:"patient_id" json:"patient_id"`
+	DoctorID      *string            `bson:"doctor_id" json:"doctor_id"`
+	OrgID         *string            `bson:"org_id" json:"org_id"`
+	CreatedAt     *time.Time         `bson:"created_at" json:"created_at"`
+	UpdatedAt     *time.Time         `bson:"updated_at" json:"updated_at"`
+	CreatedBy     *string            `bson:"created_by" json:"created_by"`
+	UpdatedBy     *string            `bson:"updated_by" json:"updated_by"`
+
+	// Clinical Data
+	LesionDescription       *string                `bson:"lesion_description" json:"lesion_description"`
+	Distribution            *string                `bson:"distribution" json:"distribution"`
+	SkinColorChanges        *string                `bson:"skin_color_changes" json:"skin_color_changes"`
+	AffectedAreas           []string               `bson:"affected_areas" json:"affected_areas"`
+	CustomAffectedArea      *string                `bson:"custom_affected_area" json:"custom_affected_area"`
+	DescriptiveFindings     *string                `bson:"descriptive_findings" json:"descriptive_findings"`
+	PhysicalExamNotes       *string                `bson:"physical_exam_notes" json:"physical_exam_notes"`
+	DiagnosticProcedures    []string               `bson:"diagnostic_procedures" json:"diagnostic_procedures"`
+	LesionCharacteristics   map[string]interface{} `bson:"lesion_characteristics" json:"lesion_characteristics"`
+	SkincareRecommendations map[string]interface{} `bson:"skincare_recommendations" json:"skincare_recommendations"`
+	Medications             []string               `bson:"medications" json:"medications"`
+	ImagingNotes            *string                `bson:"imaging_notes" json:"imaging_notes"`
+	ClinicalPhotography     *string                `bson:"clinical_photography" json:"clinical_photography"`
+	DermoscopyFindings      *string                `bson:"dermoscopy_findings" json:"dermoscopy_findings"`
+	FollowUpRecommendations *string                `bson:"follow_up_recommendations" json:"follow_up_recommendations"`
+	ReferralNeeded          *bool                  `bson:"referral_needed" json:"referral_needed"`
+	ReferralSpecialty       *string                `bson:"referral_specialty" json:"referral_specialty"`
+	ReferralReason          *string                `bson:"referral_reason" json:"referral_reason"`
+	DifferentialDiagnosis   []string               `bson:"differential_diagnosis" json:"differential_diagnosis"`
+	WorkingDiagnosis        *string                `bson:"working_diagnosis" json:"working_diagnosis"`
+	AssessmentNotes         *string                `bson:"assessment_notes" json:"assessment_notes"`
+	SeverityAssessment      *string                `bson:"severity_assessment" json:"severity_assessment"`
+	Prognosis               *string                `bson:"prognosis" json:"prognosis"`
+	PatientEducation        *string                `bson:"patient_education" json:"patient_education"`
+	Status                  *string                `bson:"status" json:"status"`
+	VisitType               *string                `bson:"visit_type" json:"visit_type"`
+	Attachments             []Attachment           `bson:"attachments" json:"attachments"`
+}
+
+// Attachment represents file attachments
+type Attachment struct {
+	Filename    string           `bson:"filename" json:"filename"`
+	ContentType string           `bson:"contentType" json:"contentType"`
+	Size        int64            `bson:"size" json:"size"`
+	Data        primitive.Binary `bson:"data" json:"-"`
+	UploadedAt  time.Time        `bson:"uploadedAt" json:"uploadedAt"`
+	UploadedBy  string           `bson:"uploadedBy" json:"uploadedBy"`
 }
 
 func (t Treatment) Value() (driver.Value, error) {
@@ -1327,7 +1383,7 @@ type VitalsResponse struct {
 	Height           *float64 `json:"height"`
 	BMI              *float64 `json:"bmi"`
 	RespiratoryRate  *int     `json:"respiratory_rate"`
-	OxygenSaturation *int     `json:"oxygen_saturation"`
+	OxygenSaturation *float64 `json:"oxygen_saturation"`
 }
 
 type MedicalHistoryRecord struct {
@@ -1402,9 +1458,766 @@ type TestResult struct {
 	Notes    string    `json:"notes"`
 }
 
-type Attachment struct {
-	FileName string `json:"file_name"`
-	FileType string `json:"file_type"`
-	FileSize int64  `json:"file_size"`
-	URL      string `json:"url"`
+// getDermatologyCollection returns the MongoDB collection
+func (h *DiagnosisHandler) getDermatologyCollection() *mongo.Collection {
+	return h.mongoClient.Database(h.config.MongoDBName).Collection("dermatology_assessments")
+}
+
+// GetDermatologyDiagnosis retrieves a dermatology diagnosis by appointment ID
+func (h *DiagnosisHandler) GetDermatologyDiagnosis(c *fiber.Ctx) error {
+	appointmentID := c.Params("id")
+	if appointmentID == "" {
+		h.logger.Error("Missing appointment ID")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Appointment ID is required",
+		})
+	}
+
+	h.logger.Info("GET request for dermatology diagnosis", zap.String("appointment_id", appointmentID))
+
+	// Get auth ID from context using standardized method
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context", zap.Error(err))
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "Authentication required",
+		})
+	}
+	fmt.Println("Auth ID:", authID)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	collection := h.getDermatologyCollection()
+
+	var diagnosis DermatologyAssessment
+	err = collection.FindOne(ctx, bson.M{"appointment_id": appointmentID}).Decode(&diagnosis)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			h.logger.Info("Dermatology diagnosis not found", zap.String("appointment_id", appointmentID))
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"error": "Dermatology diagnosis not found",
+			})
+		}
+		h.logger.Error("Error fetching dermatology diagnosis", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to fetch dermatology diagnosis",
+		})
+	}
+
+	h.logger.Info("Dermatology diagnosis found", zap.String("appointment_id", appointmentID))
+	return c.JSON(fiber.Map{
+		"success": true,
+		"data":    diagnosis,
+	})
+}
+
+// CreateDermatologyDiagnosis creates a new dermatology diagnosis
+func (h *DiagnosisHandler) CreateDermatologyDiagnosis(c *fiber.Ctx) error {
+	appointmentID := c.Params("id")
+	if appointmentID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Appointment ID is required",
+		})
+	}
+
+	h.logger.Info("POST request for dermatology diagnosis", zap.String("appointment_id", appointmentID))
+
+	// Get auth ID from context using standardized method
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context", zap.Error(err))
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "Authentication required",
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Add validation for collection
+	collection := h.getDermatologyCollection()
+	if collection == nil {
+		h.logger.Error("Failed to get dermatology collection")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Database configuration error",
+		})
+	}
+
+	// Test database connection before proceeding
+	if err := collection.Database().Client().Ping(ctx, nil); err != nil {
+		h.logger.Error("Database connection failed", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Database connection unavailable",
+		})
+	}
+
+	// Validate appointmentID format (assuming ObjectID)
+	if !primitive.IsValidObjectID(appointmentID) {
+		h.logger.Error("Invalid appointment ID format", zap.String("appointment_id", appointmentID))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid appointment ID format",
+		})
+	}
+
+	// Check if diagnosis already exists with more detailed error handling
+	filter := bson.M{"appointment_id": appointmentID}
+	count, err := collection.CountDocuments(ctx, filter)
+	if err != nil {
+		h.logger.Error("Error checking existing diagnosis",
+			zap.Error(err),
+			zap.String("appointment_id", appointmentID),
+			zap.Any("filter", filter))
+
+		// Check if it's a timeout error
+		if ctx.Err() == context.DeadlineExceeded {
+			return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{
+				"error": "Database operation timed out",
+			})
+		}
+
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Database error while checking existing diagnosis",
+		})
+	}
+
+	if count > 0 {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+			"error": "Dermatology diagnosis already exists for this appointment. Use PUT to update.",
+		})
+	}
+
+	// Parse the request based on content type with enhanced error handling
+	diagnosis, err := h.parseDermatologyRequest(c, appointmentID, authID, true)
+	if err != nil {
+		h.logger.Error("Error parsing request",
+			zap.Error(err),
+			zap.String("appointment_id", appointmentID),
+			zap.String("content_type", c.Get("Content-Type")))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": fmt.Sprintf("Request parsing error: %v", err),
+		})
+	}
+
+	// Validate diagnosis data before insertion
+	if diagnosis == nil {
+		h.logger.Error("Parsed diagnosis is nil")
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid diagnosis data",
+		})
+	}
+
+	// Set creation timestamps
+	now := time.Now()
+	diagnosis.CreatedAt = &now
+	diagnosis.UpdatedAt = &now
+	diagnosis.CreatedBy = &authID
+
+	h.logger.Info("Inserting dermatology diagnosis",
+		zap.String("appointment_id", appointmentID),
+		zap.Int("attachments_count", len(diagnosis.Attachments)),
+		zap.String("created_by", authID))
+
+	// Validate document structure before insertion
+	docBytes, err := bson.Marshal(diagnosis)
+	if err != nil {
+		h.logger.Error("Error marshaling diagnosis document", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Invalid document structure",
+		})
+	}
+
+	// Log document size for debugging
+	h.logger.Info("Document size", zap.Int("bytes", len(docBytes)))
+
+	// Insert with write concern and enhanced error handling
+	insertOptions := options.InsertOne().SetComment("Create dermatology diagnosis")
+	result, err := collection.InsertOne(ctx, diagnosis, insertOptions)
+	if err != nil {
+		h.logger.Error("Error inserting dermatology diagnosis",
+			zap.Error(err),
+			zap.String("appointment_id", appointmentID),
+			zap.String("error_type", fmt.Sprintf("%T", err)))
+
+		// Check for specific MongoDB errors
+		if mongo.IsDuplicateKeyError(err) {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+				"error": "Duplicate diagnosis found",
+			})
+		}
+
+		if ctx.Err() == context.DeadlineExceeded {
+			return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{
+				"error": "Database operation timed out",
+			})
+		}
+
+		// Check for validation errors
+		var writeErr mongo.WriteException
+		if errors.As(err, &writeErr) {
+			h.logger.Error("MongoDB write error details",
+				zap.Any("write_errors", writeErr.WriteErrors))
+		}
+
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error":   "Failed to create dermatology diagnosis",
+			"details": err.Error(), // Include error details for debugging
+		})
+	}
+
+	// Validate the insertion result
+	if result.InsertedID == nil {
+		h.logger.Error("Insert operation returned nil ID")
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to generate document ID",
+		})
+	}
+
+	insertedID, ok := result.InsertedID.(primitive.ObjectID)
+	if !ok {
+		h.logger.Error("Inserted ID is not ObjectID",
+			zap.Any("inserted_id", result.InsertedID),
+			zap.String("type", fmt.Sprintf("%T", result.InsertedID)))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Invalid document ID format",
+		})
+	}
+
+	h.logger.Info("Dermatology diagnosis created successfully",
+		zap.String("id", insertedID.Hex()),
+		zap.String("appointment_id", appointmentID))
+
+	// Optional: Verify the document was created (if frontend expects it)
+	var createdDoc bson.M
+	err = collection.FindOne(ctx, bson.M{"_id": insertedID}).Decode(&createdDoc)
+	if err != nil {
+		h.logger.Error("Document created but verification failed",
+			zap.Error(err),
+			zap.String("id", insertedID.Hex()))
+		// Document was created successfully, but we can't verify it
+		// Return success anyway since the insert operation succeeded
+	}
+
+	// Return success response with comprehensive data
+	response := fiber.Map{
+		"success":           true,
+		"message":           "Dermatology diagnosis created successfully",
+		"id":                insertedID.Hex(),
+		"appointment_id":    appointmentID,
+		"attachments_count": len(diagnosis.Attachments),
+		"status":            diagnosis.Status,
+		"created_at":        diagnosis.CreatedAt,
+	}
+
+	// Add verified document data if available
+	if createdDoc != nil {
+		response["data"] = createdDoc
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(response)
+}
+
+// UpdateDermatologyDiagnosis updates an existing dermatology diagnosis
+func (h *DiagnosisHandler) UpdateDermatologyDiagnosis(c *fiber.Ctx) error {
+	appointmentID := c.Params("id")
+	if appointmentID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Appointment ID is required",
+		})
+	}
+
+	h.logger.Info("PUT request for dermatology diagnosis", zap.String("appointment_id", appointmentID))
+
+	// Get auth ID from context using standardized method
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context", zap.Error(err))
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "Authentication required",
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	collection := h.getDermatologyCollection()
+
+	// Check if diagnosis exists
+	var existingDiagnosis DermatologyAssessment
+	err = collection.FindOne(ctx, bson.M{"appointment_id": appointmentID}).Decode(&existingDiagnosis)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+				"error": "Dermatology diagnosis not found. Use POST to create new diagnosis.",
+			})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Database error",
+		})
+	}
+
+	// Parse the update request
+	updatedDiagnosis, err := h.parseDermatologyRequest(c, appointmentID, authID, false)
+	if err != nil {
+		h.logger.Error("Error parsing update request", zap.Error(err))
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": err.Error(),
+		})
+	}
+
+	// Prepare update document
+	updateDoc := bson.M{
+		"updated_at": time.Now(),
+		"updated_by": authID,
+	}
+
+	// Build update fields dynamically
+	h.buildUpdateFields(updatedDiagnosis, updateDoc)
+
+	// Handle attachments - append new ones to existing
+	if len(updatedDiagnosis.Attachments) > 0 {
+		existingAttachments := existingDiagnosis.Attachments
+		if existingAttachments == nil {
+			existingAttachments = make([]Attachment, 0)
+		}
+		updateDoc["attachments"] = append(existingAttachments, updatedDiagnosis.Attachments...)
+		h.logger.Info("Adding new attachments", zap.Int("new_count", len(updatedDiagnosis.Attachments)))
+	}
+
+	// Check if there's anything to update
+	if len(updateDoc) <= 2 { // Only updated_at and updated_by
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"message": "No valid data provided for update",
+		})
+	}
+
+	h.logger.Info("Executing MongoDB update",
+		zap.String("appointment_id", appointmentID),
+		zap.Int("fields_count", len(updateDoc)))
+
+	// Execute the update - using v2 syntax
+	updateOpts := options.UpdateOne().SetComment("Update dermatology diagnosis")
+	result, err := collection.UpdateOne(
+		ctx,
+		bson.M{"appointment_id": appointmentID},
+		bson.M{"$set": updateDoc},
+		updateOpts,
+	)
+	if err != nil {
+		h.logger.Error("Error updating dermatology diagnosis", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to update dermatology diagnosis",
+		})
+	}
+
+	message := "Document found but no changes were made"
+	if result.ModifiedCount > 0 {
+		message = "Dermatology diagnosis updated successfully"
+	}
+
+	h.logger.Info("Update completed",
+		zap.Int64("modified_count", result.ModifiedCount),
+		zap.Int64("matched_count", result.MatchedCount))
+
+	return c.JSON(fiber.Map{
+		"success":           result.MatchedCount > 0,
+		"message":           message,
+		"modified_count":    result.ModifiedCount,
+		"attachments_added": len(updatedDiagnosis.Attachments),
+	})
+}
+
+// DeleteDermatologyDiagnosis deletes a dermatology diagnosis
+func (h *DiagnosisHandler) DeleteDermatologyDiagnosis(c *fiber.Ctx) error {
+	appointmentID := c.Params("id")
+	if appointmentID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Appointment ID is required",
+		})
+	}
+
+	h.logger.Info("DELETE request for dermatology diagnosis", zap.String("appointment_id", appointmentID))
+
+	// Get auth ID from context using standardized method
+	authID, err := h.getAuthID(c)
+	if err != nil {
+		h.logger.Error("authID not found in context", zap.Error(err))
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": "Authentication required",
+		})
+	}
+	fmt.Println("Auth ID:", authID)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	collection := h.getDermatologyCollection()
+
+	// Check if diagnosis exists
+	count, err := collection.CountDocuments(ctx, bson.M{"appointment_id": appointmentID})
+	if err != nil {
+		h.logger.Error("Error checking diagnosis existence", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Database error",
+		})
+	}
+	if count == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Dermatology diagnosis not found",
+		})
+	}
+
+	// Delete the diagnosis - using v2 syntax
+	deleteOpts := options.DeleteOne().SetComment("Delete dermatology diagnosis")
+	result, err := collection.DeleteOne(
+		ctx,
+		bson.M{"appointment_id": appointmentID},
+		deleteOpts,
+	)
+	if err != nil {
+		h.logger.Error("Error deleting dermatology diagnosis", zap.Error(err))
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to delete dermatology diagnosis",
+		})
+	}
+
+	h.logger.Info("Dermatology diagnosis deleted",
+		zap.String("appointment_id", appointmentID),
+		zap.Int64("deleted_count", result.DeletedCount))
+
+	return c.JSON(fiber.Map{
+		"success":       true,
+		"message":       "Dermatology diagnosis deleted successfully",
+		"deleted_count": result.DeletedCount,
+	})
+}
+
+// buildUpdateFields dynamically adds non-nil/non-zero fields from updatedDiagnosis to updateDoc for MongoDB update.
+func (h *DiagnosisHandler) buildUpdateFields(updated *DermatologyAssessment, updateDoc bson.M) {
+	if updated.PatientID != nil {
+		updateDoc["patient_id"] = updated.PatientID
+	}
+	if updated.DoctorID != nil {
+		updateDoc["doctor_id"] = updated.DoctorID
+	}
+	if updated.OrgID != nil {
+		updateDoc["org_id"] = updated.OrgID
+	}
+	if updated.LesionDescription != nil {
+		updateDoc["lesion_description"] = updated.LesionDescription
+	}
+	if updated.Distribution != nil {
+		updateDoc["distribution"] = updated.Distribution
+	}
+	if updated.SkinColorChanges != nil {
+		updateDoc["skin_color_changes"] = updated.SkinColorChanges
+	}
+	if len(updated.AffectedAreas) > 0 {
+		updateDoc["affected_areas"] = updated.AffectedAreas
+	}
+	if updated.CustomAffectedArea != nil {
+		updateDoc["custom_affected_area"] = updated.CustomAffectedArea
+	}
+	if updated.DescriptiveFindings != nil {
+		updateDoc["descriptive_findings"] = updated.DescriptiveFindings
+	}
+	if updated.PhysicalExamNotes != nil {
+		updateDoc["physical_exam_notes"] = updated.PhysicalExamNotes
+	}
+	if len(updated.DiagnosticProcedures) > 0 {
+		updateDoc["diagnostic_procedures"] = updated.DiagnosticProcedures
+	}
+	if len(updated.LesionCharacteristics) > 0 {
+		updateDoc["lesion_characteristics"] = updated.LesionCharacteristics
+	}
+	if len(updated.SkincareRecommendations) > 0 {
+		updateDoc["skincare_recommendations"] = updated.SkincareRecommendations
+	}
+	if len(updated.Medications) > 0 {
+		updateDoc["medications"] = updated.Medications
+	}
+	if updated.ImagingNotes != nil {
+		updateDoc["imaging_notes"] = updated.ImagingNotes
+	}
+	if updated.ClinicalPhotography != nil {
+		updateDoc["clinical_photography"] = updated.ClinicalPhotography
+	}
+	if updated.DermoscopyFindings != nil {
+		updateDoc["dermoscopy_findings"] = updated.DermoscopyFindings
+	}
+	if updated.FollowUpRecommendations != nil {
+		updateDoc["follow_up_recommendations"] = updated.FollowUpRecommendations
+	}
+	if updated.ReferralNeeded != nil {
+		updateDoc["referral_needed"] = updated.ReferralNeeded
+	}
+	if updated.ReferralSpecialty != nil {
+		updateDoc["referral_specialty"] = updated.ReferralSpecialty
+	}
+	if updated.ReferralReason != nil {
+		updateDoc["referral_reason"] = updated.ReferralReason
+	}
+	if len(updated.DifferentialDiagnosis) > 0 {
+		updateDoc["differential_diagnosis"] = updated.DifferentialDiagnosis
+	}
+	if updated.WorkingDiagnosis != nil {
+		updateDoc["working_diagnosis"] = updated.WorkingDiagnosis
+	}
+	if updated.AssessmentNotes != nil {
+		updateDoc["assessment_notes"] = updated.AssessmentNotes
+	}
+	if updated.SeverityAssessment != nil {
+		updateDoc["severity_assessment"] = updated.SeverityAssessment
+	}
+	if updated.Prognosis != nil {
+		updateDoc["prognosis"] = updated.Prognosis
+	}
+	if updated.PatientEducation != nil {
+		updateDoc["patient_education"] = updated.PatientEducation
+	}
+	if updated.Status != nil {
+		updateDoc["status"] = updated.Status
+	}
+	if updated.VisitType != nil {
+		updateDoc["visit_type"] = updated.VisitType
+	}
+	// Attachments are handled separately in the calling function.
+}
+
+// parseDermatologyRequest parses either multipart form data or JSON
+func (h *DiagnosisHandler) parseDermatologyRequest(c *fiber.Ctx, appointmentID, userID string, isCreate bool) (*DermatologyAssessment, error) {
+	contentType := c.Get("Content-Type")
+	diagnosis := &DermatologyAssessment{
+		AppointmentID: appointmentID,
+	}
+
+	if strings.Contains(contentType, "multipart/form-data") {
+		return h.parseMultipartData(c, diagnosis, userID)
+	}
+
+	return h.parseJSONData(c, diagnosis)
+}
+
+// parseMultipartData parses multipart form data
+func (h *DiagnosisHandler) parseMultipartData(c *fiber.Ctx, diagnosis *DermatologyAssessment, userID string) (*DermatologyAssessment, error) {
+	form, err := c.MultipartForm()
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse multipart form: %w", err)
+	}
+
+	// Parse text fields
+	h.parseTextFields(form, diagnosis)
+
+	// Parse array fields
+	err = h.parseArrayFields(form, diagnosis)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse object fields
+	err = h.parseObjectFields(form, diagnosis)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse boolean fields
+	h.parseBooleanFields(form, diagnosis)
+
+	// Process file attachments
+	err = h.processFileAttachments(form, diagnosis, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	return diagnosis, nil
+}
+
+// parseJSONData parses JSON request body
+func (h *DiagnosisHandler) parseJSONData(c *fiber.Ctx, diagnosis *DermatologyAssessment) (*DermatologyAssessment, error) {
+	if err := c.BodyParser(diagnosis); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON body: %w", err)
+	}
+	return diagnosis, nil
+}
+
+// parseTextFields parses text form fields
+func (h *DiagnosisHandler) parseTextFields(form *multipart.Form, diagnosis *DermatologyAssessment) {
+	textFields := map[string]**string{
+		"patient_id":                &diagnosis.PatientID,
+		"doctor_id":                 &diagnosis.DoctorID,
+		"org_id":                    &diagnosis.OrgID,
+		"lesion_description":        &diagnosis.LesionDescription,
+		"distribution":              &diagnosis.Distribution,
+		"skin_color_changes":        &diagnosis.SkinColorChanges,
+		"custom_affected_area":      &diagnosis.CustomAffectedArea,
+		"descriptive_findings":      &diagnosis.DescriptiveFindings,
+		"physical_exam_notes":       &diagnosis.PhysicalExamNotes,
+		"imaging_notes":             &diagnosis.ImagingNotes,
+		"clinical_photography":      &diagnosis.ClinicalPhotography,
+		"dermoscopy_findings":       &diagnosis.DermoscopyFindings,
+		"follow_up_recommendations": &diagnosis.FollowUpRecommendations,
+		"referral_specialty":        &diagnosis.ReferralSpecialty,
+		"referral_reason":           &diagnosis.ReferralReason,
+		"working_diagnosis":         &diagnosis.WorkingDiagnosis,
+		"assessment_notes":          &diagnosis.AssessmentNotes,
+		"severity_assessment":       &diagnosis.SeverityAssessment,
+		"prognosis":                 &diagnosis.Prognosis,
+		"patient_education":         &diagnosis.PatientEducation,
+		"status":                    &diagnosis.Status,
+		"visit_type":                &diagnosis.VisitType,
+	}
+
+	for fieldName, fieldPtr := range textFields {
+		if values, ok := form.Value[fieldName]; ok && len(values) > 0 {
+			value := strings.TrimSpace(values[0])
+			if value != "" {
+				*fieldPtr = &value
+			}
+		}
+	}
+}
+
+// parseArrayFields parses array form fields
+func (h *DiagnosisHandler) parseArrayFields(form *multipart.Form, diagnosis *DermatologyAssessment) error {
+	arrayFields := map[string]*[]string{
+		"affected_areas":         &diagnosis.AffectedAreas,
+		"diagnostic_procedures":  &diagnosis.DiagnosticProcedures,
+		"medications":            &diagnosis.Medications,
+		"differential_diagnosis": &diagnosis.DifferentialDiagnosis,
+	}
+
+	for fieldName, fieldPtr := range arrayFields {
+		if values, ok := form.Value[fieldName]; ok && len(values) > 0 {
+			jsonStr := strings.TrimSpace(values[0])
+			if jsonStr != "" {
+				var arr []string
+				if err := json.Unmarshal([]byte(jsonStr), &arr); err != nil {
+					return fmt.Errorf("invalid JSON for %s: %w", fieldName, err)
+				}
+				*fieldPtr = arr
+			}
+		}
+	}
+
+	return nil
+}
+
+// parseObjectFields parses object form fields
+func (h *DiagnosisHandler) parseObjectFields(form *multipart.Form, diagnosis *DermatologyAssessment) error {
+	objectFields := map[string]*map[string]interface{}{
+		"lesion_characteristics":   &diagnosis.LesionCharacteristics,
+		"skincare_recommendations": &diagnosis.SkincareRecommendations,
+	}
+
+	for fieldName, fieldPtr := range objectFields {
+		if values, ok := form.Value[fieldName]; ok && len(values) > 0 {
+			jsonStr := strings.TrimSpace(values[0])
+			if jsonStr != "" {
+				var obj map[string]interface{}
+				if err := json.Unmarshal([]byte(jsonStr), &obj); err != nil {
+					return fmt.Errorf("invalid JSON for %s: %w", fieldName, err)
+				}
+				*fieldPtr = obj
+			}
+		}
+	}
+
+	return nil
+}
+
+// parseBooleanFields parses boolean form fields
+func (h *DiagnosisHandler) parseBooleanFields(form *multipart.Form, diagnosis *DermatologyAssessment) {
+	if values, ok := form.Value["referral_needed"]; ok && len(values) > 0 {
+		value := strings.ToLower(strings.TrimSpace(values[0]))
+		boolVal := value == "true"
+		diagnosis.ReferralNeeded = &boolVal
+	}
+}
+
+// processFileAttachments processes uploaded files
+func (h *DiagnosisHandler) processFileAttachments(form *multipart.Form, diagnosis *DermatologyAssessment, userID string) error {
+	files := form.File["attachments"]
+	if len(files) == 0 {
+		return nil
+	}
+
+	h.logger.Info("Processing file attachments", zap.Int("count", len(files)))
+
+	validTypes := map[string]bool{
+		"image/png":          true,
+		"image/jpeg":         true,
+		"image/jpg":          true,
+		"image/gif":          true,
+		"image/webp":         true,
+		"application/pdf":    true,
+		"text/plain":         true,
+		"application/msword": true,
+		"application/vnd.openxmlformats-officedocument.wordprocessingml.document": true,
+	}
+
+	const maxFileSize = 10 * 1024 * 1024 // 10MB
+
+	attachments := make([]Attachment, 0, len(files))
+
+	for _, file := range files {
+		if file.Size == 0 {
+			continue
+		}
+
+		// Validate file size
+		if file.Size > maxFileSize {
+			return fmt.Errorf("file %s is too large. Maximum size is 10MB", file.Filename)
+		}
+
+		// Validate file type
+		contentType := file.Header.Get("Content-Type")
+		if contentType == "" {
+			// Try to guess from extension
+			ext := strings.ToLower(filepath.Ext(file.Filename))
+			switch ext {
+			case ".png":
+				contentType = "image/png"
+			case ".jpg", ".jpeg":
+				contentType = "image/jpeg"
+			case ".gif":
+				contentType = "image/gif"
+			case ".pdf":
+				contentType = "application/pdf"
+			case ".txt":
+				contentType = "text/plain"
+			default:
+				return fmt.Errorf("unknown file type for %s", file.Filename)
+			}
+		}
+
+		if !validTypes[contentType] {
+			return fmt.Errorf("invalid file type for %s. Allowed types: images, PDF, Word documents, and text files", file.Filename)
+		}
+
+		// Read file data
+		fileReader, err := file.Open()
+		if err != nil {
+			return fmt.Errorf("failed to open file %s: %w", file.Filename, err)
+		}
+		defer fileReader.Close()
+
+		fileData, err := io.ReadAll(fileReader)
+		if err != nil {
+			return fmt.Errorf("failed to read file %s: %w", file.Filename, err)
+		}
+
+		attachment := Attachment{
+			Filename:    file.Filename,
+			ContentType: contentType,
+			Size:        file.Size,
+			Data:        primitive.Binary{Data: fileData},
+			UploadedAt:  time.Now(),
+			UploadedBy:  userID,
+		}
+
+		attachments = append(attachments, attachment)
+		h.logger.Info("File processed successfully", zap.String("filename", file.Filename))
+	}
+
+	diagnosis.Attachments = attachments
+	return nil
 }
