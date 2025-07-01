@@ -1551,11 +1551,11 @@ func (h *DiagnosisHandler) CreateDermatologyDiagnosis(c *fiber.Ctx) error {
 		})
 	}
 
-	// Validate appointmentID format (assuming ObjectID)
-	if !primitive.IsValidObjectID(appointmentID) {
+	// Validate appointmentID format (UUID instead of ObjectID)
+	if !isValidUUID(appointmentID) {
 		h.logger.Error("Invalid appointment ID format", zap.String("appointment_id", appointmentID))
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid appointment ID format",
+			"error": "Invalid appointment ID format - expected UUID",
 		})
 	}
 
@@ -1660,7 +1660,7 @@ func (h *DiagnosisHandler) CreateDermatologyDiagnosis(c *fiber.Ctx) error {
 
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error":   "Failed to create dermatology diagnosis",
-			"details": err.Error(), // Include error details for debugging
+			"details": err.Error(),
 		})
 	}
 

@@ -553,7 +553,7 @@ func (a *App) setupRoutes() error {
 	diagnosisGroup.Get("/:id", diagnosisHandler.GetDiagnosis)
 	diagnosisGroup.Post("/create", diagnosisHandler.CreateDiagnosis)
 	diagnosisGroup.Get("/:id/dermatology", diagnosisHandler.GetDermatologyDiagnosis)
-	diagnosisGroup.Put("/:id/dermatology", diagnosisHandler.UpdateDermatologyDiagnosis)
+	diagnosisGroup.Put("/:id/dermatology", diagnosisHandler.CreateDermatologyDiagnosis)
 	diagnosisGroup.Delete("/:id/dermatology", diagnosisHandler.DeleteDermatologyDiagnosis)
 	diagnosisGroup.Post("/:id/dermatology", diagnosisHandler.CreateDermatologyDiagnosis)
 
