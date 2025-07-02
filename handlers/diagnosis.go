@@ -94,46 +94,65 @@ type DiagnosisRequest struct {
 	ClinicalNotes      *string          `json:"clinical_notes,omitempty"`
 	Attachments        []Attachment     `json:"attachments,omitempty"`
 }
-
 type DermatologyAssessment struct {
+	// Use appointment_id as the MongoDB _id field
 	ID            primitive.ObjectID `bson:"_id,omitempty" json:"id,omitempty"`
-	AppointmentID string             `bson:"appointment_id" json:"appointment_id" validate:"required"`
-	PatientID     *string            `bson:"patient_id" json:"patient_id"`
-	DoctorID      *string            `bson:"doctor_id" json:"doctor_id"`
-	OrgID         *string            `bson:"org_id" json:"org_id"`
-	CreatedAt     *time.Time         `bson:"created_at" json:"created_at"`
-	UpdatedAt     *time.Time         `bson:"updated_at" json:"updated_at"`
-	CreatedBy     *string            `bson:"created_by" json:"created_by"`
-	UpdatedBy     *string            `bson:"updated_by" json:"updated_by"`
+	AppointmentID string             `bson:"appointment_id" json:"appointment_id"`
 
-	// Clinical Data
-	LesionDescription       *string                `bson:"lesion_description" json:"lesion_description"`
-	Distribution            *string                `bson:"distribution" json:"distribution"`
-	SkinColorChanges        *string                `bson:"skin_color_changes" json:"skin_color_changes"`
-	AffectedAreas           []string               `bson:"affected_areas" json:"affected_areas"`
-	CustomAffectedArea      *string                `bson:"custom_affected_area" json:"custom_affected_area"`
-	DescriptiveFindings     *string                `bson:"descriptive_findings" json:"descriptive_findings"`
-	PhysicalExamNotes       *string                `bson:"physical_exam_notes" json:"physical_exam_notes"`
-	DiagnosticProcedures    []string               `bson:"diagnostic_procedures" json:"diagnostic_procedures"`
-	LesionCharacteristics   map[string]interface{} `bson:"lesion_characteristics" json:"lesion_characteristics"`
-	SkincareRecommendations map[string]interface{} `bson:"skincare_recommendations" json:"skincare_recommendations"`
-	Medications             []string               `bson:"medications" json:"medications"`
-	ImagingNotes            *string                `bson:"imaging_notes" json:"imaging_notes"`
-	ClinicalPhotography     *string                `bson:"clinical_photography" json:"clinical_photography"`
-	DermoscopyFindings      *string                `bson:"dermoscopy_findings" json:"dermoscopy_findings"`
-	FollowUpRecommendations *string                `bson:"follow_up_recommendations" json:"follow_up_recommendations"`
-	ReferralNeeded          *bool                  `bson:"referral_needed" json:"referral_needed"`
-	ReferralSpecialty       *string                `bson:"referral_specialty" json:"referral_specialty"`
-	ReferralReason          *string                `bson:"referral_reason" json:"referral_reason"`
-	DifferentialDiagnosis   []string               `bson:"differential_diagnosis" json:"differential_diagnosis"`
-	WorkingDiagnosis        *string                `bson:"working_diagnosis" json:"working_diagnosis"`
-	AssessmentNotes         *string                `bson:"assessment_notes" json:"assessment_notes"`
-	SeverityAssessment      *string                `bson:"severity_assessment" json:"severity_assessment"`
-	Prognosis               *string                `bson:"prognosis" json:"prognosis"`
-	PatientEducation        *string                `bson:"patient_education" json:"patient_education"`
-	Status                  *string                `bson:"status" json:"status"`
-	VisitType               *string                `bson:"visit_type" json:"visit_type"`
-	Attachments             []Attachment           `bson:"attachments" json:"attachments"`
+	PatientID *string `json:"patient_id" bson:"patient_id,omitempty"`
+	DoctorID  *string `json:"doctor_id" bson:"doctor_id,omitempty"`
+	OrgID     *string `json:"org_id" bson:"org_id,omitempty"`
+
+	// Lesion details
+	LesionDescription     *string                `json:"lesion_description" bson:"lesion_description,omitempty"`
+	LesionCharacteristics map[string]interface{} `json:"lesion_characteristics" bson:"lesion_characteristics,omitempty"`
+	Distribution          *string                `json:"distribution" bson:"distribution,omitempty"`
+	SkinColorChanges      *string                `json:"skin_color_changes" bson:"skin_color_changes,omitempty"`
+
+	// Affected areas
+	AffectedAreas      []string `json:"affected_areas" bson:"affected_areas,omitempty"`
+	CustomAffectedArea *string  `json:"custom_affected_area" bson:"custom_affected_area,omitempty"`
+
+	// Clinical findings
+	DescriptiveFindings *string `json:"descriptive_findings" bson:"descriptive_findings,omitempty"`
+	PhysicalExamNotes   *string `json:"physical_exam_notes" bson:"physical_exam_notes,omitempty"`
+
+	// Diagnostic procedures
+	DiagnosticProcedures []string `json:"diagnostic_procedures" bson:"diagnostic_procedures,omitempty"`
+	ImagingNotes         *string  `json:"imaging_notes" bson:"imaging_notes,omitempty"`
+	ClinicalPhotography  *string  `json:"clinical_photography" bson:"clinical_photography,omitempty"`
+	DermoscopyFindings   *string  `json:"dermoscopy_findings" bson:"dermoscopy_findings,omitempty"`
+
+	// Treatment and medications
+	Medications             []Medication           `json:"medications" bson:"medications,omitempty"`
+	SkincareRecommendations map[string]interface{} `json:"skincare_recommendations" bson:"skincare_recommendations,omitempty"`
+	FollowUpRecommendations *string                `json:"follow_up_recommendations" bson:"follow_up_recommendations,omitempty"`
+
+	// Referral information
+	ReferralNeeded    *bool   `json:"referral_needed" bson:"referral_needed,omitempty"`
+	ReferralSpecialty *string `json:"referral_specialty" bson:"referral_specialty,omitempty"`
+	ReferralReason    *string `json:"referral_reason" bson:"referral_reason,omitempty"`
+
+	// Diagnosis and assessment
+	WorkingDiagnosis      *string  `json:"working_diagnosis" bson:"working_diagnosis,omitempty"`
+	DifferentialDiagnosis []string `json:"differential_diagnosis" bson:"differential_diagnosis,omitempty"`
+	AssessmentNotes       *string  `json:"assessment_notes" bson:"assessment_notes,omitempty"`
+	SeverityAssessment    *string  `json:"severity_assessment" bson:"severity_assessment,omitempty"`
+	Prognosis             *string  `json:"prognosis" bson:"prognosis,omitempty"`
+
+	// Patient education and status
+	PatientEducation *string `json:"patient_education" bson:"patient_education,omitempty"`
+	Status           *string `json:"status" bson:"status,omitempty"`
+	VisitType        *string `json:"visit_type" bson:"visit_type,omitempty"`
+
+	// Attachments
+	Attachments []Attachment `json:"attachments" bson:"attachments,omitempty"`
+
+	// Metadata
+	CreatedAt *time.Time `json:"created_at" bson:"created_at,omitempty"`
+	UpdatedAt *time.Time `json:"updated_at" bson:"updated_at,omitempty"`
+	CreatedBy *string    `json:"created_by" bson:"created_by,omitempty"`
+	UpdatedBy *string    `json:"updated_by" bson:"updated_by,omitempty"`
 }
 
 // Attachment represents file attachments
@@ -1483,35 +1502,58 @@ func (h *DiagnosisHandler) GetDermatologyDiagnosis(c *fiber.Ctx) error {
 			"error": "Authentication required",
 		})
 	}
-	fmt.Println("Auth ID:", authID)
+
+	h.logger.Info("Authenticated user accessing dermatology diagnosis",
+		zap.String("auth_id", authID),
+		zap.String("appointment_id", appointmentID))
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	collection := h.getDermatologyCollection()
 
 	var diagnosis DermatologyAssessment
-	err = collection.FindOne(ctx, bson.M{"appointment_id": appointmentID}).Decode(&diagnosis)
+
+	// Exclude _id field to avoid decoding error - same as in CreateDermatologyDiagnosis
+	projection := bson.M{"_id": 0}
+	findOptions := options.FindOne().SetProjection(projection)
+
+	err = collection.FindOne(ctx, bson.M{"appointment_id": appointmentID}, findOptions).Decode(&diagnosis)
 	if err != nil {
 		if err == mongo.ErrNoDocuments {
-			h.logger.Info("Dermatology diagnosis not found", zap.String("appointment_id", appointmentID))
+			h.logger.Info("Dermatology diagnosis not found",
+				zap.String("appointment_id", appointmentID),
+				zap.String("auth_id", authID))
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 				"error": "Dermatology diagnosis not found",
 			})
 		}
-		h.logger.Error("Error fetching dermatology diagnosis", zap.Error(err))
+		h.logger.Error("Error fetching dermatology diagnosis",
+			zap.Error(err),
+			zap.String("appointment_id", appointmentID),
+			zap.String("auth_id", authID))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to fetch dermatology diagnosis",
 		})
 	}
 
-	h.logger.Info("Dermatology diagnosis found", zap.String("appointment_id", appointmentID))
+	h.logger.Info("Dermatology diagnosis retrieved successfully",
+		zap.String("appointment_id", appointmentID),
+		zap.String("auth_id", authID),
+		zap.String("working_diagnosis", func() string {
+			if diagnosis.WorkingDiagnosis != nil {
+				return *diagnosis.WorkingDiagnosis
+			}
+			return "not_specified"
+		}()))
+
 	return c.JSON(fiber.Map{
 		"success": true,
 		"data":    diagnosis,
 	})
 }
 
-// CreateDermatologyDiagnosis creates a new dermatology diagnosis
+// Fixed CreateDermatologyDiagnosis function - avoid decoding _id field
 func (h *DiagnosisHandler) CreateDermatologyDiagnosis(c *fiber.Ctx) error {
 	appointmentID := c.Params("id")
 	if appointmentID == "" {
@@ -1559,35 +1601,36 @@ func (h *DiagnosisHandler) CreateDermatologyDiagnosis(c *fiber.Ctx) error {
 		})
 	}
 
-	// Check if diagnosis already exists with more detailed error handling
+	// Check if diagnosis already exists using appointment_id - exclude _id field from decoding
 	filter := bson.M{"appointment_id": appointmentID}
-	count, err := collection.CountDocuments(ctx, filter)
-	if err != nil {
-		h.logger.Error("Error checking existing diagnosis",
-			zap.Error(err),
-			zap.String("appointment_id", appointmentID),
-			zap.Any("filter", filter))
+	projection := bson.M{"_id": 0} // Exclude _id field to avoid decoding error
 
-		// Check if it's a timeout error
+	var existingDiagnosis DermatologyAssessment
+	isUpdate := false
+
+	findOptions := options.FindOne().SetProjection(projection)
+	err = collection.FindOne(ctx, filter, findOptions).Decode(&existingDiagnosis)
+	if err != nil && err != mongo.ErrNoDocuments {
 		if ctx.Err() == context.DeadlineExceeded {
 			return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{
 				"error": "Database operation timed out",
 			})
 		}
-
+		h.logger.Error("Error checking existing diagnosis",
+			zap.Error(err),
+			zap.String("appointment_id", appointmentID),
+			zap.Any("filter", filter))
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Database error while checking existing diagnosis",
+			"error":   "Database error while checking existing diagnosis",
+			"details": err.Error(),
 		})
-	}
-
-	if count > 0 {
-		return c.Status(fiber.StatusConflict).JSON(fiber.Map{
-			"error": "Dermatology diagnosis already exists for this appointment. Use PUT to update.",
-		})
+	} else if err == nil {
+		isUpdate = true
+		h.logger.Info("Existing diagnosis found, will update", zap.String("appointment_id", appointmentID))
 	}
 
 	// Parse the request based on content type with enhanced error handling
-	diagnosis, err := h.parseDermatologyRequest(c, appointmentID, authID, true)
+	diagnosis, err := h.parseDermatologyRequest(c, appointmentID, authID, !isUpdate)
 	if err != nil {
 		h.logger.Error("Error parsing request",
 			zap.Error(err),
@@ -1598,7 +1641,7 @@ func (h *DiagnosisHandler) CreateDermatologyDiagnosis(c *fiber.Ctx) error {
 		})
 	}
 
-	// Validate diagnosis data before insertion
+	// Validate diagnosis data
 	if diagnosis == nil {
 		h.logger.Error("Parsed diagnosis is nil")
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -1606,225 +1649,195 @@ func (h *DiagnosisHandler) CreateDermatologyDiagnosis(c *fiber.Ctx) error {
 		})
 	}
 
-	// Set creation timestamps
+	// Ensure appointment_id is set correctly (not as _id)
+	diagnosis.AppointmentID = appointmentID
+
 	now := time.Now()
-	diagnosis.CreatedAt = &now
-	diagnosis.UpdatedAt = &now
-	diagnosis.CreatedBy = &authID
 
-	h.logger.Info("Inserting dermatology diagnosis",
-		zap.String("appointment_id", appointmentID),
-		zap.Int("attachments_count", len(diagnosis.Attachments)),
-		zap.String("created_by", authID))
-
-	// Validate document structure before insertion
-	docBytes, err := bson.Marshal(diagnosis)
-	if err != nil {
-		h.logger.Error("Error marshaling diagnosis document", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Invalid document structure",
-		})
-	}
-
-	// Log document size for debugging
-	h.logger.Info("Document size", zap.Int("bytes", len(docBytes)))
-
-	// Insert with write concern and enhanced error handling
-	insertOptions := options.InsertOne().SetComment("Create dermatology diagnosis")
-	result, err := collection.InsertOne(ctx, diagnosis, insertOptions)
-	if err != nil {
-		h.logger.Error("Error inserting dermatology diagnosis",
-			zap.Error(err),
+	if isUpdate {
+		// Update existing record
+		h.logger.Info("Updating existing dermatology diagnosis",
 			zap.String("appointment_id", appointmentID),
-			zap.String("error_type", fmt.Sprintf("%T", err)))
+			zap.Int("new_attachments_count", len(diagnosis.Attachments)))
 
-		// Check for specific MongoDB errors
-		if mongo.IsDuplicateKeyError(err) {
-			return c.Status(fiber.StatusConflict).JSON(fiber.Map{
-				"error": "Duplicate diagnosis found",
+		// Prepare update document
+		updateDoc := bson.M{
+			"updated_at": now,
+			"updated_by": authID,
+		}
+
+		// Build update fields dynamically
+		h.buildUpdateFields(diagnosis, updateDoc)
+
+		// Handle attachments - append new ones to existing
+		if len(diagnosis.Attachments) > 0 {
+			existingAttachments := existingDiagnosis.Attachments
+			if existingAttachments == nil {
+				existingAttachments = make([]Attachment, 0)
+			}
+			updateDoc["attachments"] = append(existingAttachments, diagnosis.Attachments...)
+			h.logger.Info("Adding new attachments", zap.Int("new_count", len(diagnosis.Attachments)))
+		}
+
+		// Check if there's anything to update
+		if len(updateDoc) <= 2 { // Only updated_at and updated_by
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "No valid data provided for update",
 			})
 		}
 
-		if ctx.Err() == context.DeadlineExceeded {
-			return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{
-				"error": "Database operation timed out",
+		// Execute the update using appointment_id
+		updateOpts := options.UpdateOne().SetComment("Update dermatology diagnosis via POST")
+		result, err := collection.UpdateOne(
+			ctx,
+			bson.M{"appointment_id": appointmentID},
+			bson.M{"$set": updateDoc},
+			updateOpts,
+		)
+		if err != nil {
+			h.logger.Error("Error updating dermatology diagnosis", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to update dermatology diagnosis",
 			})
 		}
 
-		// Check for validation errors
-		var writeErr mongo.WriteException
-		if errors.As(err, &writeErr) {
-			h.logger.Error("MongoDB write error details",
-				zap.Any("write_errors", writeErr.WriteErrors))
-		}
+		h.logger.Info("Dermatology diagnosis updated successfully",
+			zap.String("appointment_id", appointmentID),
+			zap.Int64("modified_count", result.ModifiedCount))
 
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error":   "Failed to create dermatology diagnosis",
-			"details": err.Error(),
+		return c.Status(fiber.StatusOK).JSON(fiber.Map{
+			"success":           true,
+			"message":           "Dermatology diagnosis updated successfully",
+			"appointment_id":    appointmentID,
+			"operation":         "update",
+			"modified_count":    result.ModifiedCount,
+			"attachments_added": len(diagnosis.Attachments),
+			"updated_at":        now,
 		})
-	}
 
-	// Validate the insertion result
-	if result.InsertedID == nil {
-		h.logger.Error("Insert operation returned nil ID")
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to generate document ID",
-		})
-	}
+	} else {
+		// Create new record
+		h.logger.Info("Creating new dermatology diagnosis",
+			zap.String("appointment_id", appointmentID),
+			zap.Int("attachments_count", len(diagnosis.Attachments)))
 
-	insertedID, ok := result.InsertedID.(primitive.ObjectID)
-	if !ok {
-		h.logger.Error("Inserted ID is not ObjectID",
-			zap.Any("inserted_id", result.InsertedID),
-			zap.String("type", fmt.Sprintf("%T", result.InsertedID)))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Invalid document ID format",
-		})
-	}
+		// Set creation timestamps and IDs
+		diagnosis.CreatedAt = &now
+		diagnosis.UpdatedAt = &now
+		diagnosis.CreatedBy = &authID
 
-	h.logger.Info("Dermatology diagnosis created successfully",
-		zap.String("id", insertedID.Hex()),
-		zap.String("appointment_id", appointmentID))
+		// Ensure appointment_id is set
+		diagnosis.AppointmentID = appointmentID
 
-	// Optional: Verify the document was created (if frontend expects it)
-	var createdDoc bson.M
-	err = collection.FindOne(ctx, bson.M{"_id": insertedID}).Decode(&createdDoc)
-	if err != nil {
-		h.logger.Error("Document created but verification failed",
-			zap.Error(err),
-			zap.String("id", insertedID.Hex()))
-		// Document was created successfully, but we can't verify it
-		// Return success anyway since the insert operation succeeded
-	}
+		// Log the full diagnosis object for debugging
+		h.logger.Info("Diagnosis object before insert",
+			zap.String("appointment_id", diagnosis.AppointmentID),
+			zap.Any("created_at", diagnosis.CreatedAt),
+			zap.Any("updated_at", diagnosis.UpdatedAt))
 
-	// Return success response with comprehensive data
-	response := fiber.Map{
-		"success":           true,
-		"message":           "Dermatology diagnosis created successfully",
-		"id":                insertedID.Hex(),
-		"appointment_id":    appointmentID,
-		"attachments_count": len(diagnosis.Attachments),
-		"status":            diagnosis.Status,
-		"created_at":        diagnosis.CreatedAt,
-	}
-
-	// Add verified document data if available
-	if createdDoc != nil {
-		response["data"] = createdDoc
-	}
-
-	return c.Status(fiber.StatusCreated).JSON(response)
-}
-
-// UpdateDermatologyDiagnosis updates an existing dermatology diagnosis
-func (h *DiagnosisHandler) UpdateDermatologyDiagnosis(c *fiber.Ctx) error {
-	appointmentID := c.Params("id")
-	if appointmentID == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Appointment ID is required",
-		})
-	}
-
-	h.logger.Info("PUT request for dermatology diagnosis", zap.String("appointment_id", appointmentID))
-
-	// Get auth ID from context using standardized method
-	authID, err := h.getAuthID(c)
-	if err != nil {
-		h.logger.Error("authID not found in context", zap.Error(err))
-		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
-			"error": "Authentication required",
-		})
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	collection := h.getDermatologyCollection()
-
-	// Check if diagnosis exists
-	var existingDiagnosis DermatologyAssessment
-	err = collection.FindOne(ctx, bson.M{"appointment_id": appointmentID}).Decode(&existingDiagnosis)
-	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-				"error": "Dermatology diagnosis not found. Use POST to create new diagnosis.",
+		// Validate document structure before insertion
+		docBytes, err := bson.Marshal(diagnosis)
+		if err != nil {
+			h.logger.Error("Error marshaling diagnosis document", zap.Error(err))
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Invalid document structure",
 			})
 		}
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Database error",
-		})
-	}
 
-	// Parse the update request
-	updatedDiagnosis, err := h.parseDermatologyRequest(c, appointmentID, authID, false)
-	if err != nil {
-		h.logger.Error("Error parsing update request", zap.Error(err))
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": err.Error(),
-		})
-	}
+		// Log document size for debugging
+		h.logger.Info("Document size", zap.Int("bytes", len(docBytes)))
 
-	// Prepare update document
-	updateDoc := bson.M{
-		"updated_at": time.Now(),
-		"updated_by": authID,
-	}
+		// Insert with write concern and enhanced error handling
+		insertOptions := options.InsertOne().SetComment("Create dermatology diagnosis")
+		result, err := collection.InsertOne(ctx, diagnosis, insertOptions)
+		if err != nil {
+			h.logger.Error("Error inserting dermatology diagnosis",
+				zap.Error(err),
+				zap.String("appointment_id", appointmentID),
+				zap.String("error_type", fmt.Sprintf("%T", err)))
 
-	// Build update fields dynamically
-	h.buildUpdateFields(updatedDiagnosis, updateDoc)
+			// Check for specific MongoDB errors
+			if mongo.IsDuplicateKeyError(err) {
+				return c.Status(fiber.StatusConflict).JSON(fiber.Map{
+					"error": "Duplicate diagnosis found",
+				})
+			}
 
-	// Handle attachments - append new ones to existing
-	if len(updatedDiagnosis.Attachments) > 0 {
-		existingAttachments := existingDiagnosis.Attachments
-		if existingAttachments == nil {
-			existingAttachments = make([]Attachment, 0)
+			if ctx.Err() == context.DeadlineExceeded {
+				return c.Status(fiber.StatusRequestTimeout).JSON(fiber.Map{
+					"error": "Database operation timed out",
+				})
+			}
+
+			// Check for validation errors
+			var writeErr mongo.WriteException
+			if errors.As(err, &writeErr) {
+				h.logger.Error("MongoDB write error details",
+					zap.Any("write_errors", writeErr.WriteErrors))
+
+				// Return specific validation error details
+				if len(writeErr.WriteErrors) > 0 {
+					return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+						"error":   "Document validation failed",
+						"details": writeErr.WriteErrors[0].Message,
+					})
+				}
+			}
+
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error":   "Failed to create dermatology diagnosis",
+				"details": err.Error(),
+			})
 		}
-		updateDoc["attachments"] = append(existingAttachments, updatedDiagnosis.Attachments...)
-		h.logger.Info("Adding new attachments", zap.Int("new_count", len(updatedDiagnosis.Attachments)))
+
+		// Validate the insertion result
+		if result.InsertedID == nil {
+			h.logger.Error("Insert operation returned nil ID")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "Failed to generate document ID",
+			})
+		}
+
+		// Get the inserted ID (MongoDB will generate ObjectID)
+		insertedID := result.InsertedID
+
+		h.logger.Info("Dermatology diagnosis created successfully",
+			zap.Any("id", insertedID),
+			zap.String("appointment_id", appointmentID))
+
+		// Verify the document was created by querying with appointment_id (exclude _id field)
+		var createdDoc bson.M
+		verifyOptions := options.FindOne().SetProjection(bson.M{"_id": 0})
+		err = collection.FindOne(ctx, bson.M{"appointment_id": appointmentID}, verifyOptions).Decode(&createdDoc)
+		if err != nil {
+			h.logger.Error("Document created but verification failed",
+				zap.Error(err),
+				zap.Any("id", insertedID))
+			// Document was created successfully, but we can't verify it
+			// Return success anyway since the insert operation succeeded
+		} else {
+			h.logger.Info("Document verification successful", zap.String("appointment_id", appointmentID))
+		}
+
+		// Return success response with comprehensive data
+		response := fiber.Map{
+			"success":           true,
+			"message":           "Dermatology diagnosis created successfully",
+			"id":                insertedID,
+			"appointment_id":    appointmentID,
+			"operation":         "create",
+			"attachments_count": len(diagnosis.Attachments),
+			"status":            diagnosis.Status,
+			"created_at":        diagnosis.CreatedAt,
+		}
+
+		// Add verified document data if available
+		if createdDoc != nil {
+			response["data"] = createdDoc
+		}
+
+		return c.Status(fiber.StatusCreated).JSON(response)
 	}
-
-	// Check if there's anything to update
-	if len(updateDoc) <= 2 { // Only updated_at and updated_by
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"success": false,
-			"message": "No valid data provided for update",
-		})
-	}
-
-	h.logger.Info("Executing MongoDB update",
-		zap.String("appointment_id", appointmentID),
-		zap.Int("fields_count", len(updateDoc)))
-
-	// Execute the update - using v2 syntax
-	updateOpts := options.UpdateOne().SetComment("Update dermatology diagnosis")
-	result, err := collection.UpdateOne(
-		ctx,
-		bson.M{"appointment_id": appointmentID},
-		bson.M{"$set": updateDoc},
-		updateOpts,
-	)
-	if err != nil {
-		h.logger.Error("Error updating dermatology diagnosis", zap.Error(err))
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to update dermatology diagnosis",
-		})
-	}
-
-	message := "Document found but no changes were made"
-	if result.ModifiedCount > 0 {
-		message = "Dermatology diagnosis updated successfully"
-	}
-
-	h.logger.Info("Update completed",
-		zap.Int64("modified_count", result.ModifiedCount),
-		zap.Int64("matched_count", result.MatchedCount))
-
-	return c.JSON(fiber.Map{
-		"success":           result.MatchedCount > 0,
-		"message":           message,
-		"modified_count":    result.ModifiedCount,
-		"attachments_added": len(updatedDiagnosis.Attachments),
-	})
 }
 
 // DeleteDermatologyDiagnosis deletes a dermatology diagnosis
@@ -2081,7 +2094,6 @@ func (h *DiagnosisHandler) parseArrayFields(form *multipart.Form, diagnosis *Der
 	arrayFields := map[string]*[]string{
 		"affected_areas":         &diagnosis.AffectedAreas,
 		"diagnostic_procedures":  &diagnosis.DiagnosticProcedures,
-		"medications":            &diagnosis.Medications,
 		"differential_diagnosis": &diagnosis.DifferentialDiagnosis,
 	}
 
@@ -2095,6 +2107,18 @@ func (h *DiagnosisHandler) parseArrayFields(form *multipart.Form, diagnosis *Der
 				}
 				*fieldPtr = arr
 			}
+		}
+	}
+
+	// Handle medications (which is []Medication, not []string)
+	if values, ok := form.Value["medications"]; ok && len(values) > 0 {
+		jsonStr := strings.TrimSpace(values[0])
+		if jsonStr != "" {
+			var meds []Medication
+			if err := json.Unmarshal([]byte(jsonStr), &meds); err != nil {
+				return fmt.Errorf("invalid JSON for medications: %w", err)
+			}
+			diagnosis.Medications = meds
 		}
 	}
 
